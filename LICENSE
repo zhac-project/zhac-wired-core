@@ -1,0 +1,36 @@
+zhac-wired-core — ZHAC ESP32-P4 firmware (wired Ethernet, single-chip)
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+Affero General Public License for more details.
+
+Full license text: `LICENSES/AGPL-3.0-or-later.txt` in this
+repository, or obtain a copy at
+https://www.gnu.org/licenses/agpl-3.0.html.
+
+Copyright © 2025–2026 Evgenij Cjura and project contributors.
+
+---
+
+ADDITIONAL NOTICE
+
+Contributions to this project are accepted only under the Contributor
+License Agreement in `CLA.md`, which grants the project maintainer
+the right to sublicense contributed work under alternative terms —
+including proprietary licenses — for commercial offerings of ZHAC.
+The maintainer reserves the right to distribute this firmware under
+such alternative terms; recipients of any proprietary build are
+governed by its separate license and not by the AGPL.
+
+The `www-spa` submodule is governed by its own AGPL-3.0-or-later
+LICENSE and retains the same CLA coverage. Third-party JavaScript
+dependencies pulled via npm during SPA build retain their own
+upstream licenses.

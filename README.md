@@ -1,0 +1,75 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+# zhac-wired-core
+
+Single-chip **ESP32-P4** ZHAC firmware. The only uplink is **wired Ethernet** — there is
+no Wi-Fi, no Bluetooth and no provisioning flow anywhere in this build.
+
+It is the `zhac-mono-core` architecture (its own `main/`, direct calls through the
+`mono_bridge` shim instead of HAP-over-SPI) retargeted from `esp32s3` to `esp32p4`, with
+`esp_eth` in place of `esp_wifi`.
+
+## Status
+
+**Phase 0, in progress.** Tasks 1–2 of
+`../extra/docs/plans/2026-08-14-zhac-wired-core-phase0.md` are implemented: board bring-up
+and the Ethernet netif. The control surface (REST/WS/SPA), storage, rules and Lua follow in
+Tasks 4–8.
+
+**There is no radio in Phase 0**, deliberately. The Zigbee stack arrives in Phase 1 as
+`esp_zigbee_backend` — `esp-zigbee-lib` on the P4 in `ESP_ZIGBEE_RADIO_MODE_UART_RCP`,
+driving an ESP32-C6 running stock Espressif `ot_rcp`. Until then `/api/devices` is expected
+to return an empty list; that is the correct result, not a fault.
+
+Nothing here has been hardware-verified yet.
+
+## Hardware
+
+**Guition JC-ESP32P4-M3-DEV** (on the `JC-ESP32P4-M3-C6` module).
+
+- ESP32-P4, 32 MB PSRAM, 16 MB NOR flash
+- 100M Ethernet via an **IP101** PHY at SMI address 1, wired to ESP-IDF's default esp32p4
+  EMAC pins — MDC 31, MDIO 52, REF_CLK-in 50, PHY power-enable 51, data 28/29/30/34/35/49
+- ESP32-C6 on the same module, reachable over what were the SDIO traces
+  (P4 14/15/54 ↔ C6 20/21/EN) — reserved for the Phase-1 radio
+
+The ZHAC flagship rig (`WT0132P4-A1`) has **no Ethernet PHY** and cannot run this firmware
+past the boot smoke test. `extra/docs/esp32_p4_gpio_allocation.md` describes that other
+board and does not apply here.
+
+> The bench P4 is silicon revision v1.3, which IDF v6.0's default minimum revision rejects.
+> `CONFIG_ESP32P4_REV_MIN_0=y` in `sdkconfig.defaults` handles it. The failure it prevents
+> happens at *flash* time, not build time.
+
+## Build
+
+```sh
+source ~/.espressif/v6.0/esp-idf/export.sh
+idf.py set-target esp32p4
+idf.py build
+idf.py -p /dev/ttyACM0 flash monitor
+```
+
+Sibling repos are **read-only inputs**, resolved via `EXTRA_COMPONENT_DIRS` and
+`EMBEDDED_ZHC_PATH`: `zhac-components`, `zhac-net-core`, `zhac-main-core`, `embedded-zhc`,
+`www-spa`. A change needed in one of them belongs in that repo, not here.
+
+## Deliberate omissions
+
+These are decisions, not gaps. `tools/check_no_rainmaker.sh` (Task 9) makes them
+build-breaking rather than conventions nobody reads.
+
+| Absent | Why |
+|---|---|
+| **RainMaker** | not part of this SKU |
+| **Wi-Fi / `esp_wifi`** | Ethernet-only by design |
+| **`znp_driver`, `ezsp_driver`, `zigbee_mgr`** | the radio here is `esp_zigbee` + `ot_rcp`; the legacy backends belong to the flagship line |
+| **OTA / dual app slots** | single `factory` slot for now; a follow-up, and it changes `partitions.csv` |
+| **BLE** | structurally impossible — the P4 has no radio of its own |
+
+## Licence
+
+AGPL-3.0-or-later, matching the other firmware cores. SPDX headers are enforced.

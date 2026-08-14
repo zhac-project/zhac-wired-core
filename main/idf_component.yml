@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Keep minimal -- the dependency graph is wired via EXTRA_COMPONENT_DIRS
+# (sibling repos) and the local components/mono_bridge shim.
+dependencies:
+  idf:
+    version: ">=6.0"

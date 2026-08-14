@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC wired-core board"
+
+    # Guition JC-ESP32P4-M3-DEV values. MDC/MDIO/REF_CLK match ESP-IDF's
+    # ETH_ESP32_EMAC_DEFAULT_CONFIG() for esp32p4 exactly, so the RMII data
+    # pins are left at the IDF defaults too (28/29/30/34/35/49) and are not
+    # exposed here -- each RMII signal picks independently from its own small
+    # IO_MUX candidate set, and this board follows the IDF default for all of
+    # them. A custom board would expose these; this one does not need to.
+
+    config ZHAC_ETH_MDC_GPIO
+        int "EMAC MDC GPIO"
+        default 31
+
+    config ZHAC_ETH_MDIO_GPIO
+        int "EMAC MDIO GPIO"
+        default 52
+
+    config ZHAC_ETH_REF_CLK_GPIO
+        int "EMAC RMII REF_CLK input GPIO"
+        default 50
+        help
+            Clock is sourced by the PHY (EMAC_CLK_EXT_IN). Valid inputs are
+            GPIO32, GPIO44 and GPIO50 only.
+
+    config ZHAC_ETH_PHY_PWR_GPIO
+        int "IP101 PHY power/enable GPIO (-1 if always on)"
+        default 51
+        help
+            Must be driven high and held before the PHY is probed, or SMI
+            reads return all-ones and PHY detection fails with a misleading
+            "no PHY found".
+
+    config ZHAC_ETH_PHY_ADDR
+        int "Ethernet PHY SMI address (-1 = autodetect)"
+        default 1
+
+    # -- Radio (Phase 1) --
+    # No radio is built in Phase 0. These are declared now so the board
+    # wiring is recorded in one place and Phase 1 only has to consume them.
+    # Values are the SDIO traces the no-WiFi decision freed -- see
+    # extra/docs/P4_C6_WIRED_GATEWAY_RESEARCH.md section 2.4.
+    config ZHAC_RCP_UART_RX_GPIO
+        int "P4 RX from RCP TX (C6 GPIO21)"
+        default 14
+
+    config ZHAC_RCP_UART_TX_GPIO
+        int "P4 TX to RCP RX (C6 GPIO20)"
+        default 15
+
+    config ZHAC_RCP_RESET_GPIO
+        int "RCP reset (to C6 EN)"
+        default 54
+
+    config ZHAC_RCP_BOOT_GPIO
+        int "RCP BOOT strap (C6 GPIO9), -1 if unwired"
+        default -1
+        help
+            Needed only by esp_rcp_update for host-driven reflash. Probably
+            not routed on the Guition board -- verify on the schematic. If it
+            is -1 the C6 must be flashed via its own programming connector.
+
+endmenu

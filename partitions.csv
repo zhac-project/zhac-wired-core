@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# zhac-wired-core partitions — 16 MB flash, single-slot app (no OTA).
+# No phy_init: that partition stores WiFi PHY calibration data, and this
+# build has no radio on the host at all.
+# Name,         Type,  SubType,  Offset,  Size
+nvs,            data,  nvs,      0x9000,  64K
+factory,        app,   factory,  ,        6M
+scripts,        data,  spiffs,   ,        2M
+spa,            data,  spiffs,   ,        7M
+coredump,       data,  coredump, ,        64K
