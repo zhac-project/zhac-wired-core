@@ -44,10 +44,9 @@ jobs:
           target: esp32p4
           path: zhac-wired-core
 
-      # Silently-ignored Kconfig symbols have bitten this repo three times
-      # (ESP32P4_REV_MIN_0, ETH_PHY_INTERFACE_RMII, ETH_RMII_CLK_INPUT). They
-      # are warnings, not errors, so the build stays green while the setting
-      # does nothing. Fail the job on them instead.
+      # A line in sdkconfig.defaults can do nothing in two ways, and only one
+      # of them is noisy. This job covers the noisy one: unknown symbols, which
+      # kconfgen warns about but does not fail on.
       - name: No unknown Kconfig symbols
         working-directory: zhac-wired-core
         run: |
@@ -57,3 +56,12 @@ jobs:
             exit 1
           fi
           echo "OK: no unknown kconfig symbols."
+
+      # ...and this covers the SILENT one: a symbol kconfgen knows but cannot
+      # select gets dropped to the choice default with no warning at all.
+      # CONFIG_ESP32P4_REV_MIN_0 without CONFIG_ESP32P4_SELECTS_REV_LESS_V3
+      # silently becomes _301 -- a binary for the wrong P4 silicon family,
+      # which fails at flash time, long after a green build.
+      - name: Resolved chip config matches main-core
+        working-directory: zhac-wired-core
+        run: ./tools/check_resolved_config.sh

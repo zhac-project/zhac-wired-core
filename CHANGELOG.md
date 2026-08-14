@@ -18,8 +18,20 @@ Initial firmware. Nothing hardware-verified yet.
 - **Repo skeleton targeting `esp32p4`** — 16 MB flash, single `factory` app slot, no
   `phy_init` partition (it holds Wi-Fi PHY calibration data, meaningless in a build with no
   radio on the host). PSRAM mandatory, with `SPIRAM_RODATA` and external BSS placement.
-- **`CONFIG_ESP32P4_REV_MIN_0=y`** so the rev-v1.3 bench part is accepted. IDF v6.0's
-  default minimum revision rejects it at flash time, not build time.
+- **Chip configuration taken wholesale from `zhac-main-core`** — the config validated on
+  ZHAC P4 hardware. All eight chip-critical settings now resolve identically: revision
+  family, `SPIRAM_MODE_HEX` @ 200 MHz, 360 MHz CPU (IDF would default to 400), QIO flash
+  @ 40 MHz (IDF would default to DIO @ 80 MHz), 16 MB.
+  - **`CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `CONFIG_ESP32P4_REV_MIN_0=y`.** P4 has two
+    incompatible revision families — v0.x–v1.x and v3.x — and that first symbol picks
+    which one the binary targets. A binary built for one will not boot on the other.
+  - Setting `REV_MIN_0` **without** the gate is silently useless: kconfgen knows the
+    symbol but cannot select it, so it drops to the default `_301` with **no warning at
+    all**, not even "unknown kconfig symbol". Verified by experiment.
+- **`tools/check_resolved_config.sh`** — asserts what the config *resolved to*, not what
+  was requested. There are two ways a `sdkconfig.defaults` line can do nothing and only
+  the first is noisy: an unknown symbol (warns) versus a known-but-unselectable one
+  (silent). Grepping build output catches only the former. Verified both directions.
 - **Wired Ethernet (`eth.cpp`)** — internal EMAC plus an external IP101 PHY over RMII, with
   `esp_netif` and the DHCP client. Exposes `eth_start()`, `eth_link_up()` and
   `eth_get_status(NetStatus*)`.

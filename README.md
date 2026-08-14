@@ -40,9 +40,29 @@ The ZHAC flagship rig (`WT0132P4-A1`) has **no Ethernet PHY** and cannot run thi
 past the boot smoke test. `extra/docs/esp32_p4_gpio_allocation.md` describes that other
 board and does not apply here.
 
-> The bench P4 is silicon revision v1.3, which IDF v6.0's default minimum revision rejects.
-> `CONFIG_ESP32P4_REV_MIN_0=y` in `sdkconfig.defaults` handles it. The failure it prevents
-> happens at *flash* time, not build time.
+### Silicon revision — read before flashing
+
+ESP32-P4 comes in two **incompatible** revision families, and one Kconfig picks which one a
+binary targets. A binary built for one will not boot on the other.
+
+| `CONFIG_ESP32P4_SELECTS_REV_LESS_V3` | rev choices | `REV_MAX_FULL` |
+|---|---|---|
+| `y` ← **this repo**, matching `zhac-main-core` | v0.0 / v0.1 / v1.0 | 199 |
+| `n` (IDF default) | v3.0 / v3.1 | 399 |
+
+The chip config here is taken wholesale from `zhac-main-core` — the one validated on ZHAC
+P4 hardware — and all eight settings resolve identically: revision family, `SPIRAM_MODE_HEX`
+@ 200 MHz, 360 MHz CPU, QIO flash @ 40 MHz, 16 MB.
+
+> **The Guition board's revision is unconfirmed.** If its first boot line reads
+> `chip: esp32p4, rev v3.x`, this binary will not run on it — set
+> `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n` and `CONFIG_ESP32P4_REV_MIN_300=y`.
+
+> **Setting `CONFIG_ESP32P4_REV_MIN_0=y` without the gate is silently useless.** kconfgen
+> knows the symbol but cannot select it, so it drops to the default `_301` **with no warning
+> of any kind** — not even "unknown kconfig symbol". A revision mismatch then fails at
+> *flash* time, long after a green build. `tools/check_resolved_config.sh` exists to catch
+> exactly this, by asserting what came out rather than what went in.
 
 ## Build
 
