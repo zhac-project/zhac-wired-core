@@ -48,20 +48,28 @@ CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 CONFIG_FREERTOS_ISR_STACKSIZE=4192
-CONFIG_MAIN_TASK_STACK_SIZE=4192
+# Renamed in IDF v6.0 (was CONFIG_MAIN_TASK_STACK_SIZE; kconfgen still
+# auto-replaces the old name, but only with an `info:` line nobody reads).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4192
 
 CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_LWIP_MAX_SOCKETS=16
 
-# Ethernet: internal EMAC + external RMII PHY (ESP-IDF supports RMII only).
-# REF_CLK is sourced by the PHY. Do NOT switch to EMAC_CLK_OUT: with PSRAM
-# enabled both share the MPLL, and at 80 MHz PSRAM speed no integer divisor
-# yields 50 MHz within tolerance -- EMAC init fails outright.
+# Ethernet: internal EMAC + external RMII PHY.
+#
+# Only CONFIG_ETH_USE_ESP32_EMAC is a real symbol here. The RMII interface
+# selection and the REF_CLK direction are NOT Kconfig on esp32p4 -- they are
+# runtime fields of eth_esp32_emac_config_t, set in eth.cpp. Earlier drafts
+# of this file also carried CONFIG_ETH_PHY_INTERFACE_RMII and
+# CONFIG_ETH_RMII_CLK_INPUT; both are unknown symbols in IDF v6.0 and were
+# silently ignored, implying configuration that was not happening.
+#
+# Check for that whole class of bug with:
+#   idf.py reconfigure 2>&1 | grep 'unknown kconfig symbol'
+# It has bitten this file three times (these two plus ESP32P4_REV_MIN_0).
 CONFIG_ETH_USE_ESP32_EMAC=y
-CONFIG_ETH_PHY_INTERFACE_RMII=y
-CONFIG_ETH_RMII_CLK_INPUT=y
 
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_MBEDTLS_COMPILER_OPTIMIZATION_PERF=y

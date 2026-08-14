@@ -18,6 +18,7 @@
 #include "sdkconfig.h"
 
 #include "eth.h"
+#include "net_discovery.h"
 
 #include <cinttypes>
 
@@ -72,6 +73,7 @@ extern "C" void app_main() {
     log_heap_info();
 
     eth_start();
+    net_discovery_start(CONFIG_ZHAC_MDNS_HOSTNAME);
 
     // Report link/IP state periodically until the HTTP surface exists to
     // serve it (Task 5). Cheap, and makes the unplug/replug gate observable

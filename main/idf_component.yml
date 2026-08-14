@@ -6,3 +6,8 @@
 dependencies:
   idf:
     version: ">=6.0"
+
+  # mDNS. net-core gets this transitively via espressif/esp_rainmaker; this
+  # SKU has no RainMaker, so it must be declared. Same major as net-core
+  # resolves, to keep the two firmwares on one mDNS implementation.
+  espressif/mdns: "^1.9.0"

@@ -36,6 +36,16 @@ menu "ZHAC wired-core board"
         int "Ethernet PHY SMI address (-1 = autodetect)"
         default 1
 
+    config ZHAC_MDNS_HOSTNAME
+        string "mDNS hostname (without .local)"
+        default "zhac"
+        help
+            Two units on one LAN both defaulting to "zhac" collide; mDNS
+            conflict resolution renames one of them, so trust the name in
+            the boot log over this value. Set it per unit to avoid the
+            ambiguity. This is the whole discovery story on a wired box --
+            there is no SoftAP and no provisioning page.
+
     # -- Radio (Phase 1) --
     # No radio is built in Phase 0. These are declared now so the board
     # wiring is recorded in one place and Phase 1 only has to consume them.

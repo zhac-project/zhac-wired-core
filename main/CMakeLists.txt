@@ -10,6 +10,7 @@ idf_component_register(
     SRCS
         "main.cpp"
         "eth.cpp"
+        "net_discovery.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         esp_system
@@ -24,4 +25,5 @@ idf_component_register(
         # now comes from esp_driver_gpio. Requiring `driver` builds but the
         # header is not on the include path.
         esp_driver_gpio
+        mdns
 )
