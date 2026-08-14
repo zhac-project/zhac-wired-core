@@ -8,26 +8,34 @@
 # by name" rule.
 cmake_minimum_required(VERSION 3.22)
 
-# NOTE (Tasks 1-3): the sibling component dirs are deliberately NOT on the
-# search path yet.
+# Shared components. This mirrors zhac-net-core's resolution, including its
+# three-way fallback, and the scope is deliberate: ONLY zhac-components.
 #
-# ESP-IDF only *builds* components reachable from main's REQUIRES, but it
-# *resolves requirements* for every component it discovers. Adding these dirs
-# before we need them therefore drags the whole ZHAC dependency graph into
-# configure -- and it fails, because lua_cjson requires the registry component
-# `lua`, which only arrives with main/idf_component.yml in Task 4:
+# Do NOT add zhac-main-core/components or zhac-mono-core/components here.
+# ESP-IDF *builds* only what is reachable from main's REQUIRES, but it
+# *resolves requirements* for everything it discovers, so a wider search path
+# drags in dependencies this firmware does not have. Adding zhac-main-core
+# fails configure outright:
 #
 #   Failed to resolve component 'lua' required by component 'lua_cjson'
 #
-# Task 4 uncomments this block and adds `georgik/lua` to main/idf_component.yml
-# in the same commit. Until then, keeping it off makes Tasks 1-3 build
-# standalone and fast, which is the point of staging them.
+# zhac-components itself is safe to scan: it contains no lua_* components, and
+# the only member declaring a registry dependency is arduinojson (see
+# main/idf_component.yml for why that one must not be path-added).
 #
-# set(EXTRA_COMPONENT_DIRS
-#     "${CMAKE_CURRENT_LIST_DIR}/../zhac-components/components"
-#     "${CMAKE_CURRENT_LIST_DIR}/../zhac-net-core/components"
-#     "${CMAKE_CURRENT_LIST_DIR}/../zhac-main-core/components"
-# )
+# ws_server and remote_client live in zhac-net-core and are pulled by explicit
+# path in main/idf_component.yml rather than by widening this search path.
+if(DEFINED ENV{IDF_COMPONENT_OVERRIDE_PATH})
+    set(EXTRA_COMPONENT_DIRS "$ENV{IDF_COMPONENT_OVERRIDE_PATH}")
+elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../zhac-components/components")
+    set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../zhac-components/components")
+elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../components")
+    set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../../components")
+else()
+    message(FATAL_ERROR
+        "shared components dir not found — set IDF_COMPONENT_OVERRIDE_PATH or "
+        "clone zhac-components as a sibling")
+endif()
 
 # embedded-zhc is the host-testable C++20 device library; firmwares resolve it
 # via EMBEDDED_ZHC_PATH (zhc_adapter's CMakeLists checks this var). Default to

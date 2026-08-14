@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Kconfig for the mono override of lua_engine. ESP-IDF looks for
+# Kconfig next to the component's CMakeLists; since our override
+# component shadows the sibling by name, we also need to shadow the
+# Kconfig so symbols like CONFIG_LUA_ENGINE_HEAP_KB exist. Content is
+# kept identical to the sibling so menuconfig presents the same UI
+# and the source files compile unchanged.
+menu "Lua engine"
+
+config LUA_ENGINE_ENABLED
+    bool "Enable Lua scripting engine"
+    default y
+
+config LUA_ENGINE_HEAP_KB
+    int "PSRAM heap budget (KB) for the Lua VM"
+    depends on LUA_ENGINE_ENABLED
+    default 4096
+    range 256 16384
+
+config LUA_ENGINE_INTERNAL_SMALL_THRESHOLD
+    int "Internal-RAM threshold for small allocations (bytes)"
+    depends on LUA_ENGINE_ENABLED
+    default 512
+    range 64 4096
+
+config LUA_ENGINE_MAX_COROUTINES
+    int "Max live coroutines"
+    depends on LUA_ENGINE_ENABLED
+    default 64
+    range 4 256
+
+config LUA_ENGINE_TIMER_POOL
+    int "Pre-allocated one-shot timer pool size"
+    depends on LUA_ENGINE_ENABLED
+    default 16
+    range 4 64
+
+config LUA_ENGINE_RESUME_QUEUE_DEPTH
+    int "Resume queue depth"
+    depends on LUA_ENGINE_ENABLED
+    default 32
+    range 8 256
+
+config LUA_ENGINE_TASK_STACK_BYTES
+    int "TaskLua stack size (bytes)"
+    depends on LUA_ENGINE_ENABLED
+    default 8192
+    range 4096 32768
+
+config LUA_ENGINE_TASK_PRIORITY
+    int "TaskLua FreeRTOS priority"
+    depends on LUA_ENGINE_ENABLED
+    default 4
+    range 1 20
+
+menu "Curated Lua libraries (preloaded via require)"
+
+config LUA_ENGINE_WITH_CJSON
+    bool "lua-cjson (JSON encode/decode)"
+    depends on LUA_ENGINE_ENABLED
+    default y
+
+config LUA_ENGINE_WITH_LPEG
+    bool "LPeg (pattern matching)"
+    depends on LUA_ENGINE_ENABLED
+    default n
+
+config LUA_ENGINE_WITH_MINIZ
+    bool "lua-miniz (zlib compress/decompress)"
+    depends on LUA_ENGINE_ENABLED
+    default n
+
+config LUA_ENGINE_CJSON_DECODE_MAX_DEPTH
+    int "cjson.decode max nesting depth"
+    depends on LUA_ENGINE_WITH_CJSON
+    default 64
+    range 4 1000
+
+endmenu
+
+endmenu

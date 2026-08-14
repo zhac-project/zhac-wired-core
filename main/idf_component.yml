@@ -1,13 +1,66 @@
+---
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Keep minimal -- the dependency graph is wired via EXTRA_COMPONENT_DIRS
-# (sibling repos) and the local components/mono_bridge shim.
+# Dependency manifest for zhac-wired-core (ESP32-P4, wired Ethernet).
+#
+# Resolution is the same hybrid zhac-net-core uses, and each half has a reason:
+#
+#   zhac-components  -> EXTRA_COMPONENT_DIRS in the root CMakeLists.txt.
+#   zhac-net-core    -> explicit `path:` entries below, so the rest of that
+#                       repo's components are not scanned.
+#   registry         -> version-pinned entries below.
+#   local shims      -> components/ in this repo wins by first-match.
+#
+# TWO TRAPS, both hit for real while building this file. Read before editing.
+#
+# 1. Do NOT widen EXTRA_COMPONENT_DIRS to zhac-main-core / zhac-mono-core.
+#    ESP-IDF resolves the requirements of every component it *discovers*, not
+#    just the reachable ones, so a wider path fails configure on
+#    `lua_cjson -> lua` before compiling anything.
+#
+# 2. Do NOT add `arduinojson` as a `path:` dependency here. The vendored copy
+#    at zhac-components/components/arduinojson declares its own REGISTRY
+#    dependency (`bblanchon/arduinojson >=7.0.0,<8.0.0`). Path-adding it makes
+#    the component manager treat it as managed and try to satisfy that too --
+#    i.e. resolve a registry component that duplicates the vendored one. The
+#    solver then spins: observed pinned at 100% CPU for 7+ minutes with every
+#    component already cached, ending in "Configuring incomplete".
+#    Reached via EXTRA_COMPONENT_DIRS it is simply a local component and the
+#    registry entry is satisfied by name. `REQUIRES arduinojson` still works.
+#
+# NOT here, deliberately: znp_driver, zigbee_mgr, ezsp_*, zigbee_backend.
+# This SKU's radio is esp-zigbee over ot_rcp and arrives in Phase 1; the legacy
+# backends belong to the flagship line. tools/check_no_rainmaker.sh enforces it.
+# The protocol-neutral device pool comes from components/zigbee_pool instead.
+
 dependencies:
   idf:
-    version: ">=6.0"
+    version: '>=6.0.0'
+
+  # -- registry --------------------------------------------------------------
 
   # mDNS. net-core gets this transitively via espressif/esp_rainmaker; this
-  # SKU has no RainMaker, so it must be declared. Same major as net-core
-  # resolves, to keep the two firmwares on one mDNS implementation.
+  # SKU has no RainMaker, so it must be declared explicitly. Same major as
+  # net-core resolves, to keep both firmwares on one mDNS implementation.
   espressif/mdns: "^1.9.0"
+
+  # esp-mqtt. ESP-IDF v6.0 no longer bundles this as a built-in component,
+  # so mqtt_gw takes it from the registry. Must stay unconditional.
+  espressif/mqtt: "^1.0.0"
+
+  # Lua interpreter for components/lua_engine + components/lua_cjson.
+  georgik/lua: ^5.5.0~7
+
+  # -- zhac-net-core (not on EXTRA_COMPONENT_DIRS; named explicitly) ----------
+
+  ws_server:
+    path: "../../zhac-net-core/components/ws_server"
+
+  # Declares espressif/esp_websocket_client itself -- a genuine registry
+  # dependency, unlike the arduinojson case above.
+  remote_client:
+    path: "../../zhac-net-core/components/remote_client"
+
+  # embedded-zhc is NOT a Component-Manager dependency -- it ships its own
+  # CMake tree, pulled via EMBEDDED_ZHC_PATH in the root CMakeLists.txt.
