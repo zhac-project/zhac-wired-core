@@ -25,6 +25,9 @@ Initial firmware. Nothing hardware-verified yet.
   - **`CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `CONFIG_ESP32P4_REV_MIN_0=y`.** P4 has two
     incompatible revision families — v0.x–v1.x and v3.x — and that first symbol picks
     which one the binary targets. A binary built for one will not boot on the other.
+    Accepted range is v0.0–v1.99, covering both ZHAC P4 boards (Guition
+    JC-ESP32P4-M3-DEV v1.x, confirmed 2026-08-14; WT0132P4-A1 bench rig v1.3), so one
+    build serves both. Neither is targetable by the v3.x family at all.
   - Setting `REV_MIN_0` **without** the gate is silently useless: kconfgen knows the
     symbol but cannot select it, so it drops to the default `_301` with **no warning at
     all**, not even "unknown kconfig symbol". Verified by experiment.

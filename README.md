@@ -54,9 +54,16 @@ The chip config here is taken wholesale from `zhac-main-core` — the one valida
 P4 hardware — and all eight settings resolve identically: revision family, `SPIRAM_MODE_HEX`
 @ 200 MHz, 360 MHz CPU, QIO flash @ 40 MHz, 16 MB.
 
-> **The Guition board's revision is unconfirmed.** If its first boot line reads
-> `chip: esp32p4, rev v3.x`, this binary will not run on it — set
-> `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n` and `CONFIG_ESP32P4_REV_MIN_300=y`.
+The accepted range is **v0.0 – v1.99**, and both ZHAC P4 boards fall inside it, so one build
+serves both:
+
+| board | revision |
+|---|---|
+| Guition JC-ESP32P4-M3-DEV | v1.x *(confirmed 2026-08-14)* |
+| WT0132P4-A1 bench rig | v1.3 |
+
+Neither can be targeted by the v3.x family at all, so this is not a compromise — it is the
+only setting that works for ZHAC hardware.
 
 > **Setting `CONFIG_ESP32P4_REV_MIN_0=y` without the gate is silently useless.** kconfgen
 > knows the symbol but cannot select it, so it drops to the default `_301` **with no warning
