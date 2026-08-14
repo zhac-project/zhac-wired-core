@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # zhac-wired-core consumes its siblings as read-only inputs, resolved by
+      # relative path, so CI has to lay them out the same way the workspace
+      # does: all repos checked out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: zhac-wired-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-components
+          path: zhac-components
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-net-core
+          path: zhac-net-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/embedded-zhc
+          path: embedded-zhc
+
+      - name: SKU invariants
+        working-directory: zhac-wired-core
+        run: ./tools/check_sku_invariants.sh
+
+      - name: Build (esp32p4)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32p4
+          path: zhac-wired-core
+
+      # Silently-ignored Kconfig symbols have bitten this repo three times
+      # (ESP32P4_REV_MIN_0, ETH_PHY_INTERFACE_RMII, ETH_RMII_CLK_INPUT). They
+      # are warnings, not errors, so the build stays green while the setting
+      # does nothing. Fail the job on them instead.
+      - name: No unknown Kconfig symbols
+        working-directory: zhac-wired-core
+        run: |
+          if grep -q 'unknown kconfig symbol' build/log/*.txt 2>/dev/null; then
+            echo "FAIL: sdkconfig.defaults contains symbols this IDF ignores" >&2
+            grep -h 'unknown kconfig symbol' build/log/*.txt >&2
+            exit 1
+          fi
+          echo "OK: no unknown kconfig symbols."

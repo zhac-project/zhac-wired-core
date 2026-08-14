@@ -46,3 +46,21 @@ endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(zhac-wired-core)
+
+# SPA -> "spa" SPIFFS partition image, built from the sibling www-spa output.
+# Run `npm run build` in www-spa FIRST: `idf.py build` never runs it, so a
+# stale or empty partition is otherwise silent. FLASH_IN_PROJECT makes
+# `idf.py flash` write it. Guarded so the firmware still builds with an empty
+# spa partition when dist/ is absent.
+#
+# Unlike zhac-net-core this repo has NO www-spa submodule; it consumes the
+# sibling checkout directly. Do not add a submodule to "match" net-core -- a
+# second checkout is exactly what causes the stale-SPIFFS trap there.
+set(ZHAC_SPA_DIST "${CMAKE_CURRENT_LIST_DIR}/../www-spa/dist")
+if(EXISTS "${ZHAC_SPA_DIST}/index.html")
+    spiffs_create_partition_image(spa "${ZHAC_SPA_DIST}" FLASH_IN_PROJECT)
+    message(STATUS "ZHAC: SPA image <- ${ZHAC_SPA_DIST}")
+else()
+    message(WARNING "ZHAC: ${ZHAC_SPA_DIST}/index.html not found — 'spa' partition "
+                    "will be empty. Build www-spa (npm run build), then reflash.")
+endif()
