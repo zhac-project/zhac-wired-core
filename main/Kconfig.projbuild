@@ -8,6 +8,20 @@ menu "ZHAC wired-core board"
     # exposed here -- each RMII signal picks independently from its own small
     # IO_MUX candidate set, and this board follows the IDF default for all of
     # them. A custom board would expose these; this one does not need to.
+    #
+    # ADDING A SECOND TARGET: keep ONE symbol per signal and give it a
+    # per-target default rather than duplicating the block behind
+    # `if IDF_TARGET_...`. Kconfig takes the first matching default:
+    #
+    #     config ZHAC_ETH_MDC_GPIO
+    #         int "EMAC MDC GPIO"
+    #         default 5  if IDF_TARGET_ESP32S31   # RGMII, YT8531
+    #         default 31                          # P4 / IP101, RMII
+    #
+    # That keeps eth_common.cpp and the API identical across SKUs; only the
+    # per-board eth_phy_*.cpp reads the values. Note the S31 is RGMII, so it
+    # additionally needs TX/RX clock pins and the data-plane set, which RMII
+    # does not have -- those belong in its own block, not retrofitted here.
 
     config ZHAC_ETH_MDC_GPIO
         int "EMAC MDC GPIO"

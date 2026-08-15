@@ -10,6 +10,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: esp32p4
+            idf: v6.0
+          # ESP32-S31 SKU. Blocked on toolchain, not on this repo:
+          #   * ESP-IDF has no esp32s31 target before v6.1 (preview support).
+          #   * esp-zigbee-lib 2.0.1 ships no esp32s31 library at all.
+          # Enable this row once both land -- and keep the IDF version PINNED
+          # PER ROW. Do not move the P4 row onto a beta IDF to unify them; the
+          # P4 is the shipping SKU.
+          # - target: esp32s31
+          #   idf: v6.1
+    name: build (${{ matrix.target }} / idf ${{ matrix.idf }})
     steps:
       # zhac-wired-core consumes its siblings as read-only inputs, resolved by
       # relative path, so CI has to lay them out the same way the workspace
@@ -37,11 +52,11 @@ jobs:
         working-directory: zhac-wired-core
         run: ./tools/check_sku_invariants.sh
 
-      - name: Build (esp32p4)
+      - name: Build
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v6.0
-          target: esp32p4
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
           path: zhac-wired-core
 
       # A line in sdkconfig.defaults can do nothing in two ways, and only one

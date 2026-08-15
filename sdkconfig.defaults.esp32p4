@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ESP32-P4 + C6 SKU. Applied automatically AFTER sdkconfig.defaults when
+# IDF_TARGET is esp32p4 (tools/cmake/kconfig.cmake:182).
+#
+# Board: Guition JC-ESP32P4-M3-DEV -- P4 + C6 module, 32 MB PSRAM, 16 MB flash,
+# IP101 PHY over RMII. Every value here is taken from zhac-main-core, the
+# configuration validated on ZHAC P4 hardware; do not "improve" them against
+# IDF defaults without hardware to prove it on.
+#
+# Assertions on the RESOLVED values live in tools/check_resolved_config.sh.
+
+# --- Silicon revision family -- READ BEFORE EDITING -------------------------
+#
+# ESP32-P4 is split into two incompatible revision families, and ONE Kconfig
+# picks which one a binary targets:
+#
+#   ESP32P4_SELECTS_REV_LESS_V3=y  -> rev choices v0.0 / v0.1 / v1.0, MAX 199
+#   ESP32P4_SELECTS_REV_LESS_V3=n  -> rev choices v3.0 / v3.1,        MAX 399
+#
+# (esp_hw_support/port/esp32p4/Kconfig.hw_support; the gate also moves the
+# bootloader offset and changes esp_pm CPU power-down and spi_flash TSUS/TRES.)
+#
+# A binary built for one family will NOT boot on the other -- a real either/or,
+# not a "minimum" in the usual sense.
+#
+# We take main-core's: LESS_V3 family, minimum rev v0.0, accepted range
+# v0.0 .. v1.99. Both ZHAC P4 boards fall inside it, so one build serves both:
+#
+#   Guition JC-ESP32P4-M3-DEV : v1.x  (confirmed 2026-08-14)
+#   WT0132P4-A1 bench rig     : v1.3
+#
+# Neither is targetable by the v3.x family at all, so this is not a compromise.
+#
+# ⚠ Setting REV_MIN_0 WITHOUT the gate is silently useless: the symbol is known
+# to kconfgen but unselectable, so it is dropped to the default (_301) with NO
+# warning -- not even "unknown kconfig symbol". Verified by experiment. Always
+# check the RESOLVED value:  grep ESP32P4_REV_MIN_FULL sdkconfig
+# A revision mismatch fails at FLASH time; a green build proves nothing.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_0=y
+
+# --- Clock ------------------------------------------------------------------
+# 360 MHz, matching main-core. The IDF default for esp32p4 is 400 MHz; main-core
+# deliberately runs 360 and that is the clock ZHAC's P4 firmware is validated
+# at. PSRAM is HEX mode @ 200 MHz here (IDF default for this part, identical to
+# main-core) and shares the MPLL.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# --- Flash ------------------------------------------------------------------
+# QIO @ 40 MHz, matching main-core rather than the IDF defaults this project
+# would otherwise land on (DIO @ 80 MHz). 80 MHz is not worth assuming on a
+# board nobody has flashed yet.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+
+# --- PSRAM placement --------------------------------------------------------
+# Near-free on P4 thanks to its separate flash/PSRAM buses and L2 cache (same
+# rationale as main-core). RODATA shifts const tables -- the ZHC catalogs and
+# string literals -- into PSRAM, offloading the flash MMU window. External BSS
+# currently moves ~112 KB of statics off internal RAM.
+#
+# These are per-target and not per-SKU cosmetics: which of them exist, and what
+# they cost, differs by SoC. The S31 has 512 KB SRAM against the P4's 768 KB, so
+# its file will likely lean on these harder, not less.
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y

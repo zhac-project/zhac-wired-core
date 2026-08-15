@@ -80,6 +80,24 @@ Initial firmware. Nothing hardware-verified yet.
 - **CI** — sibling checkouts laid out side by side, the guard, an `esp32p4` build, and a
   job that fails on `unknown kconfig symbol` (see below).
 
+- **Shaped for a second SoC**, ahead of an ESP32-S31-solo SKU (its own 802.15.4 radio
+  replacing the C6, RGMII instead of RMII). Pure refactor of the P4 build — the resolved
+  `sdkconfig` is **byte-identical** to before it, and the only binary delta is +290 bytes
+  of `.text` from splitting a translation unit, with **no DRAM or PSRAM change**.
+  - `sdkconfig.defaults` split into a target-neutral base plus
+    `sdkconfig.defaults.esp32p4`, which ESP-IDF applies automatically afterwards
+    (`tools/cmake/kconfig.cmake:182`). The base file must exist even if empty — per the
+    IDF docs the per-target file loads *"if and only if"* it does.
+  - Ethernet split into target-neutral plumbing (`eth_common.cpp`: netif, DHCP, events,
+    status) and one board implementation behind `board_eth_new()` (`board_eth.h`), picked
+    by `IDF_TARGET` in `main/CMakeLists.txt`. Selecting by file rather than by `#if` means
+    a build for one target cannot compile the other's code. An unrecognised target fails
+    at CMake time with a message naming what to add.
+  - `eth_get_status()` now reports gigabit link speed rather than collapsing anything
+    non-100M to 10 — the S31 has a gigabit MAC.
+  - CI is a target matrix with the IDF version pinned **per row**; the S31 row is present
+    but commented, with the two toolchain blockers recorded.
+
 ### Notes
 
 - **No radio in this phase, by decision.** The Zigbee stack arrives in Phase 1 as

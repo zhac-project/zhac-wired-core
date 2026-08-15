@@ -1,108 +1,90 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# zhac-wired-core sdkconfig.defaults — derived from zhac-mono-core with:
-#   - target esp32s3 -> esp32p4
-#   - all CONFIG_ESP_WIFI_* dropped (no WiFi anywhere in this build)
-#   - CONFIG_SPIRAM_MODE_OCT dropped (S3 octal PSRAM; P4 configures its own)
-#   - CONFIG_ESP32S3_DEFAULT_CPU_FREQ_* dropped (P4 default clock is correct)
-#   + Ethernet MAC/PHY
+# zhac-wired-core -- TARGET-NEUTRAL defaults.
+#
+# Anything that depends on the SoC lives in sdkconfig.defaults.<target>, which
+# ESP-IDF applies automatically AFTER this file (tools/cmake/kconfig.cmake:182):
+#
+#   sdkconfig.defaults            <- this file, every target
+#   sdkconfig.defaults.esp32p4    <- P4 + C6 SKU
+#   sdkconfig.defaults.esp32s31   <- S31-solo SKU (when the toolchain lands)
+#
+# ⚠ THIS FILE MUST EXIST, even if it were empty. Straight from the IDF docs:
+# "If AND ONLY IF an sdkconfig.defaults file exists, the build system will also
+# attempt to load defaults from sdkconfig.defaults.TARGET_NAME." Delete it and
+# every per-target file silently stops being read -- no warning, no error.
+#
+# Rule of thumb for where a line goes: if the symbol name contains a chip
+# (ESP32P4_*), or its value was chosen for a specific board's silicon, flash or
+# clock, it belongs in the per-target file. System behaviour that should be
+# identical across SKUs belongs here.
+#
+# Default target is set here so a fresh `idf.py build` with no set-target
+# produces the shipping SKU rather than falling back to esp32.
+# `idf.py set-target esp32s31` overrides it.
 CONFIG_IDF_TARGET="esp32p4"
 
-# Silicon revision family. TAKEN FROM zhac-main-core -- READ THIS BEFORE EDITING.
-#
-# ESP32-P4 is split into two incompatible revision families, and ONE Kconfig
-# picks which one a binary targets:
-#
-#   ESP32P4_SELECTS_REV_LESS_V3=y  -> rev choices v0.0 / v0.1 / v1.0, MAX 199
-#   ESP32P4_SELECTS_REV_LESS_V3=n  -> rev choices v3.0 / v3.1,        MAX 399
-#
-# (esp_hw_support/port/esp32p4/Kconfig.hw_support; the gate also moves the
-# bootloader offset 0x2000 -> 0x1000-ish, and changes esp_pm CPU power-down and
-# spi_flash TSUS/TRES support.)
-#
-# A binary built for one family will NOT boot on the other, so this is a real
-# either/or, not a "minimum" in the usual sense.
-#
-# We match zhac-main-core: the LESS_V3 family, minimum rev v0.0, giving an
-# accepted range of v0.0 .. v1.99. Both ZHAC P4 boards fall inside it, so one
-# build serves both:
-#
-#   Guition JC-ESP32P4-M3-DEV : v1.x  (confirmed 2026-08-14)
-#   WT0132P4-A1 bench rig     : v1.3
-#
-# Neither can be targeted by the v3.x family at all, so this is not a
-# compromise -- it is the only setting that works for ZHAC hardware.
-#
-# ⚠ Setting REV_MIN_0 WITHOUT the gate is silently useless: the symbol is known
-# to kconfgen but unselectable, so it is dropped to the default (_301) with NO
-# warning -- not even "unknown kconfig symbol". Verified by experiment. Always
-# check the RESOLVED value:  grep ESP32P4_REV_MIN_FULL sdkconfig
-# A revision mismatch fails at FLASH time; a green build proves nothing.
-CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_0=y
-
+# --- Kernel -----------------------------------------------------------------
+# 1 ms tick: needed by the per-second cron tick in simple_rules and by
+# lwIP / WS server timing.
 CONFIG_FREERTOS_HZ=1000
+
+# 10 s ceiling, IDLE0 exempt: the Lua and event-bus loops yield through CPU0
+# and a brief stall there during NVS commits is normal.
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 
-# PSRAM is mandatory. RODATA + BSS placement are near-free on P4 thanks to
-# its separate flash/PSRAM buses and L2 cache (same rationale as main-core).
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_RODATA=y
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-
-# Flash: QIO @ 40 MHz, matching zhac-main-core rather than the IDF defaults
-# this project would otherwise land on (DIO @ 80 MHz). main-core's values are
-# the ones proven on ZHAC P4 hardware; 80 MHz in particular is not worth
-# assuming on a board nobody has flashed yet.
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
-
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-
-CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-CONFIG_ESP_BROWNOUT_DET=y
-CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
-CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 CONFIG_FREERTOS_ISR_STACKSIZE=4192
 # Renamed in IDF v6.0 (was CONFIG_MAIN_TASK_STACK_SIZE; kconfgen still
 # auto-replaces the old name, but only with an `info:` line nobody reads).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4192
 
-CONFIG_HTTPD_WS_SUPPORT=y
+# --- Memory -----------------------------------------------------------------
+# PSRAM is mandatory in this firmware -- the device pool, the log ring and the
+# 6,235-definition tables all assume it. The PLACEMENT knobs (RODATA, external
+# BSS, speed, mode) are per-target: which of them exist and what they cost
+# differs by SoC, so they live in the per-target files.
+CONFIG_SPIRAM=y
+
+# --- Storage ----------------------------------------------------------------
+# Both current boards are 16 MB. Flash MODE and FREQUENCY are per-target --
+# they are timing choices validated against specific silicon.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Diagnostics ------------------------------------------------------------
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
-CONFIG_LWIP_MAX_SOCKETS=16
 
-# Ethernet: internal EMAC + external RMII PHY.
+# --- Network ----------------------------------------------------------------
+# Socket pool: 3 internal httpd + 9 user WS + 2 REST + 2 MQTT = 16.
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# Internal EMAC. This is the only Ethernet Kconfig symbol that is real here:
+# the RMII/RGMII interface selection and the REF_CLK direction are runtime
+# fields of eth_esp32_emac_config_t, set in the per-board eth PHY source.
 #
-# Only CONFIG_ETH_USE_ESP32_EMAC is a real symbol here. The RMII interface
-# selection and the REF_CLK direction are NOT Kconfig on esp32p4 -- they are
-# runtime fields of eth_esp32_emac_config_t, set in eth.cpp. Earlier drafts
-# of this file also carried CONFIG_ETH_PHY_INTERFACE_RMII and
+# Earlier drafts also carried CONFIG_ETH_PHY_INTERFACE_RMII and
 # CONFIG_ETH_RMII_CLK_INPUT; both are unknown symbols in IDF v6.0 and were
-# silently ignored, implying configuration that was not happening.
-#
-# Catch that class with:
+# silently ignored, implying configuration that was not happening. Catch that
+# class with:
 #   idf.py reconfigure 2>&1 | grep 'unknown kconfig symbol'
-# It has bitten this file twice (these two).
 #
-# NOTE that grep does NOT catch the OTHER silent-drop class -- a symbol that
-# kconfgen knows but cannot select, which it drops to the default without any
-# warning (see the ESP32P4_REV_MIN block above). Only checking the RESOLVED
-# value catches that, which is what tools/check_resolved_config.sh does.
+# That grep does NOT catch the OTHER silent-drop class -- a symbol kconfgen
+# knows but cannot select, which it drops to the choice default with no warning
+# at all (see the ESP32P4_REV_MIN block in sdkconfig.defaults.esp32p4). Only
+# checking the RESOLVED value catches that: tools/check_resolved_config.sh.
 CONFIG_ETH_USE_ESP32_EMAC=y
 
-# 360 MHz, matching zhac-main-core. The IDF default for esp32p4 is 400 MHz;
-# main-core deliberately runs 360 and that is the clock ZHAC's P4 firmware is
-# actually validated at. PSRAM here is HEX mode @ 200 MHz (IDF default for
-# this part, and identical to main-core), which shares the MPLL.
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
-
+# --- Performance ------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_MBEDTLS_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
@@ -110,5 +92,7 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 CONFIG_LWIP_TCP_WND_DEFAULT=11520
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
+# --- Radio ------------------------------------------------------------------
 # No radio in Phase 0. Deliberately absent: CONFIG_ZHAC_NCP_ZNP / _EZSP / _C6.
-# Phase 1 selects the esp-zigbee backend (ot_rcp on the onboard C6).
+# Phase 1 adds esp_zigbee_backend behind a Kconfig choice -- UART_RCP on the
+# P4 (ot_rcp on the onboard C6), NATIVE on the S31.

@@ -80,6 +80,38 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
+## Multi-target layout
+
+The tree is shaped for a second SoC — an **ESP32-S31-solo** SKU, where the S31's own
+802.15.4 radio replaces the C6 and Ethernet is RGMII rather than RMII. That is blocked on
+toolchain, not on this repo (ESP-IDF has no `esp32s31` target before v6.1; `esp-zigbee-lib`
+2.0.1 ships no `esp32s31` library). See `../extra/docs/WIRED_CORE_MULTI_TARGET_DESIGN.md`
+for why it stays in this repo rather than becoming a fourth firmware fork.
+
+Three things differ per target; everything else is shared.
+
+| Concern | Mechanism |
+|---|---|
+| Chip config | `sdkconfig.defaults.<target>`, auto-applied **after** `sdkconfig.defaults` |
+| Ethernet PHY | one `board_eth_new()` impl per board, picked by `IDF_TARGET` in `main/CMakeLists.txt` |
+| Zigbee radio | *(Phase 1)* Kconfig choice — `UART_RCP` on P4, `NATIVE` on S31 |
+
+```
+sdkconfig.defaults              shared, target-neutral
+sdkconfig.defaults.esp32p4      P4: revision family, 360 MHz, QIO@40, PSRAM placement
+main/eth.h                      public API — no PHY or interface in it
+main/eth_common.cpp             netif, DHCP, events, status   (no #if IDF_TARGET)
+main/board_eth.h                the seam: board_eth_new(&mac, &phy)
+main/eth_phy_ip101_rmii.cpp     P4  / IP101 / RMII
+```
+
+> `sdkconfig.defaults` **must exist** even if it were empty — per the IDF docs, the
+> per-target file is loaded *"if and only if"* the base file does. Deleting it silently
+> stops every `sdkconfig.defaults.<target>` from being read.
+
+An unrecognised target fails at CMake time with a message naming the two files to add,
+rather than as a mysterious link error.
+
 Sibling repos are **read-only inputs**, resolved via `EXTRA_COMPONENT_DIRS` and
 `EMBEDDED_ZHC_PATH`: `zhac-components`, `zhac-net-core`, `zhac-main-core`, `embedded-zhc`,
 `www-spa`. A change needed in one of them belongs in that repo, not here.

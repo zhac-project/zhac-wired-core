@@ -10,10 +10,27 @@
 #                   esp_zigbee_backend over ot_rcp. The protocol-neutral
 #                   device pool comes from components/zigbee_pool instead;
 #                   see that component's CMakeLists for why.
+# Ethernet is split into target-neutral plumbing (eth_common.cpp) plus exactly
+# one board/PHY implementation of board_eth_new() -- see main/board_eth.h.
+# Selecting it here rather than with #if inside a shared file means a build for
+# one target cannot even compile the other's code.
+if(IDF_TARGET STREQUAL "esp32p4")
+    set(BOARD_ETH_SRC "eth_phy_ip101_rmii.cpp")   # Guition JC-ESP32P4-M3-DEV
+elseif(IDF_TARGET STREQUAL "esp32s31")
+    set(BOARD_ETH_SRC "eth_phy_yt8531_rgmii.cpp") # S31 Function-Core
+else()
+    message(FATAL_ERROR
+        "zhac-wired-core: no Ethernet PHY implementation for IDF_TARGET "
+        "'${IDF_TARGET}'. Add main/eth_phy_<phy>_<iface>.cpp implementing "
+        "board_eth_new() (see main/board_eth.h) and a branch here, plus a "
+        "sdkconfig.defaults.${IDF_TARGET}.")
+endif()
+
 idf_component_register(
     SRCS
         "main.cpp"
-        "eth.cpp"
+        "eth_common.cpp"
+        "${BOARD_ETH_SRC}"
         "net_discovery.cpp"
         "sys_state.cpp"
         "log_ring.cpp"
