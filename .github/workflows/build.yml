@@ -16,12 +16,13 @@ jobs:
         include:
           - target: esp32p4
             idf: v6.0
-          # ESP32-S31 SKU. Blocked on toolchain, not on this repo:
-          #   * ESP-IDF has no esp32s31 target before v6.1 (preview support).
-          #   * esp-zigbee-lib 2.0.1 ships no esp32s31 library at all.
-          # Enable this row once both land -- and keep the IDF version PINNED
-          # PER ROW. Do not move the P4 row onto a beta IDF to unify them; the
-          # P4 is the shipping SKU.
+          # ESP32-S31 SKU. Blocked on ONE thing: ESP-IDF has no esp32s31
+          # target before v6.1 (preview in v6.1-beta1). The library half is
+          # solved -- esp-zigbee-lib 2.0.4 ships esp32s31 libs including the
+          # native radio flavor (verified 2026-08-15), so ^2.0.4 is the floor.
+          # Enable this row once a v6.1 lands -- and keep the IDF version
+          # PINNED PER ROW. Do not move the P4 row onto a beta IDF to unify
+          # them; the P4 is the shipping SKU.
           # - target: esp32s31
           #   idf: v6.1
     name: build (${{ matrix.target }} / idf ${{ matrix.idf }})

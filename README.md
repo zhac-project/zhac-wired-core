@@ -84,9 +84,12 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 The tree is shaped for a second SoC — an **ESP32-S31-solo** SKU, where the S31's own
 802.15.4 radio replaces the C6 and Ethernet is RGMII rather than RMII. That is blocked on
-toolchain, not on this repo (ESP-IDF has no `esp32s31` target before v6.1; `esp-zigbee-lib`
-2.0.1 ships no `esp32s31` library). See `../extra/docs/WIRED_CORE_MULTI_TARGET_DESIGN.md`
-for why it stays in this repo rather than becoming a fourth firmware fork.
+one thing only: ESP-IDF has no `esp32s31` target before **v6.1-beta1**. The library half is
+already solved — `esp-zigbee-lib` **2.0.4** ships `esp32s31` libs including the `native`
+radio flavor (verified in the registry archive 2026-08-15; 2.0.1 had none, so `^2.0.4` is
+the floor), and a C6 RAM proxy (`../extra/s31-spike/`) already links the native coordinator
+stack at ≈ **18.6 KB static DIRAM**. See `../extra/docs/WIRED_CORE_MULTI_TARGET_DESIGN.md`
+for why S31 stays in this repo rather than becoming a fourth firmware fork.
 
 Three things differ per target; everything else is shared.
 
