@@ -1,0 +1,27 @@
+path = "/home/user/.espressif"
+idf_path = "/home/user/.espressif/v6.1-beta1/esp-idf"
+esp_idf_json_path = "/home/user/.espressif/tools"
+tool_download_folder_name = "/home/user/.espressif/dist"
+tool_install_folder_name = "/home/user/.espressif/tools"
+target = ["esp32s31"]
+idf_versions = ["v6.1-beta1"]
+tools_json_file = "tools/tools.json"
+config_file_save_path = "eim_config.toml"
+non_interactive = true
+wizard_all_questions = false
+mirror = "https://dl.espressif.com/github_assets"
+idf_mirror = "https://github.com"
+pypi_mirror = "https://pypi.org/simple"
+recurse_submodules = true
+install_all_prerequisites = true
+skip_prerequisites_check = false
+cleanup = false
+python_env_folder_name = "python"
+activation_script_path_override = "/home/user/.espressif/tools"
+python_version_override = "python313"
+
+[idf_features_per_version]
+"v6.1-beta1" = ["core"]
+
+[idf_tools_per_version]
+"v6.1-beta1" = ["riscv32-esp-elf-gdb", "esp-clang", "esp-clang-libs", "riscv32-esp-elf", "cmake", "openocd-esp32", "ninja", "esp-rom-elfs", "esp-clangd"]

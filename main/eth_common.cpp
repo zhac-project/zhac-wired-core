@@ -90,6 +90,17 @@ void eth_start() {
         return;
     }
 
+    // PHY quirks that need a live handle, before the link is brought up.
+    // Failure here is loud but not fatal: on the S31 it means the RGMII clock
+    // delays are unset, so the link may come up yet corrupt data -- far better
+    // to see this line in the log than to chase phantom packet loss.
+    err = board_eth_post_install(s_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "board_eth_post_install failed: %s -- PHY may be "
+                      "misconfigured; expect an unreliable link",
+                 esp_err_to_name(err));
+    }
+
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, esp_eth_new_netif_glue(s_handle)));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                                &on_eth_event, nullptr));

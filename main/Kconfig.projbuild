@@ -23,32 +23,55 @@ menu "ZHAC wired-core board"
     # additionally needs TX/RX clock pins and the data-plane set, which RMII
     # does not have -- those belong in its own block, not retrofitted here.
 
+    # SMI (MDC/MDIO) is the one pair both PHYs need. Per-target defaults, one
+    # symbol per signal -- see the note above.
     config ZHAC_ETH_MDC_GPIO
         int "EMAC MDC GPIO"
+        default 5 if IDF_TARGET_ESP32S31
         default 31
 
     config ZHAC_ETH_MDIO_GPIO
         int "EMAC MDIO GPIO"
+        default 6 if IDF_TARGET_ESP32S31
         default 52
 
+    config ZHAC_ETH_PHY_ADDR
+        int "Ethernet PHY SMI address (-1 = autodetect)"
+        default -1 if IDF_TARGET_ESP32S31
+        default 1
+
+    # --- P4 / IP101 / RMII only ---
+    # The RGMII data and clock pins on the S31 are not Kconfig: there are ten
+    # of them plus two clocks, they are board-fixed, and exposing them would be
+    # noise. They live in eth_phy_yt8531_rgmii.cpp.
     config ZHAC_ETH_REF_CLK_GPIO
         int "EMAC RMII REF_CLK input GPIO"
+        depends on IDF_TARGET_ESP32P4
         default 50
         help
-            Clock is sourced by the PHY (EMAC_CLK_EXT_IN). Valid inputs are
-            GPIO32, GPIO44 and GPIO50 only.
+            RMII-only concept -- RGMII has separate Rx and Tx clocks instead.
+            Sourced by the PHY (EMAC_CLK_EXT_IN); valid inputs are GPIO32,
+            GPIO44 and GPIO50 only.
 
     config ZHAC_ETH_PHY_PWR_GPIO
         int "IP101 PHY power/enable GPIO (-1 if always on)"
+        depends on IDF_TARGET_ESP32P4
         default 51
         help
             Must be driven high and held before the PHY is probed, or SMI
             reads return all-ones and PHY detection fails with a misleading
             "no PHY found".
 
-    config ZHAC_ETH_PHY_ADDR
-        int "Ethernet PHY SMI address (-1 = autodetect)"
-        default 1
+    # --- S31 / YT8531 / RGMII only ---
+    config ZHAC_ETH_PHY_RST_GPIO
+        int "PHY reset GPIO (-1 if none)"
+        depends on IDF_TARGET_ESP32S31
+        default 7
+        help
+            Handed to the generic PHY driver (eth_phy_config_t.reset_gpio_num)
+            so it performs a proper reset pulse before probing. Note the P4
+            board uses the equivalent line as a always-high power enable
+            instead -- see ZHAC_ETH_PHY_PWR_GPIO.
 
     config ZHAC_MDNS_HOSTNAME
         string "mDNS hostname (without .local)"

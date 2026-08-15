@@ -1,11 +1,26 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# zigbee_pool -- the protocol-neutral half of the sibling `zigbee_mgr`
-# component, compiled without any of its ZNP-bound half.
+# zigbee_mgr -- a LOCAL OVERRIDE of the sibling component of the same name,
+# compiling only its protocol-neutral half and dropping the ZNP-bound half.
 #
-# WHY THIS EXISTS
-# ---------------
+# Being named `zigbee_mgr` is the whole point: ESP-IDF resolves components by
+# first match, and a project's own components/ wins. So every existing
+# `REQUIRES zigbee_mgr` in the tree -- sibling `simple_rules`, our local
+# `lua_engine` -- silently resolves HERE instead of to the sibling, and
+# znp_driver never enters the build graph at all. Same trick mono_bridge uses
+# to displace hap_master / hap_slave.
+#
+# This replaced an earlier `zigbee_pool`-named component, which did not work:
+# under that name the sibling zigbee_mgr was still reachable via
+# simple_rules/lua_engine, so znp_driver was compiled into the firmware
+# regardless. It happened to build on esp32p4 and nobody noticed until esp32s31
+# rejected it (no GPIO_NUM_29; IDF v6.1 added a uart_config_t field the
+# driver's initialiser omits). tools/check_sku_invariants.sh now asserts the
+# build GRAPH, not just our sources, so that cannot regress silently again.
+#
+# WHY ONLY HALF
+# -------------
 # `zigbee_mgr` in zhac-components is described elsewhere as a "backend-agnostic
 # lifecycle" layer. It is not: its CMakeLists REQUIRES znp_driver, and
 # zigbee_mgr.cpp / zigbee_interview.cpp / zcl_commands.cpp make ~41 direct
@@ -43,12 +58,23 @@ idf_component_register(
     SRCS
         "${ZM_DIR}/zigbee_pool.cpp"
         "${ZM_DIR}/zigbee_diagnostics.cpp"
+        # Radio operations the control surface calls but Phase 0 cannot serve.
+        # Deleted in Phase 1 when esp_zigbee_backend provides the real ones.
+        "radio_stubs.cpp"
     INCLUDE_DIRS
         "${ZM_DIR}/include"
+    # Mirrors the sibling's public REQUIRES exactly, MINUS znp_driver. Being a
+    # drop-in means matching its public interface, not just its symbols: IDF
+    # propagates REQUIRES transitively for include paths, so anything that got
+    # device_shadow.h or event_bus.h "for free" by requiring zigbee_mgr must
+    # still get them. Trimming this list to only what the two compiled files
+    # need broke sibling simple_rules with a missing device_shadow.h.
     REQUIRES
         freertos
         esp_timer
         zap_common
         zap_store
+        event_bus
+        device_shadow
         zhc_adapter
 )

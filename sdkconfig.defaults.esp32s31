@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ESP32-S31 single-chip SKU. Applied automatically AFTER sdkconfig.defaults
+# when IDF_TARGET is esp32s31 (tools/cmake/kconfig.cmake:182).
+#
+# Board: ESP32-S31 Function-Core -- S31 alone, no co-processor. Zigbee runs on
+# the SoC's OWN 802.15.4 radio (native, not RCP) and Ethernet is RGMII to a
+# YT8531 PHY. No Wi-Fi, no BT/BLE, by product decision.
+#
+# ⚠ esp32s31 is a PREVIEW target in ESP-IDF v6.1-beta1 -- every idf.py command
+# needs --preview, and the eim activation script must be used rather than
+# export.sh. See ../extra/s31-spike/README.md for all three toolchain traps.
+#
+# Deliberately minimal: unlike the P4 file (which mirrors zhac-main-core's
+# hardware-validated values), there is no validated S31 reference to copy yet,
+# so this takes IDF's defaults and records what they resolve to rather than
+# asserting numbers nobody has measured. Verify with:
+#   grep -E 'CPU_FREQ|FLASH|SPIRAM|REV_MIN' sdkconfig
+
+# Silicon revision. Unlike the P4 -- which has two incompatible families behind
+# ESP32P4_SELECTS_REV_LESS_V3 -- the S31 choice currently offers exactly one
+# option, so there is no family trap here. The bench part is rev v0.0.
+CONFIG_ESP32S31_REV_MIN_0=y
+
+# --- PSRAM speed: COUPLED TO ETHERNET. Do not change casually. ---
+#
+# On the S31 the EMAC's RGMII Tx clock and PSRAM share the **MPLL**, and PSRAM
+# claims it first. The RGMII output needs exactly 125 MHz (÷ by an integer from
+# the PLL) and the driver refuses anything outside tolerance.
+#
+#   PSRAM 200 MHz -> MPLL 400 MHz -> 400/3 = 133.3 MHz  -> EMAC init FAILS
+#   PSRAM 250 MHz -> MPLL 500 MHz -> 500/4 = 125 MHz    -> OK
+#
+# Observed verbatim with the 200 MHz default:
+#   W esp.emac: MPLL is occupied already, it is working at 400000000 Hz
+#   E esp.emac: EMAC out frequency ... unusable frequency 133333333 Hz
+#   E esp.emac: Configure RGMII internal ref clock divider failed
+#
+# So 250 MHz is not just the faster option -- it is the one that lets Ethernet
+# come up at all while keeping PSRAM. It is also the speed the S31 datasheet
+# quotes for its in-package DDR PSRAM.
+#
+# If PSRAM ever has to drop to 200/100/40 MHz, Ethernet must be decoupled from
+# MPLL at the same time via CONFIG_ETH_EMAC_RGMII_TX_CLK_SRC_CPLL (or _APLL)
+# instead of the _AUTO default -- otherwise the link silently never comes up.
+# Same family as the P4's EMAC_CLK_OUT trap; see sdkconfig.defaults.esp32p4.
+CONFIG_SPIRAM_SPEED_250M=y
+
+# PSRAM placement is NOT set here yet, deliberately.
+#
+# The S31 has 512 KB SRAM against the P4's 768 KB, so pushing rodata and BSS
+# external matters more here, not less -- and its PSRAM is 250 MHz DDR, so it
+# is cheaper to reach. But the placement symbols must be confirmed to EXIST for
+# this target before being set: an unknown symbol in a defaults file is
+# silently ignored (CI greps for that), and a known-but-unselectable one is
+# dropped to its default with no warning at all -- the trap that cost real time
+# on the P4 (see sdkconfig.defaults.esp32p4). Confirm, then add, then assert in
+# tools/check_resolved_config.sh.
+#
+# Measured headroom as of 2026-08-15 says this is not urgent: the Zigbee stack
+# costs ~50.7 KB internal on real S31 silicon, leaving ~397 KB of 492 KB free.

@@ -99,3 +99,12 @@ esp_err_t board_eth_new(esp_eth_mac_t** out_mac, esp_eth_phy_t** out_phy) {
     *out_phy = phy;
     return ESP_OK;
 }
+
+esp_err_t board_eth_post_install(esp_eth_handle_t handle) {
+    // The IP101 needs nothing after driver install. Note IDF's own
+    // ethernet/basic example calls this board's GPIO51 the PHY *reset* line
+    // rather than a power enable; holding it high above is equivalent for our
+    // purposes, and is what has been built and tested here.
+    (void)handle;
+    return ESP_OK;
+}

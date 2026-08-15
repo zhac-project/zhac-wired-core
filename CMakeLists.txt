@@ -44,6 +44,20 @@ if(NOT DEFINED ENV{EMBEDDED_ZHC_PATH})
     set(ENV{EMBEDDED_ZHC_PATH} "${CMAKE_CURRENT_LIST_DIR}/../embedded-zhc")
 endif()
 
+# Build ONLY what main actually requires, transitively.
+#
+# Without this, ESP-IDF compiles every component it discovers on
+# EXTRA_COMPONENT_DIRS -- which silently included znp_driver, zigbee_mgr,
+# ezsp_* and tg_gw in this firmware. They happened to compile for esp32p4 so
+# nobody noticed; on esp32s31 znp_driver fails outright (GPIO_NUM_29 does not
+# exist there, and IDF v6.1 added a uart_config_t field its initialiser omits).
+#
+# So this line is not a build-time optimisation, it is what actually ENFORCES
+# the "no legacy radio backend" property that tools/check_sku_invariants.sh
+# only ever checked by grepping our own sources. A component that is never
+# compiled cannot be linked in by accident.
+set(COMPONENTS main)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(zhac-wired-core)
 

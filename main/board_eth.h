@@ -26,3 +26,15 @@
 // than aborting, so the rest of the firmware still runs on a board with a dead
 // or absent PHY.
 esp_err_t board_eth_new(esp_eth_mac_t** out_mac, esp_eth_phy_t** out_phy);
+
+// Board hook for PHY quirks that need a LIVE driver handle. Called by
+// eth_common after esp_eth_driver_install() and before esp_eth_start().
+//
+// This exists because some PHYs cannot be fully configured through
+// eth_phy_config_t: the YT8531 on the S31 needs auto-negotiation re-enabled
+// after the generic driver's reset, and its RGMII clock delays written through
+// the extended register interface -- both via esp_eth_ioctl(), which needs the
+// handle board_eth_new() cannot yet have.
+//
+// Boards with no quirks return ESP_OK without doing anything.
+esp_err_t board_eth_post_install(esp_eth_handle_t handle);

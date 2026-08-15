@@ -8,7 +8,7 @@
 #   znp_driver / zigbee_mgr / zigbee_backend / ezsp_*
 #                -- no radio in Phase 0. Phase 1 brings exactly one backend,
 #                   esp_zigbee_backend over ot_rcp. The protocol-neutral
-#                   device pool comes from components/zigbee_pool instead;
+#                   device pool comes from components/zigbee_mgr instead;
 #                   see that component's CMakeLists for why.
 # Ethernet is split into target-neutral plumbing (eth_common.cpp) plus exactly
 # one board/PHY implementation of board_eth_new() -- see main/board_eth.h.
@@ -73,7 +73,10 @@ idf_component_register(
         mono_bridge
         lua_engine
         lua_cjson
-        zigbee_pool
+        zigbee_mgr
+        # Empty on p4/s3 where the sibling tg_gw supplies real sources; carries
+        # the stubs on targets it does not cover. See its CMakeLists.
+        tg_gw_stub
         # -- zhac-components ----------------------------------------------
         hap_protocol
         zap_common
