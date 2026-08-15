@@ -48,6 +48,15 @@
 # splitting zigbee_mgr upstream is added Phase-1 scope.
 set(ZM_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../zhac-components/components/zigbee_mgr")
 
+# radio_stubs.cpp is ALWAYS compiled; its contents are gated inside the file
+# with #if !CONFIG_ZHAC_ESP_ZIGBEE.
+#
+# It must not be gated here: ESP-IDF's early-expansion pass processes this file
+# with CONFIG_* undefined, so an `if(CONFIG_...)` around SRCS resolves against
+# an empty value and silently picks the wrong branch. Source-level #if sees the
+# real symbol. (Gating on IDF_TARGET here would be fine -- that is available.)
+set(RADIO_STUBS_SRC "radio_stubs.cpp")
+
 if(NOT EXISTS "${ZM_DIR}/zigbee_pool.cpp")
     message(FATAL_ERROR
         "zigbee_pool: cannot find the sibling zigbee_mgr sources at ${ZM_DIR}. "
@@ -58,9 +67,10 @@ idf_component_register(
     SRCS
         "${ZM_DIR}/zigbee_pool.cpp"
         "${ZM_DIR}/zigbee_diagnostics.cpp"
-        # Radio operations the control surface calls but Phase 0 cannot serve.
-        # Deleted in Phase 1 when esp_zigbee_backend provides the real ones.
-        "radio_stubs.cpp"
+        # Radio operations the control surface calls. esp_zigbee_backend
+        # defines the SAME six symbols, so exactly one of the two may be
+        # compiled -- linking both is a duplicate-symbol error.
+        ${RADIO_STUBS_SRC}
     INCLUDE_DIRS
         "${ZM_DIR}/include"
     # Mirrors the sibling's public REQUIRES exactly, MINUS znp_driver. Being a

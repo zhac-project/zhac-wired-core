@@ -8,16 +8,15 @@
 //
 //   * esp_eth + mDNS instead of wifi_start(). No credentials, no AP fallback,
 //     no provisioning -- discovery is DHCP plus <hostname>.local.
-//   * NO radio. znp_driver_init() / zigbee_backend_register() /
-//     zigbee_mgr_init() are absent; the device_backend registry stays empty
-//     and /api/devices returns an empty list, which is the correct answer
-//     rather than a stub's fiction. Phase 1 registers esp_zigbee_backend
-//     (esp-zigbee-lib in UART_RCP mode driving a C6 running stock ot_rcp) and
-//     nothing else here has to change.
+//   * The radio is esp-zigbee-lib with the stack on THIS SoC, registered as a
+//     DeviceBackend -- never the TI ZNP path. Where the PHY lives is the only
+//     per-target difference and the lib's Kconfig picks it: the S31's own
+//     802.15.4, or a C6 running stock ot_rcp over UART on the P4. Nothing
+//     above zhc_adapter can tell which.
 //
-// Everything between those two -- shadow, store, adapter, diagnostics, rules,
-// Lua, WS, MQTT, SPA -- is up and exercised, so Phase 1 is a backend
-// registration rather than a re-architecture.
+// Everything between -- shadow, store, adapter, diagnostics, rules, Lua, WS,
+// MQTT, SPA -- is target-agnostic, which is what made adding the second SoC a
+// config change rather than a fork.
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -50,7 +49,9 @@
 #include "api_scripts.h"
 #include "api_status.h"
 #include "api_system.h"
+#include "device_backend.h"
 #include "device_options.h"
+#include "esp_zigbee_backend.h"
 #include "device_shadow.h"
 #include "eth.h"
 #include "event_bus.h"
@@ -134,7 +135,7 @@ static void task_event_bus(void*) {
 }
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "boot -- zhac-wired-core (P4, wired Ethernet, no radio)");
+    ESP_LOGI(TAG, "boot -- zhac-wired-core (%s, wired Ethernet)", CONFIG_IDF_TARGET);
 
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -157,19 +158,38 @@ extern "C" void app_main() {
     hap_master_init();
     hap_slave_init();
 
-    // ── Device pipeline (no radio backend) ───────────────────────────
+    // ── Device pipeline ──────────────────────────────────────────────
     // Order is load-bearing: event_bus first because other subsystems publish
     // into it, then the NVS-backed stores, then the device-definition adapter.
-    // Mono continues here with znp_driver_init() / zigbee_backend_register() /
-    // zigbee_mgr_init(); this build deliberately stops short. Nothing
-    // registers itself in the device_backend registry, so radio_present() is
-    // false and the device list is empty until Phase 1.
+    // The radio registers itself against this pipeline immediately below.
     event_bus_init();
     zap_store_init();
     zap_store_flush_init();
     device_shadow_init();
     zhac_adapter_init();
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
+
+    // ── Radio ────────────────────────────────────────────────────────
+    // Registers esp-zigbee-lib as a DeviceBackend, then brings the stack up
+    // through DeviceBackend::init -- the same shape zigbee_mgr_init() had on
+    // the ZNP path. The PHY is this SoC's own 802.15.4 on the S31, or a C6
+    // running stock ot_rcp over UART on the P4; nothing above zhc_adapter
+    // knows which.
+    //
+    // Every failure here is non-fatal by design: a gateway with a dead radio
+    // should still serve its UI, rules and logs so the problem is visible.
+#if CONFIG_ZHAC_ESP_ZIGBEE
+    if (!esp_zigbee_backend_register()) {
+        ESP_LOGE(TAG, "Zigbee backend registration failed -- continuing radio-less");
+    } else {
+        DeviceBackend* zb = device_backend_find(PROTO_ZIGBEE);
+        if (zb && zb->init && !zb->init()) {
+            ESP_LOGE(TAG, "Zigbee stack failed to start -- continuing radio-less");
+        }
+    }
+#else
+    ESP_LOGW(TAG, "built without CONFIG_ZHAC_ESP_ZIGBEE -- no radio");
+#endif
 
     // Re-apply persisted per-device options now that device_shadow and the
     // device pool are up. A no-op while the pool is empty.

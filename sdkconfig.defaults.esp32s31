@@ -60,3 +60,31 @@ CONFIG_SPIRAM_SPEED_250M=y
 #
 # Measured headroom as of 2026-08-15 says this is not urgent: the Zigbee stack
 # costs ~50.7 KB internal on real S31 silicon, leaving ~397 KB of 492 KB free.
+
+# Required by main/psram_bss.lf -- opens the `extram_bss -> extern_ram` branch
+# in IDF's app.lf. Without it the mapping fragment silently falls back to
+# dram0_bss (app.lf takes the `else` branch) and nothing moves: the build stays
+# green, and Ethernet still fails at runtime for want of DMA descriptors.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# MANDATORY companion to any .bss in PSRAM on this SoC.
+#
+# Flash and PSRAM share one cache here. A flash operation (every nvs_get/set)
+# normally DISABLES that cache, which makes every PSRAM address unreachable for
+# the duration -- so a PSRAM .bss access during a flash op raises:
+#
+#   Guru Meditation Error: Core 1 panic'ed (Cache error). Cache access error
+#   ... with the core sitting in spi_flash_hal_read / nvs_flash_init
+#
+# It is layout-sensitive rather than deterministic, which made it look like the
+# linker fragment was at fault: the same fragment booted fine once, then wedged
+# in an 18-deep reset loop after an unrelated 200-byte code change moved the
+# timing. Erasing nvs and coredump changed nothing; disabling the fragment
+# appeared to change nothing only because device_shadow annotates its own
+# buffers with EXT_RAM_BSS_ATTR and lands in PSRAM independently of it.
+#
+# XIP_FROM_PSRAM keeps text+rodata in PSRAM so flash ops no longer disable the
+# cache, and PSRAM stays addressable throughout. The P4 side already had the
+# equivalent (CONFIG_SPIRAM_RODATA) inherited from zhac-main-core; s31 did not,
+# which is precisely why only s31 crashed.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y

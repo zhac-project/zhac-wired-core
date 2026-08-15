@@ -52,6 +52,11 @@ dependencies:
   # Lua interpreter for components/lua_engine + components/lua_cjson.
   georgik/lua: ^5.5.0~7
 
+  # Zigbee stack (Phase 1). ^2.0.4 is a FLOOR, not a preference: 2.0.4 is the
+  # first release shipping lib/esp32s31/ -- including the `native` radio
+  # flavour this SKU needs. 2.0.1 has no esp32s31 libraries at all.
+  espressif/esp-zigbee-lib: "^2.0.4"
+
   # -- zhac-net-core (not on EXTRA_COMPONENT_DIRS; named explicitly) ----------
 
   ws_server:

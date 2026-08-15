@@ -1,0 +1,508 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// esp_zigbee_backend -- esp-zigbee-lib (v2.x) as ZHAC's radio layer.
+//
+// THE LOAD-BEARING IDEA
+// ---------------------
+// ZHAC's product is "dumb stack on the radio, device intelligence on the host":
+// 6,235 device definitions decode raw ZCL in embedded-zhc. That only works if
+// something hands us the raw APS payload. esp-zigbee-lib does, via
+// ezb_apsde_data_indication_handler_register() -- the callback receives the
+// ASDU bytes plus src address, endpoints, cluster, profile and LQI, and its
+// return value decides whether the stack also processes the frame.
+//
+// That callback maps onto zhac_adapter_try_decode() parameter-for-parameter,
+// which is why this backend is thin. Returning false lets the stack continue
+// handling the frame normally (ZDO, ZCL foundation) even when we decoded it --
+// deliberately conservative: ZHAC observes, it does not swallow.
+//
+// BOTH SKUs, ONE FILE
+// -------------------
+// The only difference is where the PHY is, and that is a config field:
+//   esp32s31 -> ESP_ZIGBEE_RADIO_MODE_NATIVE    (own 802.15.4)
+//   esp32p4  -> ESP_ZIGBEE_RADIO_MODE_UART_RCP  (C6 running stock ot_rcp)
+// Everything above is identical, which was the entire argument for keeping
+// both SKUs in one repo.
+#include "esp_zigbee_backend.h"
+#include "sdkconfig.h"
+
+#if CONFIG_ZHAC_ESP_ZIGBEE
+
+#include "device_backend.h"
+#include "esp_log.h"
+#include "esp_zigbee.h"
+#include "ezbee/aps.h"
+#include "ezbee/app_signals.h"
+#include "ezbee/bdb.h"
+#include "ezbee/nwk.h"
+#include "ezbee/platform/radio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
+#include "task_stacks.h"
+#include "zap_common.h"
+#include "zap_store.h"
+#include "zhc_adapter.h"
+#include "zigbee_diagnostics.h"
+#include "zigbee_pool.h"
+
+#include <cstring>
+
+static const char* TAG = "esp_zb";
+
+static bool s_running = false;
+// Set from on_app_signal: true once a PAN exists (formed now, or resumed from
+// the dataset). Opening the network before this fails inside the stack.
+static bool s_formed  = false;
+
+// Defined below, used by zb_init() above its definition.
+static bool zb_network_ready();
+
+// ── Raw APS ingress: the make-or-break path (gate G2) ────────────────────
+//
+// Every inbound application frame lands here with its ASDU intact. We look the
+// device up in the pool for the identity strings the definition matcher needs
+// (modelId + manufacturerName), tell the adapter the (ieee, nwk) tuple so
+// converters that reply have a destination, then decode.
+static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
+    if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
+
+    // Source may arrive short or extended; the pool is keyed by IEEE.
+    uint64_t ieee = 0;
+    uint16_t nwk  = 0;
+    if (ind->src_address.addr_mode == EZB_ADDR_MODE_EXT) {
+        // ezb_extaddr_t is a packed union struct, not a raw byte array.
+        ieee = ind->src_address.u.extended_addr.u64;
+        ZapDevice snap{};
+        if (zigbee_pool_snapshot(ieee, &snap)) nwk = snap.nwk_addr;
+    } else {
+        nwk = ind->src_address.u.short_addr;
+        ZapDevice snap{};
+        if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) ieee = snap.ieee_addr;
+    }
+
+    if (ieee == 0) {
+        // Frame from a device not in the pool: nothing to match a definition
+        // against yet. Record it so /api/diagnostics/unhandled shows it rather
+        // than it vanishing. ZCL byte 0 is frame control (bit0 = cluster
+        // specific); the attr/cmd id sits after the 1-byte TSN.
+        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
+        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
+        zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, 0);
+        return false;
+    }
+
+    // Identity strings for the matcher, straight from the pool snapshot.
+    ZapDevice dev{};
+    const bool have = zigbee_pool_snapshot(ieee, &dev);
+    const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
+    const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
+
+    zhac_adapter_set_runtime_addr(ieee, nwk);
+
+    const bool decoded = zhac_adapter_try_decode(
+        ieee, model, manuf,
+        /*group_id=*/0,
+        ind->cluster_id, ind->src_endpoint, ind->lqi,
+        ind->asdu, ind->asdu_length);
+
+    if (!decoded) {
+        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
+        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
+        zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, ieee);
+    }
+
+    // false = "we did not consume it". ZHAC decodes for its own shadow; the
+    // stack still owes the device its normal ZCL/ZDO handling.
+    return false;
+}
+
+// ── Egress: adapter-encoded ZCL out over APS ─────────────────────────────
+static bool zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
+                       const uint8_t* zcl_data, size_t zcl_len) {
+    if (!zcl_data || zcl_len == 0) return false;
+
+    ezb_apsde_data_req_t req{};
+    req.dst_address.addr_mode   = EZB_ADDR_MODE_SHORT;
+    req.dst_address.u.short_addr = nwk_addr;
+    req.src_endpoint = 1;
+    req.dst_endpoint = dst_ep ? dst_ep : 1;
+    req.cluster_id   = cluster_id;
+    req.profile_id   = 0x0104;   // Home Automation
+    req.radius       = 0;
+    req.tx_options   = EZB_APSDE_TX_OPT_ACK_TX;
+    req.asdu_length  = static_cast<uint16_t>(zcl_len);
+    req.asdu         = const_cast<uint8_t*>(zcl_data);
+
+    const ezb_err_t err = ezb_apsde_data_request(&req);
+    if (err != 0) {
+        ESP_LOGW(TAG, "apsde_data_request to 0x%04x cluster 0x%04x failed (%d)",
+                 nwk_addr, cluster_id, (int)err);
+        return false;
+    }
+    return true;
+}
+
+// ── Stack lifecycle signals ──────────────────────────────────────────────
+//
+// This handler is not optional decoration -- it DRIVES commissioning.
+// esp_zigbee_start(true) runs BDB *initialisation* only: the stack reads the
+// dataset, decides whether a network already exists, and then raises a signal
+// asking the application what to do. If nobody answers, the coordinator sits
+// there forever with no PAN, and ezb_bdb_open_network() fails with no log of
+// its own -- which is exactly how this surfaced: REST returned
+// "500 permit_join failed" while the boot log looked perfectly healthy.
+static bool on_app_signal(const ezb_app_signal_t* app_signal) {
+    if (!app_signal) return false;
+    const ezb_app_signal_type_t sig = ezb_app_signal_get_type(app_signal);
+
+    switch (sig) {
+    case EZB_BDB_SIGNAL_DEVICE_FIRST_START: {
+        // Empty dataset -- form a new PAN. First boot after a flash erase.
+        ESP_LOGI(TAG, "no network in dataset -- forming");
+        const ezb_err_t e =
+            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
+        if (e != 0) {
+            ESP_LOGE(TAG, "formation start failed (%d), bdb status %u",
+                     (int)e, (unsigned)ezb_bdb_get_commissioning_status());
+        }
+        return true;
+    }
+
+    case EZB_BDB_SIGNAL_DEVICE_REBOOT:
+        // Dataset already held a network and the stack came back up on it.
+        // No formation needed; joined devices keep their addresses.
+        s_formed = true;
+        ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
+                 (unsigned)ezb_nwk_get_panid(),
+                 (unsigned)ezb_nwk_get_current_channel());
+        return true;
+
+    case EZB_BDB_SIGNAL_FORMATION:
+        s_formed = true;
+        ESP_LOGI(TAG, "network formed: pan 0x%04x channel %u",
+                 (unsigned)ezb_nwk_get_panid(),
+                 (unsigned)ezb_nwk_get_current_channel());
+        return true;
+
+    case EZB_ZDO_SIGNAL_DEVICE_ANNCE: {
+        // A device joined and announced itself. Pool insert + interview belong
+        // to the join-handling increment; logging the IEEE now means a join can
+        // be confirmed on hardware before that lands.
+        const auto* p = static_cast<const ezb_zdo_signal_device_annce_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "device announce: nwk 0x%04x ieee %016llx caps 0x%02x",
+                     (unsigned)p->short_addr,
+                     (unsigned long long)p->device_addr.u64,
+                     (unsigned)p->capability);
+        }
+        return true;
+    }
+
+    default:
+        // INFO, not DEBUG: this is the only evidence that signals are being
+        // delivered at all, and ESP_LOGD is compiled out at the default
+        // CONFIG_LOG_MAXIMUM_LEVEL=INFO -- so a DEBUG line here is invisible
+        // exactly when it matters.
+        ESP_LOGI(TAG, "signal %s (0x%04x)", ezb_app_signal_to_string(sig),
+                 (unsigned)sig);
+        return false;
+    }
+}
+
+// ── The Zigbee task ──────────────────────────────────────────────────────
+// esp_zigbee_launch_mainloop() does not return; it needs its own task.
+static void task_zigbee(void*) {
+    ESP_LOGI(TAG, "stack mainloop starting");
+    const esp_err_t err = esp_zigbee_launch_mainloop();
+    ESP_LOGE(TAG, "stack mainloop exited: %s", esp_err_to_name(err));
+    s_running = false;
+    s_formed  = false;
+    vTaskDelete(nullptr);
+}
+
+// ── DeviceBackend implementation ─────────────────────────────────────────
+
+static bool zb_init() {
+    // The dataset partition must be an initialised NVS partition BEFORE
+    // esp_zigbee_init: ezb_plat_datasets_init calls nvs_open_from_partition()
+    // and abort()s on failure. Note esp-zigbee-lib v2.x uses NVS here, unlike
+    // v1.x (and IDF's bundled examples) which used a FAT partition.
+    esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
+    if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION));
+        nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
+    }
+    if (nerr != ESP_OK) {
+        ESP_LOGE(TAG, "zigbee storage partition '%s' unavailable: %s -- radio down",
+                 CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(nerr));
+        return false;
+    }
+
+    esp_zigbee_config_t cfg{};
+    cfg.device_config.device_type         = EZB_NWK_DEVICE_TYPE_COORDINATOR;
+    cfg.device_config.install_code_policy = false;
+    cfg.device_config.zczr_config.max_children = CONFIG_ZHAC_ZB_MAX_CHILDREN;
+    cfg.platform_config.storage_partition_name = CONFIG_ZHAC_ZB_STORAGE_PARTITION;
+
+#if CONFIG_ZB_RADIO_NATIVE
+    cfg.platform_config.radio_config.radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE;
+    ESP_LOGI(TAG, "radio: native 802.15.4");
+#else
+    cfg.platform_config.radio_config.radio_mode = ESP_ZIGBEE_RADIO_MODE_UART_RCP;
+    auto& u = cfg.platform_config.radio_config.radio_uart_config;
+    u.port   = static_cast<uart_port_t>(CONFIG_ZHAC_RCP_UART_PORT);
+    u.rx_pin = static_cast<gpio_num_t>(CONFIG_ZHAC_RCP_UART_RX_GPIO);
+    u.tx_pin = static_cast<gpio_num_t>(CONFIG_ZHAC_RCP_UART_TX_GPIO);
+    u.uart_config.baud_rate = 460800;
+    u.uart_config.data_bits = UART_DATA_8_BITS;
+    u.uart_config.parity    = UART_PARITY_DISABLE;
+    u.uart_config.stop_bits = UART_STOP_BITS_1;
+    u.uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    u.uart_config.rx_flow_ctrl_thresh = 0;
+    u.uart_config.source_clk = UART_SCLK_DEFAULT;
+    ESP_LOGI(TAG, "radio: RCP over UART%d (tx=%d rx=%d @460800)",
+             CONFIG_ZHAC_RCP_UART_PORT, CONFIG_ZHAC_RCP_UART_TX_GPIO,
+             CONFIG_ZHAC_RCP_UART_RX_GPIO);
+#endif
+
+    esp_err_t err = esp_zigbee_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Hooks BEFORE start, so nothing is missed between start and registration.
+    ezb_apsde_data_indication_handler_register(on_apsde_indication);
+    const ezb_err_t sig_err = ezb_app_signal_add_handler(on_app_signal);
+    if (sig_err != 0) {
+        ESP_LOGE(TAG, "app signal handler registration FAILED (%d) -- "
+                      "commissioning cannot be driven", (int)sig_err);
+    }
+    zhac_adapter_register_send(zb_af_send);
+
+    ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
+
+    // autostart=true: run the normal BDB startup. v2.x does NOT auto-run
+    // initialisation otherwise, so a reboot would silently not rejoin.
+    err = esp_zigbee_start(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (xTaskCreate(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
+                    nullptr, 5, nullptr) != pdPASS) {
+        ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
+        return false;
+    }
+
+    s_running = true;
+
+    // Wait for autostart to produce a PAN, then form explicitly if it did not.
+    //
+    // esp_zigbee_start(true) is documented to run the whole startup procedure
+    // "including formation", and on a fresh coordinator it should. It does not
+    // here: the PAN id stays 0xffff and bdb commissioning status stays 0
+    // indefinitely (observed over 38 s). No signal is emitted either -- not
+    // FORMATION, not DEVICE_FIRST_START, not anything -- because signals are a
+    // product of commissioning, and commissioning never began. So there is
+    // nothing to wait for and nothing to notice the failure.
+    //
+    // Kicking NETWORK_FORMATION explicitly fixes it: the PAN appears in ~4 s
+    // and the FORMATION signal then arrives normally (pan 0x27bf channel 12 on
+    // the bench). The poll-then-kick shape keeps the fast path when a dataset
+    // already holds a network, where autostart DOES rejoin on its own.
+    for (int i = 0; i < 30 && !zb_network_ready(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!zb_network_ready()) {
+        ESP_LOGW(TAG, "no PAN after autostart -- forming explicitly");
+        const ezb_err_t fe =
+            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
+        if (fe != 0) {
+            ESP_LOGE(TAG, "formation start failed (%d)", (int)fe);
+        } else {
+            for (int i = 0; i < 100 && !zb_network_ready(); i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+    }
+
+    if (zb_network_ready()) {
+        s_formed = true;
+        ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
+                 (unsigned)ezb_nwk_get_panid(),
+                 (unsigned)ezb_nwk_get_current_channel(),
+                 CONFIG_ZHAC_ZB_MAX_CHILDREN);
+    } else {
+        // Honest: the backend is registered and the stack runs, but joins are
+        // impossible until a PAN exists. permit_join will say so too.
+        ESP_LOGE(TAG, "coordinator has NO network (pan 0x%04x bdb %u) -- "
+                      "joins will be refused",
+                 (unsigned)ezb_nwk_get_panid(),
+                 (unsigned)ezb_bdb_get_commissioning_status());
+    }
+    return true;
+}
+
+static bool zb_is_running() { return s_running; }
+
+// Is there actually a PAN?
+//
+// s_formed is set from on_app_signal, but that signal only ever fires once
+// formation has been STARTED. On this lib build esp_zigbee_start(true) never
+// starts it (see zb_init), so for the first ~5 s no signal exists to wait for
+// and s_formed alone would leave permit_join refused forever. Asking the stack
+// directly is the authoritative check; the signal is the fast path that keeps
+// it cheap afterwards.
+//
+// 0x0000 and 0xffff are both "no network": 0xffff is the broadcast PAN id the
+// stack holds before commissioning.
+static bool zb_network_ready() {
+    if (s_formed) return true;
+    const ezb_panid_t pan = ezb_nwk_get_panid();
+    return pan != 0x0000 && pan != 0xffff;
+}
+
+static bool zb_start_discovery(uint8_t duration_s) {
+    if (!s_running) {
+        ESP_LOGW(TAG, "permit_join refused: stack not running");
+        return false;
+    }
+    if (!zb_network_ready()) {
+        // Distinguishes "still forming" from a genuine stack error. Without
+        // this the REST layer's flat 500 was the only symptom.
+        ESP_LOGW(TAG, "permit_join refused: no network (pan 0x%04x ch %u bdb %u)",
+                 (unsigned)ezb_nwk_get_panid(),
+                 (unsigned)ezb_nwk_get_current_channel(),
+                 (unsigned)ezb_bdb_get_commissioning_status());
+        return false;
+    }
+    const ezb_err_t e = ezb_bdb_open_network(duration_s);
+    if (e != 0) {
+        ESP_LOGW(TAG, "open_network(%us) failed (%d)", (unsigned)duration_s, (int)e);
+        return false;
+    }
+    ESP_LOGI(TAG, "network open for %us", (unsigned)duration_s);
+    return true;
+}
+
+static bool zb_stop_discovery() {
+    if (!s_running || !zb_network_ready()) return false;
+    const ezb_err_t e = ezb_bdb_close_network();
+    if (e != 0) {
+        ESP_LOGW(TAG, "close_network failed (%d)", (int)e);
+        return false;
+    }
+    ESP_LOGI(TAG, "network closed");
+    return true;
+}
+
+static bool zb_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out) {
+    if (!out || !count_out) return false;
+    *count_out = 0;
+    zigbee_pool_lock();
+    const ZapDevice* all = pool_all();
+    const uint16_t n = pool_count();
+    uint16_t w = 0;
+    for (uint16_t i = 0; i < n && w < max; i++) {
+        if (all[i].ieee_addr) out[w++] = all[i];
+    }
+    zigbee_pool_unlock();
+    *count_out = w;
+    return true;
+}
+
+static bool zb_get_device(uint64_t ieee, ZapDevice* out) {
+    return out && zigbee_pool_snapshot(ieee, out);
+}
+
+static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t val) {
+    // The adapter owns encoding and calls zb_af_send once it has a frame, but
+    // it needs the device's identity to choose a converter and its nwk address
+    // to address the frame -- so read the pool first.
+    ZapDevice dev{};
+    if (!zigbee_pool_snapshot(ieee, &dev)) {
+        ESP_LOGW(TAG, "write_attr: %016llx not in pool", (unsigned long long)ieee);
+        return false;
+    }
+    const uint8_t dst_ep = ep ? ep : dev.endpoints[0];
+    return zhac_adapter_send_uint(ieee,
+                                  dev.model_id[0] ? dev.model_id : nullptr,
+                                  dev.manufacturer_name[0] ? dev.manufacturer_name : nullptr,
+                                  dev.nwk_addr, dst_ep, key,
+                                  static_cast<uint64_t>(val));
+}
+
+static DeviceBackend s_backend = {
+    .protocol        = PROTO_ZIGBEE,
+    .name            = "Zigbee",
+    .init            = zb_init,
+    // No poll: the stack owns TaskZigbee and its own transport threads.
+    .poll            = nullptr,
+    .is_running      = zb_is_running,
+    .start_discovery = zb_start_discovery,
+    .stop_discovery  = zb_stop_discovery,
+    // interview / remove / rename need ZDO round-trips that belong with the
+    // join-handling increment; nullptr is honest until then.
+    .interview       = nullptr,
+    .write_attr      = zb_write_attr,
+    .read_attr       = nullptr,
+    .get_device_list = zb_get_device_list,
+    .get_device      = zb_get_device,
+    .remove_device   = nullptr,
+    .rename_device   = nullptr,
+};
+
+bool esp_zigbee_backend_register(void) {
+    if (!device_backend_register(&s_backend)) {
+        ESP_LOGE(TAG, "device_backend_register failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "registered as DeviceBackend");
+    return true;
+}
+
+// ── Radio entry points the control surface calls directly ────────────────
+// These replace components/zigbee_mgr/radio_stubs.cpp, which is dropped from
+// the build when CONFIG_ZHAC_ESP_ZIGBEE is set. Same signatures as the
+// sibling zigbee_mgr declares in zigbee_mgr.h.
+bool zigbee_permit_join(uint8_t duration_s) { return zb_start_discovery(duration_s); }
+
+uint64_t zigbee_mgr_coordinator_ieee() {
+    ezb_extaddr_t addr{};
+    ezb_plat_radio_get_macaddr(addr.u8);
+    return addr.u64;
+}
+
+// Not yet implemented on this backend -- ZDO bind/unbind and recommission need
+// the ZDO request path, which lands with the join-handling increment. Refusing
+// loudly beats pretending.
+static inline bool not_yet(const char* op) {
+    ESP_LOGW(TAG, "%s: not implemented on esp_zigbee_backend yet", op);
+    return false;
+}
+bool zigbee_zdo_bind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
+    return not_yet("zdo_bind");
+}
+bool zigbee_zdo_unbind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
+    return not_yet("zdo_unbind");
+}
+bool zigbee_interview_trigger(uint64_t) { return not_yet("interview_trigger"); }
+bool zigbee_force_recommission() { return not_yet("force_recommission"); }
+
+#else   // !CONFIG_ZHAC_ESP_ZIGBEE
+
+// Radio disabled at build time. The refusals for the six radio entry points
+// come from components/zigbee_mgr/radio_stubs.cpp instead.
+#include "esp_log.h"
+bool esp_zigbee_backend_register(void) {
+    ESP_LOGW("esp_zb", "built without CONFIG_ZHAC_ESP_ZIGBEE -- no radio backend");
+    return false;
+}
+
+#endif  // CONFIG_ZHAC_ESP_ZIGBEE

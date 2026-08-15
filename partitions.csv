@@ -9,4 +9,9 @@ nvs,            data,  nvs,      0x9000,  64K
 factory,        app,   factory,  ,        6M
 scripts,        data,  spiffs,   ,        2M
 spa,            data,  spiffs,   ,        7M
+# Zigbee datasets. MUST be subtype `nvs`, NOT `fat`: esp-zigbee-lib v2.x opens
+# it with nvs_open_from_partition() and abort()s inside esp_zigbee_init if that
+# fails -- a boot loop with no error message. IDF's own bundled zigbee examples
+# declare `fat` because they are still v1.x (esp_zb_* API).
+zb_storage,     data,  nvs,      ,        16K
 coredump,       data,  coredump, ,        64K

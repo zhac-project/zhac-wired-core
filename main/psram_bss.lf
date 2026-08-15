@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# psram_bss.lf -- move the big fixed-size lookup tables out of internal DRAM.
+#
+# WHY THIS EXISTS
+# ---------------
+# Phase 1 added the esp-zigbee stack, and on esp32s31 that broke Ethernet:
+#
+#   E (1668) esp.emac.dma: emac_esp_new_dma(509): no mem for descriptors
+#   E (1689) eth: board_eth_new failed: ESP_FAIL -- continuing with link down
+#   E (2870) ws_server: httpd_start failed
+#   E (2873) event_bus: queue alloc failed for type 11
+#
+# Not a Zigbee bug -- an internal-DRAM budget failure that Zigbee merely pushed
+# over the line. The static picture before this file:
+#
+#   DIRAM  396360 / 503744 used (78.7%)  -> heap_init offered just 120 KiB
+#   libzhc_adapter.a alone: 230 KB (106 KB .bss + 123 KB .data)
+#
+# EMAC DMA descriptors MUST come from internal DMA-capable memory, and they are
+# allocated after the Zigbee stack has taken its share. Whoever asks last loses.
+# Raising the allocation order would just move the failure onto Zigbee.
+#
+# WHAT MOVES
+# ----------
+# zhc_adapter's DRAM is dominated by a handful of fixed-size tables sized by
+# max_devices/registry, not by anything per-frame:
+#
+#   56.5 KB  g_pool     (zhc_adapter_fallback.cpp)
+#   32.7 KB  g_merged   (zhc_adapter.cpp)
+#   10.4 KB  g_store    (zhc_adapter.cpp)
+#    4.8 KB  g_slots    (zhc_adapter.cpp)
+#
+# These are decode-time lookup structures: no DMA, no ISR access, no use before
+# app_main. That makes them exactly what extern_ram is for. PSRAM here runs at
+# 250 MHz and there are 16 MB of it against ~120 KiB of contended internal DRAM,
+# so the trade is heavily in our favour.
+#
+# WHAT MUST NOT MOVE -- THE RULE THIS FILE EXISTS TO RECORD
+# ---------------------------------------------------------
+# A buffer in PSRAM is reached THROUGH THE CACHE. Flash reads run with the
+# cache disabled, so any buffer that a flash/NVS read writes into must stay in
+# internal RAM. Break that and you get, at the first read of a key that
+# actually exists:
+#
+#   Guru Meditation Error: Core 1 panic'ed (Cache error). Cache access error
+#   MEPC 0x2f80d33c   (RA -> spi_flash_hal_read -> esp_flash_read)
+#
+# device_shadow was mapped here at first and did exactly this.
+# device_shadow.cpp:269 reads straight into a static blob:
+#
+#   nvs_get_blob(s_nvs, key, s_attr_blob, &len);
+#
+# ...and s_attr_blob / s_sweep_blob / s_staged are precisely the .bss this
+# fragment would have relocated. It survived one boot only because NVS was
+# still empty; the crash arrived on the next boot, once a key had been written.
+# An 18-deep reset loop for the sake of ~8 KB.
+#
+# So before adding an archive here, confirm it does no NVS reads, no flash
+# reads and no DMA into static buffers. zhc_adapter qualifies: it contains no
+# nvs_*, esp_flash_*, or esp_partition_* calls at all -- its tables are pure
+# in-memory lookup state. That property is why only it is listed below.
+#
+# WHY A LINKER FRAGMENT AND NOT EXT_RAM_BSS_ATTR
+# ----------------------------------------------
+# EXT_RAM_BSS_ATTR would mean editing zhc_adapter, which lives in the sibling
+# zhac-components repo. Those repos are read-only inputs to this SKU. A mapping
+# fragment achieves the same placement from OUR side, so the shared component
+# stays byte-identical for the flagship P4/S3 cores that do not need this.
+#
+# NOT FIXED HERE: libzhc_adapter.a also carries ~123 KB of .data spread across
+# thousands of ~112-byte per-device symbols. Those look like definition structs
+# that are not declared const, so they land in .data instead of .rodata (flash).
+# Making them const would recover more internal DRAM than this whole file, but
+# it is a change to the shared component -- raised as a ticket rather than
+# patched here. `extram_bss` cannot help: .data needs its flash-image copy
+# applied before PSRAM is mapped.
+#
+# APPLIES TO BOTH TARGETS. P4 has far more headroom, but the tables are just as
+# idle there, and keeping one placement policy avoids a target-specific
+# divergence nobody would remember to re-test.
+
+[mapping:zhc_adapter_psram]
+archive: libzhc_adapter.a
+entries:
+    * (extram_bss)

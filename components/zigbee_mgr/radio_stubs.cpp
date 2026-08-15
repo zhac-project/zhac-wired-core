@@ -24,6 +24,13 @@
 //
 // PHASE 1: delete this file. esp_zigbee_backend supplies the real
 // implementations, and the call sites above need no change.
+#include "sdkconfig.h"
+
+// Compiled away when the real backend is present -- it defines the same six
+// symbols, so linking both would be a duplicate-symbol error. Gated HERE and
+// not in CMake because CONFIG_* is undefined during IDF early expansion.
+#if !CONFIG_ZHAC_ESP_ZIGBEE
+
 #include "esp_log.h"
 #include "zigbee_mgr.h"
 
@@ -55,3 +62,5 @@ bool zigbee_force_recommission() { return no_radio("force_recommission"); }
 // Zero rather than a fabricated address: callers format this as the
 // coordinator's IEEE, and an invented value would look like a real device.
 uint64_t zigbee_mgr_coordinator_ieee() { return 0; }
+
+#endif  // !CONFIG_ZHAC_ESP_ZIGBEE

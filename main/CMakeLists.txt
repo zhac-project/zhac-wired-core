@@ -49,6 +49,10 @@ idf_component_register(
         "api_scripts.cpp"
         "api_system.cpp"
     INCLUDE_DIRS "."
+    # Moves zhc_adapter's ~105 KB of lookup-table .bss to PSRAM. Without it the
+    # esp32s31 build has too little internal DRAM left for EMAC DMA descriptors
+    # and Ethernet dies at init. See the file for the full measurement.
+    LDFRAGMENTS "psram_bss.lf"
     REQUIRES
         # -- IDF ----------------------------------------------------------
         esp_system
@@ -74,9 +78,17 @@ idf_component_register(
         lua_engine
         lua_cjson
         zigbee_mgr
+        esp_zigbee_backend
         # Empty on p4/s3 where the sibling tg_gw supplies real sources; carries
         # the stubs on targets it does not cover. See its CMakeLists.
         tg_gw_stub
+        # Must be required EXPLICITLY. With set(COMPONENTS main) a component
+        # that nothing requires is not built -- and a component that is not
+        # built contributes no Kconfig, so CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+        # in sdkconfig.defaults became an "unknown symbol" and was silently
+        # ignored, disabling coredumps. tools/check_resolved_config.sh now
+        # asserts it.
+        espcoredump
         # -- zhac-components ----------------------------------------------
         hap_protocol
         zap_common

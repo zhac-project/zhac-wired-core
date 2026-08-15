@@ -40,6 +40,35 @@ expect() {
     fi
 }
 
+TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
+
+# ---------------------------------------------------------------- esp32s31 --
+if [ "$TARGET" = "esp32s31" ]; then
+    expect CONFIG_SPIRAM y          "PSRAM is mandatory for this firmware."
+    expect CONFIG_SPIRAM_SPEED 250  "250 MHz keeps MPLL at 500, so EMAC can derive 125 MHz for RGMII. At 200 MHz the MPLL lands at 400 and Ethernet init fails with 'config emac interface failed'."
+
+    # Load-bearing. Flash and PSRAM share a cache on this part: without XIP the
+    # cache is disabled for every flash op, and any PSRAM access during that
+    # window (we deliberately put zhc_adapter's .bss there, and device_shadow
+    # puts its own buffers there via EXT_RAM_BSS_ATTR) raises
+    # "Cache error / Cache access error" inside nvs_flash_init. The failure is
+    # layout-sensitive, so it can hide through several builds and then wedge
+    # the board in a reset loop after an unrelated change.
+    expect CONFIG_SPIRAM_XIP_FROM_PSRAM y \
+        "Required whenever any .bss lives in PSRAM on this SoC -- see main/psram_bss.lf."
+    expect CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY y \
+        "Opens app.lf's extram_bss branch; without it main/psram_bss.lf silently does nothing and Ethernet dies for want of DMA descriptors."
+    expect CONFIG_ZB_RADIO_NATIVE y "S31 has its own 802.15.4; the RCP path is the P4 configuration."
+    expect CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH y \
+        "Coredumps off. Usually means the espcoredump component fell out of the build graph."
+
+    if [ "$fail" -eq 0 ]; then
+        echo "OK: resolved chip config valid for esp32s31."
+    fi
+    exit "$fail"
+fi
+
+# ----------------------------------------------------------------- esp32p4 --
 # Silicon family. The pair must agree: the gate opens the v0/v1 choices, and
 # REV_MIN_0 selects the lowest. Either alone is wrong.
 expect CONFIG_ESP32P4_SELECTS_REV_LESS_V3 y \
@@ -60,6 +89,13 @@ expect CONFIG_SPIRAM_SPEED 200    "Matches main-core."
 expect CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 360        "IDF default is 400; main-core runs 360."
 expect CONFIG_ESPTOOLPY_FLASHFREQ '"40m"'         "IDF default is 80m; main-core uses 40m."
 expect CONFIG_ESPTOOLPY_FLASHSIZE '"16MB"'        "Board has 16 MB."
+
+# Coredump. Not paranoia: set(COMPONENTS main) means an unrequired component
+# is never built, and an unbuilt component contributes no Kconfig -- so this
+# symbol silently became "unknown" and was ignored until espcoredump was added
+# to main's REQUIRES. Exactly the silent-drop class this script exists for.
+expect CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH y \
+    "Coredumps off. Usually means the espcoredump component fell out of the build graph."
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: resolved chip config matches zhac-main-core."

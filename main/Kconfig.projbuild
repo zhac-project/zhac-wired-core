@@ -83,7 +83,53 @@ menu "ZHAC wired-core board"
             ambiguity. This is the whole discovery story on a wired box --
             there is no SoftAP and no provisioning page.
 
-    # -- Radio (Phase 1) --
+    # -- Radio --
+    config ZHAC_ESP_ZIGBEE
+        bool "Enable the Zigbee radio (esp_zigbee_backend)"
+        default y
+        select ZB_ENABLED
+        help
+            Phase 1. Runs esp-zigbee-lib as coordinator with the stack on THIS
+            SoC, and registers it as ZHAC's DeviceBackend. The lib's own
+            Kconfig picks the PHY per target: native 802.15.4 on the S31,
+            Radio-Spinel UART to a C6 running ot_rcp on the P4.
+
+            Turn off for a radio-less build; components/zigbee_mgr/
+            radio_stubs.cpp then answers the radio entry points with refusals
+            and /api/devices stays empty.
+
+    config ZHAC_ZB_MAX_CHILDREN
+        int "Max direct children of the coordinator"
+        depends on ZHAC_ESP_ZIGBEE
+        default 32
+        help
+            Neighbour/routing table allocations scale with this, so it is a
+            real RAM knob, not just a policy limit.
+
+    config ZHAC_ZB_STORAGE_PARTITION
+        string "NVS partition holding Zigbee datasets"
+        depends on ZHAC_ESP_ZIGBEE
+        default "zb_storage"
+        help
+            Must exist in partitions.csv as type `data`, subtype `nvs`.
+            NOT `fat`: esp-zigbee-lib v2.x opens it with
+            nvs_open_from_partition() and abort()s if that fails. IDF's own
+            bundled zigbee examples still declare fat because they are v1.x.
+
+    config ZHAC_ZB_CHANNEL_MASK
+        hex "Primary channel mask"
+        depends on ZHAC_ESP_ZIGBEE
+        default 0x07FFF800
+        help
+            Default is all channels 11-26. Narrow it to pin the network to a
+            channel away from local Wi-Fi.
+
+    config ZHAC_RCP_UART_PORT
+        int "UART port to the RCP (P4 only)"
+        depends on ZHAC_ESP_ZIGBEE && !ZB_RADIO_NATIVE
+        default 1
+
+    # -- Radio wiring --
     # No radio is built in Phase 0. These are declared now so the board
     # wiring is recorded in one place and Phase 1 only has to consume them.
     # Values are the SDIO traces the no-WiFi decision freed -- see

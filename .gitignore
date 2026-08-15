@@ -1,5 +1,12 @@
+# This repo builds two targets from one tree, each with its own build dir and
+# sdkconfig (build/ = esp32p4, build.s31/ = esp32s31). The globs must match the
+# names actually used -- a plain `build/` line does NOT cover `build.s31/`, and
+# an untracked multi-hundred-MB build dir is exactly how a `git add -A` once
+# bloated a ZHAC repo's .git to 4.7 GB.
 build/
+build.*/
 sdkconfig
+sdkconfig.s31
 sdkconfig.old
 managed_components/
 dependencies.lock
