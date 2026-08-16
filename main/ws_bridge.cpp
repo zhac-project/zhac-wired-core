@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "zigbee_mgr.h"
+#include "device_backend.h"
 #include "zigbee_pool.h"
 #include "zhc_adapter.h"
 #include "zap_common.h"
@@ -491,6 +492,18 @@ static void cmd_device_rename(int fd, uint32_t id, JsonDocument& doc) {
 // the network) and wipe the NVS row. Default (soft) just removes from
 // the in-memory pool; rejoining the device will fast-path back via the
 // last-known shadow.
+//
+// The Mgmt_Leave half of that contract was missing: `hard` only deleted
+// the NVS row, so the device stayed joined, re-announced, and came
+// straight back — the one outcome a hard delete exists to prevent. It
+// now goes through the backend's remove_device, which owns the whole
+// sequence. Routing via the registry rather than calling the esp-zigbee
+// symbol directly keeps this file protocol-agnostic, so the znp backend
+// gets the same behaviour from the same code.
+//
+// Order matters: Mgmt_Leave is addressed to the device's short address,
+// so the backend must run while the pool entry is still live. Removing
+// first would send the leave to nobody.
 static void cmd_device_delete(int fd, uint32_t id, JsonDocument& doc) {
     const char* ieee_s = doc["args"]["ieee"] | (const char*)nullptr;
     const bool  hard   = doc["args"]["hard"] | false;
@@ -498,16 +511,32 @@ static void cmd_device_delete(int fd, uint32_t id, JsonDocument& doc) {
     uint64_t ieee = parse_ieee(ieee_s);
     if (ieee == 0) { send_err(fd, id, "bad ieee"); return; }
 
-    zigbee_pool_lock();
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
-        zigbee_pool_unlock();
+    ZapDevice snap{};
+    if (!zigbee_pool_snapshot(ieee, &snap)) {
         send_err(fd, id, "device not found");
         return;
     }
-    const uint16_t idx = (uint16_t)(dev - pool_all());
-    zap_dev_mark_removed(dev);
-    pool_remove(idx);
+
+    if (hard) {
+        DeviceBackend* b = device_backend_find(PROTO_ZIGBEE);
+        if (b && b->remove_device && b->remove_device(ieee)) {
+            reply_ok_or_err(fd, id, true, nullptr);
+            return;
+        }
+        // No backend, or it declined. Still honour the delete locally --
+        // a UI delete that leaves the device on screen is worse than one
+        // that could not reach the radio.
+        ESP_LOGW("ws_bridge", "hard delete of 0x%016" PRIX64 " fell back to "
+                 "local removal (no backend leave)", ieee);
+    }
+
+    zigbee_pool_lock();
+    ZapDevice* dev = pool_find_by_ieee(ieee);
+    if (dev) {
+        const uint16_t idx = (uint16_t)(dev - pool_all());
+        zap_dev_mark_removed(dev);
+        pool_remove(idx);
+    }
     zigbee_pool_unlock();
 
     if (hard) zap_store_delete_device(ieee);

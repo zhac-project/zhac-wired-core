@@ -25,6 +25,21 @@ void zb_interview_enqueue(uint64_t ieee, uint16_t nwk);
 // queue is full.
 bool zb_interview_trigger(uint64_t ieee);
 
+// Handle a device announcement. Decides between the rejoin fast path (device
+// already fully interviewed -- just refresh its address) and a full interview.
+// Routers announce on every power cycle, so this is the difference between a
+// mains outage costing one pool update per device and costing a full 4-stage
+// ZDO interview per device, serialised on one radio.
+void zb_interview_on_announce(uint64_t ieee, uint16_t nwk);
+
+// Soft-remove: the device told us it is leaving (or was told to). Keeps the
+// record so friendly name, interview state and shadow survive a rejoin.
+void zb_interview_on_leave(uint64_t ieee);
+
+// Hard-remove: user-initiated delete. Drops the pool entry and the adapter's
+// cached definition. Does NOT send the ZDO leave -- the caller does that.
+bool zb_interview_forget(uint64_t ieee);
+
 // Feed every inbound ZCL frame to the interview engine so it can catch the
 // Basic-cluster Read Attributes Response it is waiting for.
 //

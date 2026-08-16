@@ -32,6 +32,8 @@
 
 #include "device_backend.h"
 #include "esp_log.h"
+#include "esp_system.h"   // esp_restart
+#include "esp_timer.h"
 #include "event_bus.h"
 #include "esp_zigbee.h"
 #include "ezbee/aps.h"
@@ -61,6 +63,10 @@ static bool s_formed  = false;
 
 // Defined below, used by zb_init() above its definition.
 static bool zb_network_ready();
+
+// A mainloop exit below this uptime is treated as a startup failure and does
+// NOT trigger a reboot -- see task_zigbee().
+static constexpr int kMainloopRebootMinUptimeS = 60;
 
 // ── Raw APS ingress: the make-or-break path (gate G2) ────────────────────
 //
@@ -207,7 +213,26 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
                      (unsigned)p->short_addr,
                      (unsigned long long)p->device_addr.u64,
                      (unsigned)p->capability);
-            zb_interview_enqueue(p->device_addr.u64, p->short_addr);
+            zb_interview_on_announce(p->device_addr.u64, p->short_addr);
+        }
+        return true;
+    }
+
+    case EZB_ZDO_SIGNAL_LEAVE:
+    case EZB_ZDO_SIGNAL_LEAVE_INDICATION: {
+        // Both carry the same params struct. LEAVE is this device being told
+        // to leave; LEAVE_INDICATION is a child/neighbour announcing it left.
+        // For a coordinator only the latter is expected, but handling both
+        // means a stack that reclassifies the event cannot silently strand a
+        // device in the pool as permanently present.
+        const auto* p = static_cast<const ezb_zdo_signal_leave_indication_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "leave: nwk 0x%04x ieee %016llx type %u",
+                     (unsigned)p->short_addr,
+                     (unsigned long long)p->device_addr.u64,
+                     (unsigned)p->leave_type);
+            zb_interview_on_leave(p->device_addr.u64);
         }
         return true;
     }
@@ -226,11 +251,35 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
 // ── The Zigbee task ──────────────────────────────────────────────────────
 // esp_zigbee_launch_mainloop() does not return; it needs its own task.
 static void task_zigbee(void*) {
+    const int64_t started_us = esp_timer_get_time();
     ESP_LOGI(TAG, "stack mainloop starting");
+
+    // Does not return in normal operation.
     const esp_err_t err = esp_zigbee_launch_mainloop();
-    ESP_LOGE(TAG, "stack mainloop exited: %s", esp_err_to_name(err));
+
+    // Getting here means the radio is gone: no joins, no reports, no commands.
+    // Nothing in the stack recovers from this by itself, and leaving the
+    // firmware "up" with a dead radio is the worst outcome -- REST answers,
+    // the SPA renders, and every device silently stops working.
     s_running = false;
     s_formed  = false;
+    const int64_t uptime_s = (esp_timer_get_time() - started_us) / 1000000;
+    ESP_LOGE(TAG, "stack mainloop EXITED after %llds: %s -- radio is down",
+             (long long)uptime_s, esp_err_to_name(err));
+
+    // Reboot to recover, but only if the stack had actually been running for a
+    // while. A stack that dies within the first minute would otherwise turn
+    // every boot into a reset loop, which is strictly worse than staying up
+    // with is_running() == false: that at least leaves REST reachable to say
+    // so, and leaves the console usable to diagnose it.
+    if (uptime_s >= kMainloopRebootMinUptimeS) {
+        ESP_LOGE(TAG, "restarting to recover the radio");
+        vTaskDelay(pdMS_TO_TICKS(1000));   // let the log drain
+        esp_restart();
+    }
+    ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting, to avoid "
+                  "a boot loop. /api/status reports the radio as down.",
+             (long long)uptime_s, kMainloopRebootMinUptimeS);
     vTaskDelete(nullptr);
 }
 
@@ -443,6 +492,31 @@ static bool zb_stop_discovery() {
     return true;
 }
 
+// Tell the device to leave, then forget it locally.
+//
+// The local removal is unconditional and does not wait for the ZDO response:
+// the overwhelmingly common reason to remove a device is that it is already
+// dead or out of range, and a UI delete that fails because the device cannot
+// be reached is useless. z2m behaves the same way.
+static bool zb_backend_remove_device(uint64_t ieee) {
+    if (s_running && zb_network_ready()) {
+        ZapDevice snap{};
+        if (zigbee_pool_snapshot(ieee, &snap) && snap.nwk_addr) {
+            ezb_zdo_nwk_mgmt_leave_req_t req{};
+            req.dst_nwk_addr = snap.nwk_addr;
+            req.field.device_addr.u64 = ieee;
+            req.field.remove_children = false;   // reassign, do not orphan-purge
+            req.field.rejoin          = false;
+            const ezb_err_t e = ezb_zdo_nwk_mgmt_leave_req(&req);
+            if (e != 0) {
+                ESP_LOGW(TAG, "leave req for %016llx failed (%d) -- removing "
+                              "locally anyway", (unsigned long long)ieee, (int)e);
+            }
+        }
+    }
+    return zb_interview_forget(ieee);
+}
+
 static bool zb_backend_interview(uint64_t ieee, uint16_t addr_hint) {
     if (!s_running) return false;
     // A device already in the pool goes through trigger (which reads its
@@ -506,7 +580,7 @@ static DeviceBackend s_backend = {
     .read_attr       = nullptr,
     .get_device_list = zb_get_device_list,
     .get_device      = zb_get_device,
-    .remove_device   = nullptr,
+    .remove_device   = zb_backend_remove_device,
     .rename_device   = nullptr,
 };
 

@@ -52,6 +52,7 @@
 #include "zap_store.h"
 #include "zhc_adapter.h"
 #include "zigbee_interview_utils.h"
+#include "zigbee_mgr.h"   // zigbee_pool_remove
 #include "zigbee_pool.h"
 
 #include <cstring>
@@ -489,6 +490,110 @@ void zb_interview_enqueue(uint64_t ieee, uint16_t nwk) {
         ESP_LOGW(TAG, "join queue full -- dropping announce for %016llx",
                  (unsigned long long)ieee);
     }
+}
+
+// ── Lifecycle: announce / leave / forget ──────────────────────────────────
+
+namespace {
+
+// Clear the soft-removed flag and refresh the address, in one locked pass.
+struct RejoinCtx {
+    uint16_t nwk;
+    uint32_t now;
+    bool     nwk_changed;
+    bool     was_removed;
+    ZapDevice snap;
+};
+
+void rejoin_fn(ZapDevice* d, void* ctx) {
+    auto* c = static_cast<RejoinCtx*>(ctx);
+    c->nwk_changed = (d->nwk_addr != c->nwk);
+    c->was_removed = zap_dev_is_removed(d);
+    d->flags      &= static_cast<uint8_t>(~ZAP_DEV_REMOVED);
+    d->nwk_addr    = c->nwk;
+    d->last_seen   = c->now;
+    c->snap        = *d;
+}
+
+void leave_fn(ZapDevice* d, void* ctx) {
+    zap_dev_mark_removed(d);
+    *static_cast<ZapDevice*>(ctx) = *d;
+}
+
+}  // namespace
+
+void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
+    if (ieee == 0) return;
+
+    RejoinCtx c{};
+    c.nwk = nwk;
+    c.now = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+
+    if (zigbee_pool_with_device(ieee, rejoin_fn, &c)) {
+        // Known device. A full re-interview is only warranted when we never
+        // got its identity -- routers announce on every power cycle, and
+        // re-running four ZDO round-trips per device across a mains outage
+        // would serialise the whole network behind the radio for minutes.
+        if (c.nwk_changed) zigbee_pool_mark_dirty();   // nwk index is stale
+
+        if (c.snap.interview_state ==
+            static_cast<uint8_t>(InterviewState::IDENTITY_READY)) {
+            ESP_LOGI(TAG, "rejoin %016llx nwk 0x%04x%s (identity known -- "
+                          "no re-interview)",
+                     (unsigned long long)ieee, nwk,
+                     c.was_removed ? ", un-removed" : "");
+            zap_store_mark_dirty(&c.snap, ZAP_PERSIST_LOW);
+            Event ev{};
+            ev.type = EventType::DEVICE_JOIN;
+            std::memcpy(ev.data, &ieee, sizeof(ieee));
+            event_bus_publish(ev);
+            return;
+        }
+        // Known but never identified -- a rejoin is exactly the wake window
+        // the retry loop was waiting for.
+        zap_store_mark_dirty(&c.snap, ZAP_PERSIST_LOW);
+    }
+
+    zb_interview_enqueue(ieee, nwk);
+}
+
+void zb_interview_on_leave(uint64_t ieee) {
+    if (ieee == 0) return;
+    // Soft-remove. The record stays in pool + NVS so friendly name, interview
+    // state and shadow cache survive until the device rejoins (flag cleared in
+    // zb_interview_on_announce) or the user hard-deletes it. Same contract as
+    // the ZNP path's ZDO_LEAVE_IND handler.
+    ZapDevice snap{};
+    if (zigbee_pool_with_device(ieee, leave_fn, &snap)) {
+        // Persist OUTSIDE the visitor: mark_dirty can write flash synchronously
+        // when the dirty table is full, and that must not run under the pool
+        // mutex.
+        zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
+        ESP_LOGI(TAG, "device left: %016llx (soft-remove)",
+                 (unsigned long long)ieee);
+    } else {
+        ESP_LOGI(TAG, "leave from unknown device %016llx -- ignored",
+                 (unsigned long long)ieee);
+    }
+    Event ev{};
+    ev.type = EventType::DEVICE_LEAVE;
+    std::memcpy(ev.data, &ieee, sizeof(ieee));
+    event_bus_publish(ev);
+}
+
+bool zb_interview_forget(uint64_t ieee) {
+    if (ieee == 0) return false;
+    const bool gone = zigbee_pool_remove(ieee);   // also invalidates the def cache
+    zhac_adapter_fallback_clear(ieee);            // and the cluster fallback data
+    zap_store_delete_device(ieee);
+    if (gone) {
+        ESP_LOGI(TAG, "device forgotten: %016llx", (unsigned long long)ieee);
+        Event ev{};
+        ev.type = EventType::DEVICE_LEAVE;
+        std::memcpy(ev.data, &ieee, sizeof(ieee));
+        event_bus_publish(ev);
+    }
+    return gone;
 }
 
 bool zb_interview_trigger(uint64_t ieee) {
