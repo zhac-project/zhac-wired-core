@@ -33,6 +33,7 @@ idf_component_register(
         "${BOARD_ETH_SRC}"
         "net_discovery.cpp"
         "sys_state.cpp"
+        "sys_diag.cpp"
         "log_ring.cpp"
         "device_options.cpp"
         "groups_store.cpp"

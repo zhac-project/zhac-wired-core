@@ -54,6 +54,7 @@
 #include "esp_zigbee_backend.h"
 #include "device_shadow.h"
 #include "eth.h"
+#include "sys_diag.h"
 #include "event_bus.h"
 #include "log_ring.h"
 #include "lua_engine.h"
@@ -303,6 +304,10 @@ extern "C" void app_main() {
                  net.ip[0] ? net.ip : "-",
                  net.speed_mbps,
                  net.duplex_full ? "full" : "half");
+        // Live diagnostics for the Info page. Without this the SPA only
+        // sees a status snapshot at mount and on WS reconnect, so CPU% would
+        // freeze at whatever it read when the tab was opened.
+        sys_diag_push_tick();
         if ((tick % 6) == 0) log_heap_info();
     }
 }

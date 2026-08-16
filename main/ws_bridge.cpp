@@ -25,6 +25,7 @@
 #include "esp_heap_caps.h"
 #include "zigbee_mgr.h"
 #include "device_backend.h"
+#include "sys_diag.h"
 #include "zigbee_pool.h"
 #include "zhc_adapter.h"
 #include "zap_common.h"
@@ -88,13 +89,16 @@ static void cmd_status(int fd, uint32_t id) {
     doc["id"] = id;
     doc["ok"] = true;
     JsonObject d = doc["data"].to<JsonObject>();
-    d["uptime"]          = (uint32_t)(esp_timer_get_time() / 1000000);
-    d["heap"]            = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    d["psram_free"]      = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    d["zigbee_ok"]       = radio_ok();          // was !zigbee_mgr_crashed()
-    d["zigbee_present"]  = radio_present();     // no radio at all in Phase 0
-    d["mqtt_connected"]  = mqtt_gw_is_connected();
-    char buf[256];
+    // Full diagnostics set -- see sys_diag.h. This used to emit six fields
+    // with names of its own, which is why the Info page rendered "—" for
+    // CPU, memory, stack and firmware: the SPA was reading different keys.
+    sys_diag_fill(d, SYS_DIAG_CPU_ONDEMAND);
+    d["zigbee_ok"]      = radio_ok();
+    d["zigbee_present"] = radio_present();
+    // 768 covers the full object with headroom; serializeJson truncates
+    // rather than overflowing, but a truncated reply is invalid JSON and the
+    // page would silently show nothing.
+    char buf[768];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     ws_server_reply(fd, buf, n);
 }
@@ -710,7 +714,18 @@ static void cmd_remote_disconnect(int fd, uint32_t id, JsonDocument& doc) {
 void ws_push(const char* event, JsonDocument& data) {
     if (ws_server_client_count() == 0) return;
     JsonDocument env; env["event"] = event; env["data"] = data;
-    char buf[512]; size_t n = serializeJson(env, buf, sizeof(buf));
+    // 1024, not 512: the status.tick payload alone serialises to ~500 bytes
+    // and the envelope adds more. serializeJson TRUNCATES rather than failing,
+    // so an undersized buffer broadcasts malformed JSON that every client
+    // silently drops -- a push that looks sent and never arrives.
+    char buf[1024];
+    const size_t cap = sizeof(buf);
+    const size_t n = serializeJson(env, buf, cap);
+    if (n == 0 || n >= cap) {
+        ESP_LOGW(TAG, "ws_push('%s') dropped: payload %u B exceeds %u B buffer",
+                 event, (unsigned)measureJson(env), (unsigned)cap);
+        return;
+    }
     ws_server_broadcast(buf, n);
     remote_client_publish_event(event, buf, n);
 }

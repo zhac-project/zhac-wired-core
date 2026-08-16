@@ -96,3 +96,18 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # No radio in Phase 0. Deliberately absent: CONFIG_ZHAC_NCP_ZNP / _EZSP / _C6.
 # Phase 1 adds esp_zigbee_backend behind a Kconfig choice -- UART_RCP on the
 # P4 (ot_rcp on the onboard C6), NATIVE on the S31.
+
+# Runtime diagnostics for the Info page (main/sys_diag.cpp).
+#
+# GENERATE_RUN_TIME_STATS is what makes per-core CPU% possible at all:
+# sys_metrics_sample_cpu_pct() deltas the FreeRTOS per-core idle-task run-time
+# counters, and with this off it returns a hard 0 for both cores -- which reads
+# as a real measurement rather than "unavailable". USE_TRACE_FACILITY backs
+# uxTaskGetSystemState(), used to find the smallest stack headroom across every
+# live task.
+#
+# Both cost a small per-task bookkeeping overhead and a timer read per context
+# switch. That is the price of being able to answer "what is this gateway
+# doing" without a JTAG probe, on a device whose whole job is to run unattended.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

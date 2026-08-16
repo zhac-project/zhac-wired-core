@@ -20,6 +20,7 @@
 #include "esp_psram.h"
 #include "esp_timer.h"
 #include "eth.h"
+#include "sys_diag.h"
 #include "mqtt_gw.h"
 #include "net_discovery.h"
 #include "radio_state.h"
@@ -44,6 +45,13 @@ static esp_err_t handle_get_status(httpd_req_t* req) {
     if (app) doc["fw"] = app->version;
 
     doc["uptime_s"] = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    // Full diagnostics set, identical to the WS status.get payload (cpu_c0,
+    // int_free, heap_min, stack_hwm, ...). The pre-existing heap_* / uptime_s
+    // keys below are KEPT: they are this SKU's own REST shape and something
+    // may already scrape them. Both live side by side rather than one being
+    // renamed out from under a consumer.
+    sys_diag_fill(doc.as<JsonObject>(), SYS_DIAG_CPU_ONDEMAND);
 
     // Heap (internal + PSRAM: free / min / largest block)
     doc["heap_internal_free"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
