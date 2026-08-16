@@ -63,8 +63,20 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
         doc["ieee"]         = ieee_s;
         doc["nwk"]          = d.nwk_addr;
         doc["friendly"]     = d.friendly_name;
-        doc["model"]        = d.model_id;
+        // Friendly definition labels with raw fallback, matching the WS
+        // device.list contract — the SPA's device table reads `vendor`, so a
+        // row carrying only `manufacturer` renders that column as "—".
+        char vendor_buf[32] = {};
+        char model_buf[32]  = {};
+        zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
+                                    vendor_buf, sizeof(vendor_buf),
+                                    model_buf,  sizeof(model_buf));
+        doc["model"]        = model_buf[0] ? (const char*)model_buf
+                                           : (const char*)d.model_id;
+        doc["vendor"]       = vendor_buf[0] ? (const char*)vendor_buf
+                                            : (const char*)d.manufacturer_name;
         doc["manufacturer"] = d.manufacturer_name;
+        doc["model_id"]     = d.model_id;
         doc["last_seen"]    = d.last_seen;
 
         // Endpoints array

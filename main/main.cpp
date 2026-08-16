@@ -56,6 +56,7 @@
 #include "eth.h"
 #include "sys_diag.h"
 #include "dgm_store.h"
+#include "zigbee_pool.h"
 #include "event_bus.h"
 #include "log_ring.h"
 #include "lua_engine.h"
@@ -193,6 +194,21 @@ extern "C" void app_main() {
 #else
     ESP_LOGW(TAG, "built without CONFIG_ZHAC_ESP_ZIGBEE -- no radio");
 #endif
+
+    // Repopulate the shadow cache from the pool's persisted attribute blobs.
+    //
+    // Must run AFTER the backend init above, because that is what restores the
+    // device pool from NVS. Without this the shadow starts empty on every boot
+    // and each device's state only reappears when it next reports — instant for
+    // a mains plug, but a battery contact sensor can stay blank in the UI for
+    // hours after a reboot or a firmware flash. main-core has always done this;
+    // this SKU never inherited the call, for the same reason it never inherited
+    // the pool init and the shadow sink: they all live inside zigbee_mgr_init().
+    zigbee_pool_lock();
+    const uint16_t shadow_n =
+        device_shadow_restore_from_pool(pool_all(), pool_count());
+    zigbee_pool_unlock();
+    if (shadow_n) ESP_LOGI(TAG, "shadow: restored %u device(s) from NVS", shadow_n);
 
     // Re-apply persisted per-device options now that device_shadow and the
     // device pool are up. A no-op while the pool is empty.

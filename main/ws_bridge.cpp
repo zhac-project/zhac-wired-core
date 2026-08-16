@@ -365,15 +365,32 @@ static void cmd_device_list(int fd, uint32_t id) {
     for (uint16_t i = 0; i < cnt; i++) {
         const ZapDevice& d = pool[i];
         if (zap_dev_is_removed(&d)) continue;
+        // Friendly labels from the matched definition ("Tuya" / "TS0203"),
+        // falling back to the device's own Basic strings when no def matches.
+        // The SPA's device table reads `vendor`, NOT `manufacturer` — omitting
+        // it left the Manufacturer column showing "—" for every device even
+        // though the raw string was right there in the row. `manufacturer`
+        // stays as the raw Basic 0x0004 value, which the detail tab reads.
+        // Same contract as hap_json's device_list encoder.
+        char vendor_buf[32] = {};
+        char model_buf[32]  = {};
+        zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
+                                    vendor_buf, sizeof(vendor_buf),
+                                    model_buf,  sizeof(model_buf));
+        const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
+        const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
+
         char row[512];
         int rn = snprintf(row, sizeof(row),
             "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
             "\"friendly\":\"%s\",\"model\":\"%s\",\"manufacturer\":\"%s\","
+            "\"vendor\":\"%s\","
             "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
             "\"ep_count\":%u}",
             first ? "" : ",",
             d.ieee_addr, d.nwk_addr,
-            d.friendly_name, d.model_id, d.manufacturer_name,
+            d.friendly_name, model_out, d.manufacturer_name,
+            vendor_out,
             (int64_t)d.last_seen, d.link_quality, d.battery_pct,
             d.endpoint_count);
         if (rn <= 0 || pos + rn + 4 >= 8 * 1024) break;  // truncate gracefully
@@ -422,8 +439,24 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
     D["nwk"]         = dev->nwk_addr;
     D["friendly"]    = dev->friendly_name;
     D["name"]        = dev->friendly_name;    // net-core SPA prefers `name`
-    D["model"]       = dev->model_id;
+    // `manufacturer` / `model_id` are the device's raw Basic strings;
+    // `vendor` / `model` are the matched definition's friendly labels with the
+    // raw values as fallback. The SPA reads different ones in different views
+    // (list: vendor, detail: manufacturer), so both must be present.
+    char vendor_buf[32] = {};
+    char model_buf[32]  = {};
+    zhac_adapter_resolve_labels(dev->model_id, dev->manufacturer_name,
+                                vendor_buf, sizeof(vendor_buf),
+                                model_buf,  sizeof(model_buf));
+    D["model"]       = model_buf[0] ? (const char*)model_buf
+                                    : (const char*)dev->model_id;
+    D["vendor"]      = vendor_buf[0] ? (const char*)vendor_buf
+                                     : (const char*)dev->manufacturer_name;
     D["manufacturer"]= dev->manufacturer_name;
+    D["model_id"]    = dev->model_id;
+    D["mfr"]         = dev->manufacturer_code;
+    D["power_source"]= dev->power_source;
+    D["type"]        = dev->device_type;
     D["last_seen"]   = (int64_t)dev->last_seen;
     D["lqi"]         = dev->link_quality;
     D["bat_pct"]     = dev->battery_pct;
