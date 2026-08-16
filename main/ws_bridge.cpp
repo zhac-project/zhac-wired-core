@@ -26,6 +26,7 @@
 #include "zigbee_mgr.h"
 #include "device_backend.h"
 #include "sys_diag.h"
+#include "dgm_store.h"
 #include "zigbee_pool.h"
 #include "zhc_adapter.h"
 #include "zap_common.h"
@@ -710,6 +711,114 @@ static void cmd_remote_disconnect(int fd, uint32_t id, JsonDocument& doc) {
 }
 #endif
 
+// ── device.groups.* / groups.all — native ZCL group membership ────────
+//
+// NOT the Collections feature above. A device in ZCL group N obeys commands
+// addressed to N, including groupcasts a hardware zone-remote sends directly —
+// so the remote keeps driving the bulbs while the gateway is rebooting.
+// Collections are gateway fan-out; these are the device's own group table.
+//
+// dgm_store is a MIRROR of what we provisioned, kept so the UI can list
+// membership without waking every device. The device's table is authoritative,
+// which is what `refresh` reconciles against.
+//
+// Unlike net-core, which reaches the radio over a HAP roundtrip to the P4,
+// this SKU calls the backend in-process.
+static uint64_t dgm_arg_ieee(JsonDocument& doc) {
+    const char* s = doc["args"]["ieee"] | (const char*)nullptr;
+    return s ? parse_ieee(s) : 0;
+}
+
+// Reply shape the SPA expects: {"groups":[101,102]}.
+static void dgm_reply_list(int fd, uint32_t id, uint64_t ieee) {
+    uint16_t gids[DGM_MAX_GIDS];
+    const uint8_t n = dgm_list(ieee, gids, DGM_MAX_GIDS);
+    char buf[256];
+    int p = snprintf(buf, sizeof(buf),
+                     "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"groups\":[", id);
+    for (uint8_t i = 0; i < n && p > 0 && (size_t)p < sizeof(buf); i++)
+        p += snprintf(buf + p, sizeof(buf) - (size_t)p, "%s%u", i ? "," : "", gids[i]);
+    if (p > 0 && (size_t)p < sizeof(buf))
+        p += snprintf(buf + p, sizeof(buf) - (size_t)p, "]}}");
+    ws_server_reply(fd, buf, p);
+}
+
+static void cmd_device_groups_list(int fd, uint32_t id, JsonDocument& doc) {
+    const uint64_t ieee = dgm_arg_ieee(doc);
+    if (ieee == 0) { send_err(fd, id, "missing or bad ieee"); return; }
+    dgm_reply_list(fd, id, ieee);
+}
+
+static void cmd_device_groups_add_remove(int fd, uint32_t id, JsonDocument& doc,
+                                         bool remove) {
+    const uint64_t ieee = dgm_arg_ieee(doc);
+    if (ieee == 0) { send_err(fd, id, "missing or bad ieee"); return; }
+    uint16_t gid = doc["args"]["gid"] | (uint16_t)0;
+    if (gid == 0) gid = doc["args"]["group"] | (uint16_t)0;
+    const uint8_t ep = doc["args"]["ep"] | (uint8_t)1;
+    if (gid == 0) { send_err(fd, id, "gid 1-65535"); return; }
+
+    ZapDevice snap{};
+    if (!zigbee_pool_snapshot(ieee, &snap) || snap.nwk_addr == 0) {
+        send_err(fd, id, "device not found");
+        return;
+    }
+    const bool ok = remove ? zigbee_zcl_group_remove(snap.nwk_addr, ep, gid)
+                           : zigbee_zcl_group_add(snap.nwk_addr, ep, gid);
+    if (!ok) { send_err(fd, id, "command failed"); return; }
+    // Mirror only after the radio accepted it, so a failed send cannot leave
+    // the UI claiming a membership the device never got.
+    if (remove) dgm_remove(ieee, gid); else dgm_add(ieee, gid);
+    dgm_reply_list(fd, id, ieee);
+}
+
+// Read the device's ACTUAL table and reconcile the mirror to it.
+static void cmd_device_groups_refresh(int fd, uint32_t id, JsonDocument& doc) {
+    const uint64_t ieee = dgm_arg_ieee(doc);
+    if (ieee == 0) { send_err(fd, id, "missing or bad ieee"); return; }
+    const uint8_t ep = doc["args"]["ep"] | (uint8_t)1;
+
+    ZapDevice snap{};
+    if (!zigbee_pool_snapshot(ieee, &snap) || snap.nwk_addr == 0) {
+        send_err(fd, id, "device not found");
+        return;
+    }
+    uint16_t gids[DGM_MAX_GIDS];
+    uint8_t  count = 0;
+    if (!zigbee_zcl_get_group_membership(snap.nwk_addr, ep, gids,
+                                         DGM_MAX_GIDS, &count)) {
+        // No answer is NOT "device is in no groups". Reconciling to empty here
+        // would wipe a working configuration because a sleepy device missed
+        // its window, so the mirror is left exactly as it was.
+        send_err(fd, id, "device did not answer");
+        return;
+    }
+    dgm_set(ieee, gids, count);
+    dgm_reply_list(fd, id, ieee);
+}
+
+// Whole-store view, inverted by gid — backs the SPA's global Groups tab.
+// PSRAM buffer: the response scales with every device * every group, well past
+// what belongs on the httpd task's stack.
+static void cmd_groups_all(int fd, uint32_t id) {
+    constexpr size_t CAP = 8192;
+    char* tmp = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+    char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+    if (!tmp || !buf) { heap_caps_free(tmp); heap_caps_free(buf); send_err(fd, id, "oom"); return; }
+    const size_t tn = dgm_all_json_live(tmp, CAP);
+    JsonDocument inner;
+    // n == 0 means the serializer overflowed or the store is unreadable; send a
+    // well-formed empty result rather than a truncated body the SPA cannot parse.
+    if (tn == 0 || deserializeJson(inner, tmp, tn)) {
+        inner.clear();
+        inner["groups"].to<JsonArray>();
+    }
+    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = inner;
+    const size_t n = serializeJson(env, buf, CAP);
+    ws_server_reply(fd, buf, n);
+    heap_caps_free(tmp); heap_caps_free(buf);
+}
+
 // ── uplink.get ────────────────────────────────────────────────────────
 //
 // The SPA asks this before rendering a device's Options tab. Without it the
@@ -978,6 +1087,11 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
     if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
     if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }
+    if (std::strcmp(cmd, "device.groups.list")  == 0) { cmd_device_groups_list(fd, id, doc);  return; }
+    if (std::strcmp(cmd, "device.groups.add")   == 0) { cmd_device_groups_add_remove(fd, id, doc, false); return; }
+    if (std::strcmp(cmd, "device.groups.remove")== 0) { cmd_device_groups_add_remove(fd, id, doc, true);  return; }
+    if (std::strcmp(cmd, "device.groups.refresh")==0) { cmd_device_groups_refresh(fd, id, doc); return; }
+    if (std::strcmp(cmd, "groups.all")          == 0) { cmd_groups_all(fd, id);               return; }
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     if (std::strcmp(cmd, "remote.status")      == 0) { cmd_remote_status(fd, id);            return; }
     if (std::strcmp(cmd, "remote.connect")     == 0) { cmd_remote_connect(fd, id, doc);      return; }

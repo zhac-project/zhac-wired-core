@@ -52,6 +52,9 @@
 #include "zigbee_diagnostics.h"
 #include "zigbee_pool.h"
 
+// Defined in zhac-components' zhc_shadow_bridge.cpp; declared in no header.
+extern "C" void zhc_shadow_bridge_register(void);
+
 #include <cstring>
 
 static const char* TAG = "esp_zb";
@@ -107,6 +110,8 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     // to the adapter either way.
     zb_interview_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint,
                           ind->asdu, static_cast<uint8_t>(ind->asdu_length));
+    zb_groups_feed_zcl(nwk, ind->cluster_id, ind->asdu,
+                       static_cast<uint8_t>(ind->asdu_length));
 
     // Identity strings for the matcher, straight from the pool snapshot.
     ZapDevice dev{};
@@ -308,6 +313,13 @@ static bool zb_init() {
     // snapshot cb (so deferred flushes can read live state) -> restore.
     zigbee_pool_init();
     zap_store_set_snapshot_cb(zigbee_pool_snapshot);
+
+    // Install the decode -> device_shadow sink. Normally done by
+    // zigbee_mgr_init(), which is ZNP-bound and not compiled here. Must happen
+    // BEFORE the radio starts: zhac_adapter_try_decode() drops every key it
+    // decodes if no sink is registered, so any frame arriving in the gap is
+    // logged as "matched" and then silently lost.
+    zhc_shadow_bridge_register();
     const uint16_t restored = zigbee_pool_restore_persisted();
     if (restored) {
         ESP_LOGI(TAG, "restored %u device(s) from NVS", (unsigned)restored);

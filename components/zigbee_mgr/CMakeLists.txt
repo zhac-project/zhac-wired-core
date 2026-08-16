@@ -74,6 +74,12 @@ idf_component_register(
         # Shared ZCL transaction-sequence allocator (znp-free). Reused so the
         # interview and configure paths draw TSNs from one counter.
         "${ZM_DIR}/zcl_seq.cpp"
+        # THE decode->shadow sink. zhac_adapter_try_decode() hands every decoded
+        # key to whatever zhac_adapter_register_shadow() installed, and this file
+        # is the only thing in the tree that installs one. Without it a device
+        # decodes perfectly, logs "matched, N keys", and the values go nowhere --
+        # device_shadow stays empty and the SPA shows no states. znp-free.
+        "${ZM_DIR}/zhc_shadow_bridge.cpp"
         # Radio operations the control surface calls. esp_zigbee_backend
         # defines the SAME six symbols, so exactly one of the two may be
         # compiled -- linking both is a duplicate-symbol error.

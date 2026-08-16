@@ -37,6 +37,7 @@ idf_component_register(
         "log_ring.cpp"
         "device_options.cpp"
         "groups_store.cpp"
+        "dgm_store.cpp"
         "spa_serve.cpp"
         "metrics_mqtt.cpp"
         "radio_state.cpp"

@@ -55,6 +55,7 @@
 #include "device_shadow.h"
 #include "eth.h"
 #include "sys_diag.h"
+#include "dgm_store.h"
 #include "event_bus.h"
 #include "log_ring.h"
 #include "lua_engine.h"
@@ -165,6 +166,7 @@ extern "C" void app_main() {
     // The radio registers itself against this pipeline immediately below.
     event_bus_init();
     zap_store_init();
+    dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
     device_shadow_init();
     zhac_adapter_init();
