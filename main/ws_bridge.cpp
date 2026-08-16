@@ -710,6 +710,52 @@ static void cmd_remote_disconnect(int fd, uint32_t id, JsonDocument& doc) {
 }
 #endif
 
+// ── uplink.get ────────────────────────────────────────────────────────
+//
+// The SPA asks this before rendering a device's Options tab. Without it the
+// call rejects and the tab shows "Couldn't load RainMaker status" with a Retry
+// button -- on every device, forever, on a SKU that has no RainMaker by design
+// (tools/check_sku_invariants.sh makes that a build failure, not a convention).
+//
+// Answering "none" is the truthful answer and makes the SPA render its correct
+// "RainMaker bridging is off" copy instead of an error. There is deliberately
+// no uplink.set: there is nothing here to switch to.
+static void cmd_uplink_get(int fd, uint32_t id) {
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"id\":%" PRIu32 ",\"ok\":true,"
+                     "\"data\":{\"uplink\":\"none\"}}", id);
+    ws_server_reply(fd, buf, n);
+}
+
+// ── zigbee.permit_join / .status ──────────────────────────────────────
+//
+// The SPA drives pairing over WS, not REST: its Devices toolbar calls
+// `zigbee.permit_join` and then polls `zigbee.permit_join.status` for the
+// countdown badge. Both were missing here, so the button failed with
+// "unknown cmd" while the REST endpoint it never calls worked fine.
+//
+// Duration is range-checked against the Zigbee spec (0-254); 0 closes the
+// window. radio_permit_join owns the deadline so REST and WS agree.
+static void cmd_zigbee_permit_join(int fd, uint32_t id, JsonDocument& doc) {
+    const int duration = doc["args"]["duration"] | -1;
+    if (duration < 0 || duration > 254) { send_err(fd, id, "duration 0-254"); return; }
+    const bool ok = radio_permit_join((uint8_t)duration);
+    reply_ok_or_err(fd, id, ok, "permit_join failed");
+}
+
+static void cmd_zigbee_permit_join_status(int fd, uint32_t id) {
+    bool open = false;
+    int  remaining = 0;
+    radio_permit_join_status(&open, &remaining);
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{"
+                     "\"open\":%s,\"remaining_sec\":%d}}",
+                     id, open ? "true" : "false", remaining);
+    ws_server_reply(fd, buf, n);
+}
+
 // ── push helper: {event, data} broadcast (+ relay mirror) ─────────────
 void ws_push(const char* event, JsonDocument& data) {
     if (ws_server_client_count() == 0) return;
@@ -929,6 +975,9 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "script.check")       == 0) { cmd_script_check(fd, id, doc);        return; }
     if (std::strcmp(cmd, "zigbee.settings.set") == 0) { cmd_zigbee_settings_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "zigbee.reset")        == 0) { cmd_zigbee_reset(fd, id);             return; }
+    if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
+    if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
+    if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     if (std::strcmp(cmd, "remote.status")      == 0) { cmd_remote_status(fd, id);            return; }
     if (std::strcmp(cmd, "remote.connect")     == 0) { cmd_remote_connect(fd, id, doc);      return; }

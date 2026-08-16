@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "ArduinoJson.h"
 
+#include "radio_state.h"
 #include "zigbee_mgr.h"
 #include "zigbee_pool.h"
 #include "device_shadow.h"
@@ -223,7 +224,10 @@ static esp_err_t handle_permit_join(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "duration 0-254");
         return ESP_FAIL;
     }
-    bool ok = zigbee_permit_join((uint8_t)duration);
+    // radio_permit_join, not zigbee_permit_join: it records the deadline the
+    // WS `zigbee.permit_join.status` poll reads. Calling the backend directly
+    // here would open the network without the UI ever learning it is open.
+    bool ok = radio_permit_join((uint8_t)duration);
     httpd_resp_set_type(req, "application/json");
     if (ok) {
         char r[48];
