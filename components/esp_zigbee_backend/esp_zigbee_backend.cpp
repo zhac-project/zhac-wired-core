@@ -25,12 +25,14 @@
 // Everything above is identical, which was the entire argument for keeping
 // both SKUs in one repo.
 #include "esp_zigbee_backend.h"
+#include "esp_zb_interview.h"
 #include "sdkconfig.h"
 
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "device_backend.h"
 #include "esp_log.h"
+#include "event_bus.h"
 #include "esp_zigbee.h"
 #include "ezbee/aps.h"
 #include "ezbee/app_signals.h"
@@ -94,6 +96,12 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
         return false;
     }
 
+    // Give the interview engine first sight of the frame. It only consumes
+    // Basic-cluster replies it is actively waiting for; everything continues
+    // to the adapter either way.
+    zb_interview_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint,
+                          ind->asdu, static_cast<uint8_t>(ind->asdu_length));
+
     // Identity strings for the matcher, straight from the pool snapshot.
     ZapDevice dev{};
     const bool have = zigbee_pool_snapshot(ieee, &dev);
@@ -120,8 +128,10 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
 }
 
 // ── Egress: adapter-encoded ZCL out over APS ─────────────────────────────
-static bool zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
-                       const uint8_t* zcl_data, size_t zcl_len) {
+// Non-static: esp_zb_interview.cpp sends its Basic-cluster reads through this
+// rather than duplicating the apsde plumbing (declared in esp_zb_interview.h).
+bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
+                    const uint8_t* zcl_data, size_t zcl_len) {
     if (!zcl_data || zcl_len == 0) return false;
 
     ezb_apsde_data_req_t req{};
@@ -188,9 +198,8 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         return true;
 
     case EZB_ZDO_SIGNAL_DEVICE_ANNCE: {
-        // A device joined and announced itself. Pool insert + interview belong
-        // to the join-handling increment; logging the IEEE now means a join can
-        // be confirmed on hardware before that lands.
+        // A device joined (or a known one rejoined) and announced itself.
+        // Queue it; the interview task owns everything after this point.
         const auto* p = static_cast<const ezb_zdo_signal_device_annce_params_t*>(
             ezb_app_signal_get_params(app_signal));
         if (p) {
@@ -198,6 +207,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
                      (unsigned)p->short_addr,
                      (unsigned long long)p->device_addr.u64,
                      (unsigned)p->capability);
+            zb_interview_enqueue(p->device_addr.u64, p->short_addr);
         }
         return true;
     }
@@ -242,6 +252,18 @@ static bool zb_init() {
         return false;
     }
 
+    // The device pool is normally brought up by zigbee_mgr_init(), which is
+    // ZNP-bound and therefore not compiled into this SKU. Nothing else calls
+    // these, so without them pool_add() would write through a null pool and
+    // every join would be lost. Order matters: init (allocates in PSRAM) ->
+    // snapshot cb (so deferred flushes can read live state) -> restore.
+    zigbee_pool_init();
+    zap_store_set_snapshot_cb(zigbee_pool_snapshot);
+    const uint16_t restored = zigbee_pool_restore_persisted();
+    if (restored) {
+        ESP_LOGI(TAG, "restored %u device(s) from NVS", (unsigned)restored);
+    }
+
     esp_zigbee_config_t cfg{};
     cfg.device_config.device_type         = EZB_NWK_DEVICE_TYPE_COORDINATOR;
     cfg.device_config.install_code_policy = false;
@@ -282,7 +304,7 @@ static bool zb_init() {
         ESP_LOGE(TAG, "app signal handler registration FAILED (%d) -- "
                       "commissioning cannot be driven", (int)sig_err);
     }
-    zhac_adapter_register_send(zb_af_send);
+    zhac_adapter_register_send(esp_zb_af_send);
 
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
 
@@ -330,7 +352,26 @@ static bool zb_init() {
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
+    } else {
+        // Resume path: the dataset already held a PAN and the stack came back
+        // up on it. Tempting to do nothing here -- the network exists and
+        // frames flow -- but BDB itself never ran, and it refuses to act from
+        // that state. ezb_bdb_open_network() returns 3 (EZB_ERR_INV_STATE), so
+        // permit_join fails on every boot after the first with a network that
+        // looks perfectly healthy.
+        //
+        // BDB INITIALIZATION is the spec's answer for "device restarted with
+        // network parameters already in NVRAM"; it also raises DEVICE_REBOOT.
+        const ezb_err_t ie =
+            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
+        if (ie != 0) {
+            ESP_LOGW(TAG, "bdb initialization failed (%d) -- permit_join may "
+                          "refuse until the next reboot", (int)ie);
+        }
     }
+
+    // Only start join handling once there is a PAN to join.
+    zb_interview_init();
 
     if (zb_network_ready()) {
         s_formed = true;
@@ -402,6 +443,17 @@ static bool zb_stop_discovery() {
     return true;
 }
 
+static bool zb_backend_interview(uint64_t ieee, uint16_t addr_hint) {
+    if (!s_running) return false;
+    // A device already in the pool goes through trigger (which reads its
+    // current short address). An unknown IEEE with a usable hint is admitted
+    // as a fresh join -- that is what the REST "add by address" path wants.
+    if (zb_interview_trigger(ieee)) return true;
+    if (addr_hint == 0) return false;
+    zb_interview_enqueue(ieee, addr_hint);
+    return true;
+}
+
 static bool zb_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out) {
     if (!out || !count_out) return false;
     *count_out = 0;
@@ -447,9 +499,9 @@ static DeviceBackend s_backend = {
     .is_running      = zb_is_running,
     .start_discovery = zb_start_discovery,
     .stop_discovery  = zb_stop_discovery,
-    // interview / remove / rename need ZDO round-trips that belong with the
-    // join-handling increment; nullptr is honest until then.
-    .interview       = nullptr,
+    // remove / rename still need ZDO round-trips this backend does not issue
+    // yet; nullptr stays honest for those.
+    .interview       = zb_backend_interview,
     .write_attr      = zb_write_attr,
     .read_attr       = nullptr,
     .get_device_list = zb_get_device_list,
@@ -492,7 +544,7 @@ bool zigbee_zdo_bind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
 bool zigbee_zdo_unbind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
     return not_yet("zdo_unbind");
 }
-bool zigbee_interview_trigger(uint64_t) { return not_yet("interview_trigger"); }
+bool zigbee_interview_trigger(uint64_t ieee) { return zb_interview_trigger(ieee); }
 bool zigbee_force_recommission() { return not_yet("force_recommission"); }
 
 #else   // !CONFIG_ZHAC_ESP_ZIGBEE

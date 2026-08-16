@@ -67,6 +67,10 @@ idf_component_register(
     SRCS
         "${ZM_DIR}/zigbee_pool.cpp"
         "${ZM_DIR}/zigbee_diagnostics.cpp"
+        # ZCL Basic-attribute parsing + endpoint probe ordering. Verified
+        # znp-free (0 znp_ references), so the esp-zigbee interview reuses the
+        # exact parser the ZNP path uses rather than reimplementing it.
+        "${ZM_DIR}/zigbee_interview_utils.cpp"
         # Radio operations the control surface calls. esp_zigbee_backend
         # defines the SAME six symbols, so exactly one of the two may be
         # compiled -- linking both is a duplicate-symbol error.

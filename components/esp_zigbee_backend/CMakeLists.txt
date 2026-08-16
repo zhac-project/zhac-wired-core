@@ -23,7 +23,7 @@
 # the symbol genuinely exists. Same rule applies to zigbee_mgr/radio_stubs.cpp.
 # Gating on IDF_TARGET is fine -- that IS available early (see tg_gw_stub).
 idf_component_register(
-    SRCS "esp_zigbee_backend.cpp"
+    SRCS "esp_zigbee_backend.cpp" "esp_zb_interview.cpp"
     INCLUDE_DIRS "include"
     REQUIRES
         espressif__esp-zigbee-lib
@@ -35,5 +35,6 @@ idf_component_register(
         event_bus
         device_shadow
         nvs_flash
+        esp_timer
         freertos
 )
