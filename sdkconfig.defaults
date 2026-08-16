@@ -111,3 +111,14 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # doing" without a JTAG probe, on a device whose whole job is to run unattended.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# Lets ws_server register a WebSocket client at handshake time on IDF >= 6.1.
+#
+# v6.1 stopped calling the URI handler for the handshake ("if the request is
+# websocket handshake, then do not call the uri->handler" in httpd_uri.c), and
+# that handler is where ws_server added the socket to its broadcast table. With
+# it off, ws_server falls back to adopting sockets on their first data frame --
+# which works, but such a socket has no handshake headers left to inspect, so a
+# header-authenticated client would have to re-auth by message. Enabling this
+# keeps handshake-time X-Api-Key auth behaving exactly as it does on v6.0.
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
