@@ -71,6 +71,9 @@ idf_component_register(
         # znp-free (0 znp_ references), so the esp-zigbee interview reuses the
         # exact parser the ZNP path uses rather than reimplementing it.
         "${ZM_DIR}/zigbee_interview_utils.cpp"
+        # Shared ZCL transaction-sequence allocator (znp-free). Reused so the
+        # interview and configure paths draw TSNs from one counter.
+        "${ZM_DIR}/zcl_seq.cpp"
         # Radio operations the control surface calls. esp_zigbee_backend
         # defines the SAME six symbols, so exactly one of the two may be
         # compiled -- linking both is a duplicate-symbol error.

@@ -49,6 +49,16 @@ bool zb_interview_forget(uint64_t ieee);
 bool zb_interview_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
                            const uint8_t* zcl, uint8_t zcl_len);
 
+// Register the configure transports (bind / report / cmd / read / write) with
+// zhc_adapter. Call once at init, before any interview can complete.
+void esp_zb_configure_register();
+
+// ZDO bind/unbind with a caller-chosen destination, for the SPA's Bind tab.
+// cfg_bind() above always targets the coordinator; this does not.
+bool esp_zb_zdo_bind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
+                     uint16_t cluster, uint64_t dst_ieee, uint8_t dst_ep,
+                     bool unbind);
+
 // Defined in esp_zigbee_backend.cpp -- raw ZCL out over APS. Declared here so
 // the interview engine can send its Basic-cluster reads without duplicating
 // the apsde request plumbing.

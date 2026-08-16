@@ -13,3 +13,4 @@ dependencies.lock
 .vscode/
 *.pyc
 __pycache__/
+components/*/test/host/build/

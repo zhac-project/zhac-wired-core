@@ -320,6 +320,23 @@ static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
     zigbee_pool_unlock();
 
     const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp, model_cp, manu_cp);
+
+    // Record the outcome. Without this a successful manual retry leaves the
+    // row still showing FAILED, so the operator has no way to tell whether
+    // the button did anything.
+    ZapDevice cur{};
+    if (zigbee_pool_snapshot(ieee_cp, &cur)) {
+        cur.configure_state = static_cast<uint8_t>(
+            ok ? ConfigureState::DONE : ConfigureState::FAILED);
+        if (!ok && cur.configure_attempts < 0xFF) cur.configure_attempts++;
+        zigbee_pool_with_device(ieee_cp,
+            [](ZapDevice* d, void* ctx) {
+                const ZapDevice* src = static_cast<const ZapDevice*>(ctx);
+                d->configure_state    = src->configure_state;
+                d->configure_attempts = src->configure_attempts;
+            }, &cur);
+        zap_store_mark_dirty(&cur, ZAP_PERSIST_LOW);
+    }
     reply_ok_or_err(fd, id, ok, "no def or transport down");
 }
 

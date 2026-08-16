@@ -53,6 +53,7 @@
 #include "zhc_adapter.h"
 #include "zigbee_interview_utils.h"
 #include "zigbee_mgr.h"   // zigbee_pool_remove
+#include "zcl_seq.h"
 #include "zigbee_pool.h"
 
 #include <cstring>
@@ -240,11 +241,11 @@ bool read_basic_once(uint16_t nwk, uint8_t ep, uint8_t tsn) {
 }
 
 // Probe endpoints that advertise Basic first (shared helper), then the rest.
-bool read_basic(ZapDevice* work, uint16_t nwk, uint8_t tsn) {
+bool read_basic(ZapDevice* work, uint16_t nwk) {
     uint8_t order[8];
     const uint8_t n = zigbee_interview_build_basic_probe_order(*work, order, sizeof(order));
     for (uint8_t i = 0; i < n; i++) {
-        if (!read_basic_once(nwk, order[i], static_cast<uint8_t>(tsn + i))) continue;
+        if (!read_basic_once(nwk, order[i], zcl_seq_next())) continue;
 
         // manufacturer_code from the Basic read wins over the node descriptor's
         // only when the read actually carried it; seed with what we have.
@@ -335,7 +336,7 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
     // 4. Identity. This is the step that decides whether the device is usable,
     //    and the step sleepy devices fail -- hence the retry loop around the
     //    whole interview rather than around individual requests.
-    const bool have_identity = read_basic(&work, nwk, 0x40);
+    const bool have_identity = read_basic(&work, nwk);
     work.interview_state = static_cast<uint8_t>(
         have_identity ? InterviewState::IDENTITY_READY : InterviewState::IDENTITY_PENDING);
 
@@ -370,6 +371,31 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
     // Persist outside the visitor -- mark_dirty can write flash on overflow,
     // and the pool mutex must not be held across that.
     zap_store_mark_dirty(&work, ZAP_PERSIST_HIGH);
+
+    // Configure: bindings + reporting + config_steps. Without this the device
+    // is identified but inert -- nothing has told it to send its reports here.
+    // Only meaningful once identity is known, since the definition (and hence
+    // its bindings[]/reports[]) is selected by model+manufacturer.
+    if (have_identity) {
+        const bool cfg_ok = zhac_adapter_configure(
+            ieee, nwk,
+            work.model_id[0] ? work.model_id : nullptr,
+            work.manufacturer_name[0] ? work.manufacturer_name : nullptr);
+        // Recorded, not fatal. A failed bind on a sleepy device is routine --
+        // it simply missed the window -- and the record must still show the
+        // device so /api/device/configure can retry against it.
+        ZapDevice cur{};
+        if (zigbee_pool_snapshot(ieee, &cur)) {
+            cur.configure_state = static_cast<uint8_t>(
+                cfg_ok ? ConfigureState::DONE : ConfigureState::FAILED);
+            if (!cfg_ok && cur.configure_attempts < 0xFF) cur.configure_attempts++;
+            CommitCtx cc{&cur, false};
+            zigbee_pool_with_device(ieee, commit_fn, &cc);
+            zap_store_mark_dirty(&cur, ZAP_PERSIST_LOW);
+        }
+        ESP_LOGI(TAG, "configure %016llx: %s",
+                 (unsigned long long)ieee, cfg_ok ? "DONE" : "FAILED");
+    }
     return have_identity;
 }
 

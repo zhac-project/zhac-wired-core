@@ -419,7 +419,10 @@ static bool zb_init() {
         }
     }
 
-    // Only start join handling once there is a PAN to join.
+    // Only start join handling once there is a PAN to join. Configure
+    // transports must be registered before any interview can finish, since
+    // the interview calls zhac_adapter_configure() on success.
+    esp_zb_configure_register();
     zb_interview_init();
 
     if (zb_network_ready()) {
@@ -612,11 +615,17 @@ static inline bool not_yet(const char* op) {
     ESP_LOGW(TAG, "%s: not implemented on esp_zigbee_backend yet", op);
     return false;
 }
-bool zigbee_zdo_bind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
-    return not_yet("zdo_bind");
+bool zigbee_zdo_bind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
+                     uint16_t cluster, uint64_t dst_ieee, uint8_t dst_ep) {
+    if (!s_running) return false;
+    return esp_zb_zdo_bind(src_nwk, src_ieee, src_ep, cluster, dst_ieee, dst_ep,
+                           /*unbind=*/false);
 }
-bool zigbee_zdo_unbind(uint16_t, uint64_t, uint8_t, uint16_t, uint64_t, uint8_t) {
-    return not_yet("zdo_unbind");
+bool zigbee_zdo_unbind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
+                       uint16_t cluster, uint64_t dst_ieee, uint8_t dst_ep) {
+    if (!s_running) return false;
+    return esp_zb_zdo_bind(src_nwk, src_ieee, src_ep, cluster, dst_ieee, dst_ep,
+                           /*unbind=*/true);
 }
 bool zigbee_interview_trigger(uint64_t ieee) { return zb_interview_trigger(ieee); }
 bool zigbee_force_recommission() { return not_yet("force_recommission"); }
