@@ -80,6 +80,18 @@ idf_component_register(
         # decodes perfectly, logs "matched, N keys", and the values go nowhere --
         # device_shadow stays empty and the SPA shows no states. znp-free.
         "${ZM_DIR}/zhc_shadow_bridge.cpp"
+        # Late-identity enrichment. A sleepy device usually misses the
+        # interview's Basic read window; when it later reports cluster 0x0000
+        # unprompted this promotes IDENTITY_PENDING -> IDENTITY_READY and
+        # re-runs the definition match, with no user action. Without it such a
+        # device is stuck decoding as generic/generic forever. znp-free apart
+        # from its AF-framed entry point, which esp_zigbee_backend adapts.
+        "${ZM_DIR}/zigbee_identity.cpp"
+        # Deferred configure with backoff (1/5/30/120/600 s, 5 attempts). The
+        # interview fires configure once; a battery device asleep at that
+        # moment gets no bindings and no reports, and nothing ever retries.
+        # znp-free -- it drives zhac_adapter_configure, same as we do.
+        "${ZM_DIR}/zigbee_configure_queue.cpp"
         # Radio operations the control surface calls. esp_zigbee_backend
         # defines the SAME six symbols, so exactly one of the two may be
         # compiled -- linking both is a duplicate-symbol error.

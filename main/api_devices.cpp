@@ -78,6 +78,13 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
         doc["manufacturer"] = d.manufacturer_name;
         doc["model_id"]     = d.model_id;
         doc["last_seen"]    = d.last_seen;
+        // Parity with the WS device.list row, which already carried these.
+        // A REST consumer had no way to see signal strength, battery or
+        // endpoint count at all.
+        doc["lqi"]          = d.link_quality;
+        doc["battery"]      = d.battery_pct;
+        doc["power_source"] = d.power_source;
+        doc["ep_count"]     = d.endpoint_count;
 
         // Endpoints array
         JsonArray eps = doc["endpoints"].to<JsonArray>();
@@ -90,6 +97,11 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
         uint8_t n = device_shadow_get_attrs(d.ieee_addr, sa, 32);
         JsonObject attrs = doc["attrs"].to<JsonObject>();
         for (uint8_t j = 0; j < n; j++) {
+            // Underscore-prefixed keys are shadow-internal bookkeeping
+            // (`_last_seen`), not device state. The WS encoder has always
+            // filtered them; this one did not, so REST consumers saw a phantom
+            // "_last_seen" attribute alongside the real ones.
+            if (sa[j].key[0] == '_') continue;
             switch (sa[j].val_type) {
                 case VAL_INT:
                 case VAL_BOOL: attrs[sa[j].key] = sa[j].int_val; break;

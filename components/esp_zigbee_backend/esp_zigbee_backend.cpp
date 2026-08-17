@@ -50,6 +50,8 @@
 #include "zap_store.h"
 #include "zhc_adapter.h"
 #include "zigbee_diagnostics.h"
+#include "zigbee_configure_queue.h"
+#include "zigbee_identity.h"
 #include "zigbee_pool.h"
 
 // Defined in zhac-components' zhc_shadow_bridge.cpp; declared in no header.
@@ -77,6 +79,31 @@ static constexpr int kMainloopRebootMinUptimeS = 60;
 // device up in the pool for the identity strings the definition matcher needs
 // (modelId + manufacturerName), tell the adapter the (ieee, nwk) tuple so
 // converters that reply have a destination, then decode.
+// zigbee_identity_on_af_incoming() takes a ZNP AF_INCOMING_MSG payload, not a
+// raw ASDU -- it reads cluster at [2], src nwk at [4], data_len at [16], body
+// from [17]. Everything BEHIND that entry point (the worker task, pool update,
+// re-match, persist) is transport-neutral and well tested, so rather than
+// duplicate that logic we hand it a synthetic header.
+//
+// Only the four fields it actually reads are filled; the rest stay zero. If
+// that layout ever changes upstream this breaks silently, which is why the
+// better fix is a transport-neutral entry point in zhac-components -- raised,
+// not done here, because this SKU cannot modify that repo.
+static void feed_late_identity(uint16_t nwk, uint16_t cluster_id,
+                               const uint8_t* zcl, uint16_t zcl_len) {
+    if (cluster_id != 0x0000 || !zcl || zcl_len == 0) return;
+    if (zcl_len > 200) return;                 // keep the frame off the stack
+
+    uint8_t af[17 + 200] = {};
+    af[2]  = static_cast<uint8_t>(cluster_id & 0xFF);
+    af[3]  = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
+    af[4]  = static_cast<uint8_t>(nwk & 0xFF);
+    af[5]  = static_cast<uint8_t>((nwk >> 8) & 0xFF);
+    af[16] = static_cast<uint8_t>(zcl_len);
+    std::memcpy(af + 17, zcl, zcl_len);
+    zigbee_identity_on_af_incoming(af, static_cast<uint8_t>(17 + zcl_len));
+}
+
 static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
 
@@ -105,6 +132,19 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
         return false;
     }
 
+    // Link quality. Every APS indication carries it and nothing else on this
+    // backend ever wrote it, so the UI showed lqi 0 for every device forever.
+    // Cheap in-place update under the pool's own visitor lock.
+    if (ieee != 0 && ind->lqi != 0) {
+        struct LqiCtx { uint8_t lqi; uint32_t now; };
+        LqiCtx lc{ind->lqi, static_cast<uint32_t>(esp_timer_get_time() / 1000000)};
+        zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+            auto* x = static_cast<LqiCtx*>(c);
+            d->link_quality = x->lqi;
+            d->last_seen    = x->now;
+        }, &lc);
+    }
+
     // Give the interview engine first sight of the frame. It only consumes
     // Basic-cluster replies it is actively waiting for; everything continues
     // to the adapter either way.
@@ -112,6 +152,7 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
                           ind->asdu, static_cast<uint8_t>(ind->asdu_length));
     zb_groups_feed_zcl(nwk, ind->cluster_id, ind->asdu,
                        static_cast<uint8_t>(ind->asdu_length));
+    feed_late_identity(nwk, ind->cluster_id, ind->asdu, ind->asdu_length);
 
     // Identity strings for the matcher, straight from the pool snapshot.
     ZapDevice dev{};
@@ -436,6 +477,12 @@ static bool zb_init() {
     // the interview calls zhac_adapter_configure() on success.
     esp_zb_configure_register();
     zb_interview_init();
+    // Late-identity enrichment + deferred configure retries. Both are started
+    // by zigbee_mgr_init() on the ZNP path; neither is optional for battery
+    // devices, which routinely sleep through the interview's Basic read and
+    // through the first configure attempt.
+    zigbee_identity_init();
+    zigbee_configure_init();
 
     if (zb_network_ready()) {
         s_formed = true;

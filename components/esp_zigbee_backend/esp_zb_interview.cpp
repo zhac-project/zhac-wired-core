@@ -52,6 +52,7 @@
 #include "zap_store.h"
 #include "zhc_adapter.h"
 #include "zigbee_interview_utils.h"
+#include "zigbee_configure_queue.h"
 #include "zigbee_mgr.h"   // zigbee_pool_remove
 #include "zcl_seq.h"
 #include "zigbee_pool.h"
@@ -240,6 +241,44 @@ bool read_basic_once(uint16_t nwk, uint8_t ep, uint8_t tsn) {
     return got && s_basic_len > 0;
 }
 
+// Pull Basic attr 0x0007 (powerSource, ENUM8) out of a Read Attributes
+// Response. zigbee_parse_basic_identity extracts model / manufacturer /
+// manufacturer-code but not this one, so it stayed 0 ("unknown") on every
+// device and the UI showed "Power Source: —" for a battery sensor that had
+// just told us it runs on a battery.
+//
+// Record layout after the 3-byte header: attr_id(2 LE) | status(1) |
+// [type(1) | value(N)] -- type+value present only when status == SUCCESS.
+// Walk it rather than assuming attribute order; devices reorder freely.
+uint8_t parse_power_source(const uint8_t* d, uint8_t len) {
+    if (!d || len < 3) return 0;
+    size_t p = ((d[0] & 0x04) ? 5u : 3u);   // skip header (+2 if manuf-specific)
+    while (p + 3 <= len) {
+        const uint16_t attr = static_cast<uint16_t>(d[p]) |
+                              static_cast<uint16_t>(d[p + 1] << 8);
+        const uint8_t status = d[p + 2];
+        p += 3;
+        if (status != 0x00) continue;       // failed read: no type/value follows
+        if (p >= len) break;
+        const uint8_t type = d[p++];
+        uint8_t vlen = 0;
+        switch (type) {
+            case 0x30: case 0x20: case 0x18: case 0x10: vlen = 1; break;
+            case 0x31: case 0x21: case 0x29: case 0x19: vlen = 2; break;
+            case 0x23: case 0x2B: vlen = 4; break;
+            case 0x42:                       // char string: length-prefixed
+                if (p >= len) return 0;
+                vlen = static_cast<uint8_t>(1 + d[p]);
+                break;
+            default: return 0;               // unknown width -> cannot walk on
+        }
+        if (p + vlen > len) break;
+        if (attr == 0x0007 && vlen >= 1) return d[p];
+        p += vlen;
+    }
+    return 0;
+}
+
 // Probe endpoints that advertise Basic first (shared helper), then the rest.
 bool read_basic(ZapDevice* work, uint16_t nwk) {
     uint8_t order[8];
@@ -255,6 +294,9 @@ bool read_basic(ZapDevice* work, uint16_t nwk) {
             work->model_id, sizeof(work->model_id),
             work->manufacturer_name, sizeof(work->manufacturer_name),
             &mfg_code);
+        if (const uint8_t ps = parse_power_source(s_basic_buf, s_basic_len)) {
+            work->power_source = ps;
+        }
         if (any) {
             work->manufacturer_code = mfg_code;
             if (work->model_id[0] || work->manufacturer_name[0]) return true;
@@ -376,25 +418,15 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
     // is identified but inert -- nothing has told it to send its reports here.
     // Only meaningful once identity is known, since the definition (and hence
     // its bindings[]/reports[]) is selected by model+manufacturer.
+    //
+    // Enqueued rather than run inline. A single attempt at the end of the
+    // interview is exactly the wrong moment for a battery device: it has often
+    // gone back to sleep by then, every bind silently fails, and nothing ever
+    // tries again -- the device sits MATCHED with no bindings and no reports.
+    // The queue owns the retry schedule (1/5/30/120/600 s) and the
+    // ConfigureState/attempts bookkeeping that used to be duplicated here.
     if (have_identity) {
-        const bool cfg_ok = zhac_adapter_configure(
-            ieee, nwk,
-            work.model_id[0] ? work.model_id : nullptr,
-            work.manufacturer_name[0] ? work.manufacturer_name : nullptr);
-        // Recorded, not fatal. A failed bind on a sleepy device is routine --
-        // it simply missed the window -- and the record must still show the
-        // device so /api/device/configure can retry against it.
-        ZapDevice cur{};
-        if (zigbee_pool_snapshot(ieee, &cur)) {
-            cur.configure_state = static_cast<uint8_t>(
-                cfg_ok ? ConfigureState::DONE : ConfigureState::FAILED);
-            if (!cfg_ok && cur.configure_attempts < 0xFF) cur.configure_attempts++;
-            CommitCtx cc{&cur, false};
-            zigbee_pool_with_device(ieee, commit_fn, &cc);
-            zap_store_mark_dirty(&cur, ZAP_PERSIST_LOW);
-        }
-        ESP_LOGI(TAG, "configure %016llx: %s",
-                 (unsigned long long)ieee, cfg_ok ? "DONE" : "FAILED");
+        zigbee_configure_enqueue(ieee);
     }
     return have_identity;
 }
