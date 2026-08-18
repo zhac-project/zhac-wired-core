@@ -32,20 +32,47 @@ static esp_eth_handle_t s_handle  = nullptr;
 static bool             s_link_up = false;
 static bool             s_has_ip  = false;
 
+// IPv6 addresses, kept as strings because that is all any consumer wants and it
+// avoids handing raw esp_ip6_addr_t across the status API. Written only from the
+// event handlers (one task), read under no lock -- same contract as s_has_ip.
+static bool s_has_ip6 = false;
+static char s_ip6_ll[46] = {};   // link-local, fe80::/10
+static char s_ip6_gl[46] = {};   // first global / unique-local, if any
+
 static void on_eth_event(void*, esp_event_base_t, int32_t id, void*) {
     switch (id) {
-        case ETHERNET_EVENT_CONNECTED:
+        case ETHERNET_EVENT_CONNECTED: {
             s_link_up = true;
             ESP_LOGI(TAG, "link up");
+            // Ask for an IPv6 link-local address. esp_netif does NOT do this on
+            // its own for Ethernet -- without this call the interface stays
+            // IPv4-only, which is invisible until something actually needs v6.
+            //
+            // Non-fatal by design, like everything else in this file: a failure
+            // here costs IPv6 and nothing more. The address itself arrives
+            // asynchronously as IP_EVENT_GOT_IP6 once duplicate-address
+            // detection completes.
+            const esp_err_t e6 = esp_netif_create_ip6_linklocal(s_netif);
+            if (e6 != ESP_OK) {
+                ESP_LOGW(TAG, "create_ip6_linklocal failed: %s -- IPv4 only",
+                         esp_err_to_name(e6));
+            }
             break;
+        }
         case ETHERNET_EVENT_DISCONNECTED:
             s_link_up = false;
             s_has_ip  = false;
+            s_has_ip6 = false;
+            s_ip6_ll[0] = '\0';
+            s_ip6_gl[0] = '\0';
             ESP_LOGW(TAG, "link down");
             break;
         case ETHERNET_EVENT_STOP:
             s_link_up = false;
             s_has_ip  = false;
+            s_has_ip6 = false;
+            s_ip6_ll[0] = '\0';
+            s_ip6_gl[0] = '\0';
             break;
         default:
             break;
@@ -57,6 +84,46 @@ static void on_got_ip(void*, esp_event_base_t, int32_t, void* data) {
     s_has_ip = true;
     ESP_LOGI(TAG, "got IP " IPSTR " gw " IPSTR,
              IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw));
+}
+
+// One event per address, and a dual-stack interface legitimately has several:
+// link-local first, then any SLAAC-derived global or unique-local addresses.
+// They are kept separate because they are not interchangeable -- link-local
+// reaches the same L2 segment only, which is fine for a commissioner on the LAN
+// but useless to anything routed.
+static void on_got_ip6(void*, esp_event_base_t, int32_t, void* data) {
+    const auto* ev = static_cast<ip_event_got_ip6_t*>(data);
+
+    char buf[46];
+    snprintf(buf, sizeof(buf), IPV6STR, IPV62STR(ev->ip6_info.ip));
+
+    // esp_ip6_addr_t is const-incorrect in this API; the call only reads it.
+    auto* addr = const_cast<esp_ip6_addr_t*>(&ev->ip6_info.ip);
+    const esp_ip6_addr_type_t type = esp_netif_ip6_get_addr_type(addr);
+
+    const char* kind = "other";
+    switch (type) {
+        case ESP_IP6_ADDR_IS_LINK_LOCAL:
+            kind = "link-local";
+            snprintf(s_ip6_ll, sizeof(s_ip6_ll), "%s", buf);
+            break;
+        case ESP_IP6_ADDR_IS_GLOBAL:
+            kind = "global";
+            snprintf(s_ip6_gl, sizeof(s_ip6_gl), "%s", buf);
+            break;
+        case ESP_IP6_ADDR_IS_UNIQUE_LOCAL:
+            kind = "unique-local";
+            // Only take a ULA if no global address has been seen -- a global
+            // one is strictly more useful and must not be overwritten.
+            if (s_ip6_gl[0] == '\0') {
+                snprintf(s_ip6_gl, sizeof(s_ip6_gl), "%s", buf);
+            }
+            break;
+        default:
+            break;   // site-local / v4-mapped / unknown: report, do not store
+    }
+    s_has_ip6 = (s_ip6_ll[0] != '\0') || (s_ip6_gl[0] != '\0');
+    ESP_LOGI(TAG, "got IPv6 %s: %s", kind, buf);
 }
 
 void eth_start() {
@@ -104,6 +171,9 @@ void eth_start() {
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, esp_eth_new_netif_glue(s_handle)));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                                &on_eth_event, nullptr));
+    // IP_EVENT_GOT_IP6 is transport-generic -- there is no IP_EVENT_ETH_GOT_IP6.
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6,
+                                               &on_got_ip6, nullptr));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
                                                &on_got_ip, nullptr));
     ESP_ERROR_CHECK(esp_eth_start(s_handle));
@@ -150,4 +220,11 @@ void eth_get_status(NetStatus* out) {
             snprintf(out->gw,      sizeof(out->gw),      IPSTR, IP2STR(&ip.gw));
         }
     }
+
+    // Straight copies of what the event handlers recorded. Not re-read from
+    // esp_netif here: the handler already classified each address by type, and
+    // esp_netif_get_ip6_linklocal() would only return the one kind.
+    out->has_ip6 = s_has_ip6;
+    snprintf(out->ip6_link_local, sizeof(out->ip6_link_local), "%s", s_ip6_ll);
+    snprintf(out->ip6_global,     sizeof(out->ip6_global),     "%s", s_ip6_gl);
 }

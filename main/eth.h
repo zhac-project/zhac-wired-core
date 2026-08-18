@@ -20,6 +20,16 @@ struct NetStatus {
     char     mac[18];       // aa:bb:cc:dd:ee:ff
     uint32_t speed_mbps;    // 10 or 100, 0 when down
     bool     duplex_full;
+
+    // IPv6. Both empty until the link is up; `global` stays empty on networks
+    // with no router advertisements (most NAT test benches), which is normal
+    // and not an error -- link-local alone is enough for same-segment peers.
+    //
+    // 46 = INET6_ADDRSTRLEN: 39 chars for the address, plus room for a "%iface"
+    // scope suffix and the NUL.
+    bool     has_ip6;
+    char     ip6_link_local[46];
+    char     ip6_global[46];   // first global or unique-local address seen
 };
 void eth_get_status(NetStatus* out);
 

@@ -76,6 +76,9 @@ static esp_err_t handle_get_status(httpd_req_t* req) {
     doc["wifi_mode"]     = "eth";          // compat: there is no radio here
     doc["ip"]            = net.ip;
     doc["net_transport"] = "ethernet";
+    doc["ip6"]           = net.ip6_global[0] ? net.ip6_global : net.ip6_link_local;
+    doc["ip6_ll"]        = net.ip6_link_local;
+    doc["ip6_global"]    = net.ip6_global;
     doc["net_link_up"]   = net.link_up;
     doc["net_speed"]     = net.speed_mbps;
     doc["net_duplex"]    = net.duplex_full ? "full" : "half";
@@ -109,8 +112,19 @@ static esp_err_t handle_get_status(httpd_req_t* req) {
     doc["remote_available"] = false;
 #endif
 
-    char buf[1024];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
+    // 2048, not 1024: this doc carries the full sys_diag set (cpu, heap, psram,
+    // stack, net) plus this SKU's own legacy keys, and adding four IPv6 fields
+    // pushed it past 1024. serializeJson TRUNCATES rather than failing, so the
+    // overflow shipped a 200 with a JSON document cut off mid-key -- every
+    // client just sees a parse error. Same trap as ws_push (fixed there too).
+    char buf[2048];
+    const size_t n = serializeJson(doc, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) {
+        ESP_LOGE(TAG, "/api/status overflow: %u B needed, %u B buffer",
+                 (unsigned)measureJson(doc), (unsigned)sizeof(buf));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status too large");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, n);
 }

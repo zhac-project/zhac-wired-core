@@ -316,10 +316,12 @@ extern "C" void app_main() {
         eth_get_status(&net);
         ESP_LOGI(TAG,
                  "alive (tick=%d, uptime=%" PRId64 " s) net: link=%d ip=%s "
-                 "speed=%" PRIu32 " duplex=%s",
+                 "ip6=%s speed=%" PRIu32 " duplex=%s",
                  ++tick, esp_timer_get_time() / 1000000,
                  (int)net.link_up,
                  net.ip[0] ? net.ip : "-",
+                 net.ip6_global[0] ? net.ip6_global
+                                   : (net.ip6_link_local[0] ? net.ip6_link_local : "-"),
                  net.speed_mbps,
                  net.duplex_full ? "full" : "half");
         // Live diagnostics for the Info page. Without this the SPA only

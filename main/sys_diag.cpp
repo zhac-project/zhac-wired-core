@@ -120,6 +120,14 @@ void sys_diag_fill(JsonObject d, SysDiagCpuSlot slot) {
     d["ip"]  = net.ip;
     d["mac"] = net.mac;
 
+    // IPv6. Reported even when empty so a consumer can tell "no address" from
+    // "field absent" -- the distinction matters while bringing v6 up, and a
+    // Matter bridge would be dead in the water without a v6 address.
+    d["ip6"]        = net.ip6_global[0] ? net.ip6_global : net.ip6_link_local;
+    d["ip6_ll"]     = net.ip6_link_local;
+    d["ip6_global"] = net.ip6_global;
+    d["has_ip6"]    = net.has_ip6;
+
     // The SPA labels this row "WiFi" because it was written for the S3
     // gateway. This SKU has no WiFi at all -- its uplink is Ethernet. Reporting
     // false would paint a red "Disconnected" badge on a perfectly healthy wired

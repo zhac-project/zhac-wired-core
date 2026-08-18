@@ -27,8 +27,19 @@
 static const char* TAG = "api_net";
 
 static esp_err_t send_json(httpd_req_t* req, const JsonDocument& doc) {
-    char buf[512];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
+    // Guarded because serializeJson TRUNCATES on overflow rather than failing:
+    // an oversized doc would ship a 200 carrying JSON cut off mid-key, which
+    // every client reports as a parse error with nothing pointing back here.
+    // Cheaper to 500 loudly. (/api/status hit exactly this when IPv6 fields
+    // were added.)
+    char buf[768];
+    const size_t n = serializeJson(doc, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) {
+        ESP_LOGE(TAG, "response overflow: %u B needed, %u B buffer",
+                 (unsigned)measureJson(doc), (unsigned)sizeof(buf));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "response too large");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, n);
 }
