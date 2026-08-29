@@ -13,6 +13,27 @@ contents become the release-tag annotation at `just release`.
 
 Initial firmware. Nothing hardware-verified yet.
 
+### Changed
+
+- **Device library brought current with zigbee-herdsman-converters v26.101.0.**
+  `embedded-zhc` is resolved by sibling path (`EMBEDDED_ZHC_PATH`), not pinned, so this
+  is a rebuild rather than a code change here — but it is worth recording what the
+  firmware now carries, because two of the changes alter decode behaviour for devices
+  this board already talks to:
+  - **A Tuya on/off datapoint wire-typed as ENUM now decodes.** The datapoint decoder
+    previously required the raw value to be exactly `Bool` and silently dropped anything
+    else; Tuya firmwares ship the same logical datapoint as BOOL on one batch and ENUM on
+    another. Nine definitions covering TRV601 / TRV602 / TS0601_thermostat_1 were affected.
+  - **`action_duration` is no longer suffixed by endpoint** on multi-endpoint devices, so
+    it arrives under the name the definition and z2m both use.
+  - Two Mazda TRV definitions were reading one element past the end of their datapoint
+    table on every lookup miss.
+  - 42 new device definitions across the v26.99.0 and v26.101.0 windows; the library is
+    now 5847 definitions over 387 vendors.
+
+  Both targets rebuilt clean against it — `esp32s31` (IDF v6.1-beta1) at 0x37e1c0 bytes,
+  42% of the app partition free, and `esp32p4` (IDF v6.0). Not yet re-run on hardware.
+
 ### Added
 
 - **Repo skeleton targeting `esp32p4`** — 16 MB flash, single `factory` app slot, no
