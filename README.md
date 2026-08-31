@@ -71,6 +71,37 @@ only setting that works for ZHAC hardware.
 > *flash* time, long after a green build. `tools/check_resolved_config.sh` exists to catch
 > exactly this, by asserting what came out rather than what went in.
 
+### Building for `esp32s31`
+
+ESP-IDF **v6.1-beta1** is required — no earlier release has the `esp32s31`
+target. Its own `export.sh` does not work in this install (it looks for a
+virtualenv the toolchain installer never created), so source the helper
+instead:
+
+```sh
+. tools/s31-env.sh          # must be SOURCED, not executed
+idf.py -B build.s31 build
+idf.py -B build.s31 -p /dev/ttyACM0 flash monitor
+```
+
+The helper resolves the v6.1 venv, puts ninja / cmake / the RISC-V toolchain on
+PATH, skips the missing constraints file, and sets `ESP_IDF_VERSION` (the
+component manager crashes on `None` without it). Use it for every S31 build:
+mixing it with a manually-invoked `python3 .../idf.py` leaves the build
+directory recording a different interpreter and IDF then refuses to build until
+`fullclean`.
+
+The **P4** target is unaffected and still builds under v6.0, whose `export.sh`
+is fine:
+
+```sh
+. ~/.espressif/v6.0/esp-idf/export.sh
+idf.py -B build build
+```
+
+`embedded-zhc` is resolved by sibling path (`EMBEDDED_ZHC_PATH`), not pinned, so
+the firmware always picks up whatever is checked out in `../embedded-zhc`.
+
 ## Build
 
 ```sh
