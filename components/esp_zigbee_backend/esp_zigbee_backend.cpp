@@ -35,6 +35,7 @@
 #include "esp_system.h"   // esp_restart
 #include "esp_timer.h"
 #include "event_bus.h"
+#include "esp_zb_lock.h"
 #include "esp_zigbee.h"
 #include "ezbee/aps.h"
 #include "ezbee/app_signals.h"
@@ -198,6 +199,8 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     req.asdu_length  = static_cast<uint16_t>(zcl_len);
     req.asdu         = const_cast<uint8_t*>(zcl_data);
 
+    zb_lock::Guard g;
+    if (!g) return false;
     const ezb_err_t err = ezb_apsde_data_request(&req);
     if (err != 0) {
         ESP_LOGW(TAG, "apsde_data_request to 0x%04x cluster 0x%04x failed (%d)",
@@ -298,6 +301,9 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
 // esp_zigbee_launch_mainloop() does not return; it needs its own task.
 static void task_zigbee(void*) {
     const int64_t started_us = esp_timer_get_time();
+    // Callbacks run on this task with the SDK lock held by the mainloop;
+    // zb_lock::Guard is a no-op here (see esp_zb_lock.h).
+    zb_lock::set_stack_task(xTaskGetCurrentTaskHandle());
     ESP_LOGI(TAG, "stack mainloop starting");
 
     // Does not return in normal operation.
@@ -445,8 +451,12 @@ static bool zb_init() {
     }
     if (!zb_network_ready()) {
         ESP_LOGW(TAG, "no PAN after autostart -- forming explicitly");
-        const ezb_err_t fe =
-            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
+        int fe = -1;
+        {
+            zb_lock::Guard g;
+            if (g) fe = static_cast<int>(
+                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION));
+        }
         if (fe != 0) {
             ESP_LOGE(TAG, "formation start failed (%d)", (int)fe);
         } else {
@@ -464,8 +474,12 @@ static bool zb_init() {
         //
         // BDB INITIALIZATION is the spec's answer for "device restarted with
         // network parameters already in NVRAM"; it also raises DEVICE_REBOOT.
-        const ezb_err_t ie =
-            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
+        int ie = -1;
+        {
+            zb_lock::Guard g;
+            if (g) ie = static_cast<int>(
+                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION));
+        }
         if (ie != 0) {
             ESP_LOGW(TAG, "bdb initialization failed (%d) -- permit_join may "
                           "refuse until the next reboot", (int)ie);
@@ -484,19 +498,25 @@ static bool zb_init() {
     zigbee_identity_init();
     zigbee_configure_init();
 
-    if (zb_network_ready()) {
-        s_formed = true;
-        ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
-                 (unsigned)ezb_nwk_get_panid(),
-                 (unsigned)ezb_nwk_get_current_channel(),
-                 CONFIG_ZHAC_ZB_MAX_CHILDREN);
-    } else {
-        // Honest: the backend is registered and the stack runs, but joins are
-        // impossible until a PAN exists. permit_join will say so too.
-        ESP_LOGE(TAG, "coordinator has NO network (pan 0x%04x bdb %u) -- "
-                      "joins will be refused",
-                 (unsigned)ezb_nwk_get_panid(),
-                 (unsigned)ezb_bdb_get_commissioning_status());
+    {
+        // Main task, mainloop already running: the getters need the SDK lock.
+        zb_lock::Guard g;
+        if (!g) {
+            ESP_LOGW(TAG, "coordinator state unknown at init: SDK lock timeout");
+        } else if (zb_network_ready()) {
+            s_formed = true;
+            ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
+                     (unsigned)ezb_nwk_get_panid(),
+                     (unsigned)ezb_nwk_get_current_channel(),
+                     CONFIG_ZHAC_ZB_MAX_CHILDREN);
+        } else {
+            // Honest: the backend is registered and the stack runs, but joins
+            // are impossible until a PAN exists. permit_join will say so too.
+            ESP_LOGE(TAG, "coordinator has NO network (pan 0x%04x bdb %u) -- "
+                          "joins will be refused",
+                     (unsigned)ezb_nwk_get_panid(),
+                     (unsigned)ezb_bdb_get_commissioning_status());
+        }
     }
     return true;
 }
@@ -516,6 +536,8 @@ static bool zb_is_running() { return s_running; }
 // stack holds before commissioning.
 static bool zb_network_ready() {
     if (s_formed) return true;
+    zb_lock::Guard g;
+    if (!g) return false;
     const ezb_panid_t pan = ezb_nwk_get_panid();
     return pan != 0x0000 && pan != 0xffff;
 }
@@ -525,6 +547,8 @@ static bool zb_start_discovery(uint8_t duration_s) {
         ESP_LOGW(TAG, "permit_join refused: stack not running");
         return false;
     }
+    zb_lock::Guard g;
+    if (!g) return false;
     if (!zb_network_ready()) {
         // Distinguishes "still forming" from a genuine stack error. Without
         // this the REST layer's flat 500 was the only symptom.
@@ -544,7 +568,9 @@ static bool zb_start_discovery(uint8_t duration_s) {
 }
 
 static bool zb_stop_discovery() {
-    if (!s_running || !zb_network_ready()) return false;
+    if (!s_running) return false;
+    zb_lock::Guard g;
+    if (!g || !zb_network_ready()) return false;
     const ezb_err_t e = ezb_bdb_close_network();
     if (e != 0) {
         ESP_LOGW(TAG, "close_network failed (%d)", (int)e);
@@ -569,7 +595,8 @@ static bool zb_backend_remove_device(uint64_t ieee) {
             req.field.device_addr.u64 = ieee;
             req.field.remove_children = false;   // reassign, do not orphan-purge
             req.field.rejoin          = false;
-            const ezb_err_t e = ezb_zdo_nwk_mgmt_leave_req(&req);
+            zb_lock::Guard g;
+            const int e = g ? static_cast<int>(ezb_zdo_nwk_mgmt_leave_req(&req)) : -1;
             if (e != 0) {
                 ESP_LOGW(TAG, "leave req for %016llx failed (%d) -- removing "
                               "locally anyway", (unsigned long long)ieee, (int)e);
