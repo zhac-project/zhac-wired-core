@@ -37,6 +37,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "esp_zb_interview.h"   // esp_zb_af_send
+#include "esp_zb_lock.h"
 #include "esp_zb_zcl_frame.h"
 
 #include "esp_log.h"
@@ -98,7 +99,14 @@ bool do_bind(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
 
     xSemaphoreTake(s_bind_sem, 0);       // drain a stale post
     s_bind_ok = false;
-    const ezb_err_t e = unbind ? ezb_zdo_unbind_req(&req) : ezb_zdo_bind_req(&req);
+    int e = -1;
+    {
+        // Lock only around the request: the bind result arrives via a
+        // callback on the stack task, which needs the lock to run.
+        zb_lock::Guard g;
+        if (g) e = static_cast<int>(unbind ? ezb_zdo_unbind_req(&req)
+                                           : ezb_zdo_bind_req(&req));
+    }
     if (e != 0) {
         ESP_LOGW(TAG, "%s req failed to send (%d)", unbind ? "unbind" : "bind",
                  (int)e);

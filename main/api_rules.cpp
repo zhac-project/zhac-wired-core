@@ -13,6 +13,7 @@
 // On parse error, the response includes the dsl_parser-formatted
 // message in `err` so the SPA can show what the user mistyped.
 #include "api_rules.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "ArduinoJson.h"
@@ -40,10 +41,21 @@ static bool uri_ends_with(const char* uri, const char* suffix) {
 
 // ── GET /api/rules — chunked list ───────────────────────────────────────
 static esp_err_t handle_get_rules(httpd_req_t* req) {
+    // 256 slots x 536 B = 137 KB. Until review 2026-09 (WC-02) this was a
+    // local array on the 12 KB httpd worker stack: the frame overflowed on
+    // entry, on an unauthenticated route, in both wired-core and mono-core.
+    // Same allocation as cmd_rule_list in ws_bridge.cpp: PSRAM first, the
+    // internal heap only as a fallback, and nothing on the stack.
+    auto* slots = static_cast<RuleSlot*>(
+        heap_caps_malloc(sizeof(RuleSlot) * ZAP_MAX_RULES, MALLOC_CAP_SPIRAM));
+    if (!slots) slots = static_cast<RuleSlot*>(malloc(sizeof(RuleSlot) * ZAP_MAX_RULES));
+    if (!slots) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr_chunk(req, "[");
 
-    RuleSlot slots[ZAP_MAX_RULES];
     uint16_t cnt = rule_store_load_all(slots, ZAP_MAX_RULES);
     for (uint16_t i = 0; i < cnt; i++) {
         const RuleSlot& s = slots[i];
@@ -67,6 +79,7 @@ static esp_err_t handle_get_rules(httpd_req_t* req) {
     }
     httpd_resp_sendstr_chunk(req, "]");
     httpd_resp_sendstr_chunk(req, nullptr);
+    free(slots);
     return ESP_OK;
 }
 

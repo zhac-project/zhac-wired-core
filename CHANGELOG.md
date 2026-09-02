@@ -11,6 +11,29 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`GET /api/rules` overflowed the HTTP worker stack by 11×.** `handle_get_rules`
+  kept `RuleSlot slots[ZAP_MAX_RULES]` — 256 × 536 B = 137 KB — as a local on
+  the 12 KB httpd worker, on the unauthenticated REST surface; the frame
+  overflowed on entry. The slots now come from PSRAM (internal heap as the
+  fallback), the same allocation `cmd_rule_list` in `ws_bridge.cpp` already used.
+  Same fix in zhac-mono-core, which carries the identical copy. (Review 2026-09,
+  WC-02.)
+- **The esp-zigbee SDK lock was never taken.** The lib makes
+  `esp_zigbee_lock_acquire()` mandatory around every SDK call made outside a
+  stack callback; this backend had zero call sites while issuing APS sends, ZDO
+  requests, bind/unbind, permit-join and formation from httpd, the interview
+  task, the configure worker, the event-bus task and the main task against the
+  running mainloop. New `esp_zb_lock.h` wraps the lock in an RAII guard that is
+  a no-op on the stack task (callbacks already hold it), re-entrant per task,
+  and bounded (2 s — a wedged stack surfaces as a failed request, not a wedged
+  httpd worker). Applied at the APS send funnel (`esp_zb_af_send`), the three
+  ZDO interview requests, bind/unbind, Mgmt_Leave, open/close network, the PAN
+  probe and the explicit formation/initialisation kicks. Locks are released
+  before every wait on a step/bind semaphore, since the callbacks that post
+  them need the lock to run. (Review 2026-09, WC-01.)
+
 Initial firmware. Nothing hardware-verified yet.
 
 ### Changed

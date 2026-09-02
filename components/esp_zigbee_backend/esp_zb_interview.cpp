@@ -37,6 +37,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "esp_zb_interview.h"
+#include "esp_zb_lock.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -182,7 +183,12 @@ bool req_node_desc(uint16_t nwk) {
     req.dst_nwk_addr = nwk;
     req.field.nwk_addr_of_interest = nwk;
     req.cb = on_node_desc;
-    if (ezb_zdo_node_desc_req(&req) != 0) return false;
+    {
+        // Lock only around the request; the result is posted by a callback on
+        // the stack task, which needs the lock back before step_wait can end.
+        zb_lock::Guard g;
+        if (!g || ezb_zdo_node_desc_req(&req) != 0) return false;
+    }
     return step_wait(kZdoTimeoutMs);
 }
 
@@ -192,7 +198,12 @@ bool req_active_ep(uint16_t nwk) {
     req.dst_nwk_addr = nwk;
     req.field.nwk_addr_of_interest = nwk;
     req.cb = on_active_ep;
-    if (ezb_zdo_active_ep_req(&req) != 0) return false;
+    {
+        // Lock only around the request; the result is posted by a callback on
+        // the stack task, which needs the lock back before step_wait can end.
+        zb_lock::Guard g;
+        if (!g || ezb_zdo_active_ep_req(&req) != 0) return false;
+    }
     return step_wait(kZdoTimeoutMs);
 }
 
@@ -203,7 +214,12 @@ bool req_simple_desc(uint16_t nwk, uint8_t ep) {
     req.field.nwk_addr_of_interest = nwk;
     req.field.endpoint = ep;
     req.cb = on_simple_desc;
-    if (ezb_zdo_simple_desc_req(&req) != 0) return false;
+    {
+        // Lock only around the request; the result is posted by a callback on
+        // the stack task, which needs the lock back before step_wait can end.
+        zb_lock::Guard g;
+        if (!g || ezb_zdo_simple_desc_req(&req) != 0) return false;
+    }
     return step_wait(kZdoTimeoutMs);
 }
 
