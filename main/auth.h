@@ -16,6 +16,7 @@
 
 void   auth_init();                              // after nvs_flash_init
 bool   auth_enabled();
+bool   auth_storage_error();                    // true when zhac_auth could not be opened: sign-in forced on, no password set-up
 void   auth_set_enabled(bool en);                // persists; applies to REST + WS
 bool   auth_password_is_set();
 uint32_t auth_setup_secs_left();               // >0 only while setup is open (no password, hub booted < 10 min ago)

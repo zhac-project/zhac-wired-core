@@ -314,6 +314,7 @@ extern "C" void app_main() {
                     nullptr, 2, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "TaskEventBus create FAILED -- event subscribers inert");
     } else {
+        sys_set_event_task_ok(true);   // the post-update health check asks for this
         ESP_LOGI(TAG, "TaskEventBus up -- event subscribers now serviced");
     }
 

@@ -29,6 +29,7 @@ namespace {
 
 char s_token[33] = {};
 bool s_enabled = false;
+bool s_storage_error = false;   // zhac_auth namespace could not be opened at boot
 
 // ── Per-peer lockout (net-core CC-F8): 5 failures in 60 s blocks that peer ──
 constexpr uint8_t  kFailLimit   = 5;
@@ -234,6 +235,7 @@ esp_err_t handle_login(httpd_req_t* req) {
 // kZapSetupWindowS ago (zap_setup_window.h): the first visitor to a fresh hub
 // claims it, but only someone who can power-cycle the hub can reopen that.
 esp_err_t handle_setup(httpd_req_t* req) {
+    if (s_storage_error) return reply(req, "503 Service Unavailable", "{\"error\":\"storage_error\"}");
     if (s_pw_set) return reply(req, "403 Forbidden", "{\"error\":\"already_set\"}");
     if (zap_setup_secs_left() == 0) return reply(req, "403 Forbidden", "{\"error\":\"setup_closed\"}");
     JsonDocument doc;
@@ -270,7 +272,21 @@ void auth_init() {
     if (psa_crypto_init() != PSA_SUCCESS) ESP_LOGE(TAG, "psa_crypto_init failed -- password login unavailable");
     nvs_handle_t h;
     if (nvs_open("zhac_auth", NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open(zhac_auth) failed -- auth off");
+        // Storage fault. Fail CLOSED: sign-in stays on with a token that lives
+        // only in RAM and is printed on the serial console -- the one recovery
+        // path -- and no password can be set until storage works again. The
+        // old behaviour (auth off) turned a broken flash into an open hub.
+        s_storage_error = true;
+        s_enabled = true;
+        s_pw_set = false;
+        new_token(s_token);
+        ws_server_set_api_token(s_token);
+        ESP_LOGE(TAG, "nvs_open(zhac_auth) failed -- STORAGE ERROR: sign-in forced on, "
+                      "password set-up refused until storage is reset");
+        printf("\n*** ZHAC auth storage unreadable -- serial-only token for this boot: %s ***\n"
+               "    Sign in with it (Login -> \"Use API token\"), then reset storage from Settings.\n\n",
+               s_token);
+        fflush(stdout);
         return;
     }
 #if CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED
@@ -310,6 +326,7 @@ void auth_init() {
 uint32_t auth_setup_secs_left() { return (s_enabled && !s_pw_set) ? zap_setup_secs_left() : 0; }
 
 bool auth_enabled() { return s_enabled; }
+bool auth_storage_error() { return s_storage_error; }
 bool auth_password_is_set() { return s_pw_set; }
 
 void auth_set_enabled(bool en) {

@@ -7,6 +7,18 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 All notable changes to `zhac-wired-core` are recorded here. Format follows the convention
 used across the other ZHAC repos: an `## [Unreleased]` section accumulates work, and its
+
+### Fixed
+
+- **Architecture review (2026-09-20) quick fixes.** Release manifest pins the pushed
+  `feat/diy-readiness` commits (the old pins lacked `ha_bridge`, so a tagged build could not
+  configure). Sign-in fails CLOSED when its storage cannot be opened: token in RAM, printed on
+  the serial console, password set-up refused (`503 storage_error`, status
+  `auth_storage_error`) — it used to boot with sign-in off. `GET /api/devices` copies the pool
+  under its lock and sends from the copy; the REST attribute setter releases the lock before
+  the radio dispatch. The REST device list carries decimals (`VAL_FLOAT` ÷ 100). The
+  post-update health check also requires the event dispatcher task and readable sign-in
+  storage.
 contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]

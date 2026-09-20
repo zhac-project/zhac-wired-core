@@ -154,6 +154,10 @@ ten minutes after power-on. After that the web UI says so and asks for a power c
 that was never set up cannot be claimed by whoever finds it on the network a month later.
 Status reports the seconds left as `auth_setup_secs_left`.
 
+If the sign-in storage cannot be opened at boot, the hub locks itself instead of opening up:
+sign-in stays on with a token that exists only for that boot and is printed on the serial
+console; set-up is refused until storage is reset.
+
 Lost the password? The serial console prints the token at every boot; sign in with it
 (**Login → Use API token instead**), then set a new password in Settings. Settings → *Auth*
 turns sign-in off for a lab bench — then anyone on the LAN can run Lua, update the firmware
@@ -223,8 +227,9 @@ The web UI's **OTA** page lists the published releases that fit the hub (read fr
 the browser, matched on chip and silicon family) and installs the chosen one; a URL field for
 an image that is not a release stays under *Advanced*.
 The hub downloads it over HTTPS into the idle app slot and reboots into it. The new firmware
-is then on trial: the hub keeps it only once its storage answers, its web server is up and,
-if the Zigbee radio worked before the update, the radio works again -- an unplugged Ethernet
+is then on trial: the hub keeps it only once its storage answers, its web server and event
+dispatcher are up, its sign-in storage opened and, if the Zigbee radio worked before the
+update, the radio works again -- an unplugged Ethernet
 cable is deliberately not a reason to go back. Unmet after ten minutes, or a crash before
 that, and the bootloader boots the previous version; status then reports why as
 `ota_rollback_reason` and the OTA page shows it. Status reports `ota_state` (`pending` during

@@ -19,6 +19,10 @@ void sys_state_init();
 bool sys_metrics_enabled();
 bool sys_ap_disabled();
 bool sys_auth_enabled();
+// Set by main once TaskEventBus runs; false means rules, MQTT and the web UI
+// see no device events. Read by the post-update health check.
+void sys_set_event_task_ok(bool ok);
+bool sys_event_task_ok();
 
 void sys_set_metrics_enabled(bool en);   // persists sys_cfg/metrics_en
 void sys_set_ap_disabled(bool dis);      // persists sys_cfg/ap_disabled

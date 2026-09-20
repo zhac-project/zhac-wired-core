@@ -120,6 +120,7 @@ void api_status_fill(JsonObject doc) {
     // that no password exists yet -- the same fact /api/auth/setup makes true.
     doc["auth_setup_required"] = sys_auth_enabled() && !auth_password_is_set();
     doc["auth_setup_secs_left"] = auth_setup_secs_left();   // 0 = closed; power-cycle the hub to reopen
+    if (auth_storage_error()) doc["auth_storage_error"] = true;   // sign-in forced on, serial token only
     // Schedules (cron rules, Lua on_cron) wait until SNTP has set the clock;
     // the web UI's Rules page says so while this is false.
     doc["clock_set"] = esp_zigbee_backend_wall_clock_s() != 0;

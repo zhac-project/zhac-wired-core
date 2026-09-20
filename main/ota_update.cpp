@@ -20,7 +20,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "auth.h"
 #include "radio_state.h"
+#include "sys_state.h"
 #include "rule_store.h"
 #include "ws_bridge.h"
 #include "ws_server.h"
@@ -38,6 +40,8 @@ char              s_url[256];
 // merely because it stayed up for a minute:
 //   * storage readable   -- NVS answers (devices, rules, names live there)
 //   * web UI reachable   -- the HTTP server that serves it is up
+//   * events flowing     -- TaskEventBus started (rules, MQTT, UI depend on it)
+//   * sign-in storage    -- the auth namespace opened (else the hub is locked)
 //   * radio no worse     -- if the radio worked before the update, it works now
 // Ethernet is deliberately NOT a criterion: an unplugged cable or a router
 // reboot must never roll a good firmware back. Unmet after kHealthDeadlineS,
@@ -75,6 +79,8 @@ const char* health_problem() {
     nvs_stats_t st{};
     if (nvs_get_stats(nullptr, &st) != ESP_OK) return "storage (NVS) not readable";
     if (!ws_server_get_handle()) return "web server not running";
+    if (!sys_event_task_ok()) return "event dispatcher not running (rules and web UI would see no device events)";
+    if (auth_storage_error()) return "sign-in storage not readable";
     uint8_t radio_was_ok = 0;
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READONLY, &h) == ESP_OK) {
