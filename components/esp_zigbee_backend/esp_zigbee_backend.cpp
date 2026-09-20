@@ -639,22 +639,29 @@ static bool zb_stop_discovery() {
 // the overwhelmingly common reason to remove a device is that it is already
 // dead or out of range, and a UI delete that fails because the device cannot
 // be reached is useless. z2m behaves the same way.
+// ZDO Mgmt_Leave, same signature the sibling zigbee_mgr declares. device_cmd
+// calls it for a soft remove (leave, keep the row); the backend's own
+// remove_device below is the hard path (leave, then forget everything).
+bool zigbee_leave_req(uint16_t nwk_addr, uint64_t ieee) {
+    if (!s_running || !zb_network_ready() || !nwk_addr) return false;
+    ezb_zdo_nwk_mgmt_leave_req_t req{};
+    req.dst_nwk_addr = nwk_addr;
+    req.field.device_addr.u64 = ieee;
+    req.field.remove_children = false;   // reassign, do not orphan-purge
+    req.field.rejoin          = false;
+    zb_lock::Guard g;
+    const int e = g ? static_cast<int>(ezb_zdo_nwk_mgmt_leave_req(&req)) : -1;
+    if (e != 0) {
+        ESP_LOGW(TAG, "leave req for %016llx failed (%d)", (unsigned long long)ieee, (int)e);
+        return false;
+    }
+    return true;
+}
+
 static bool zb_backend_remove_device(uint64_t ieee) {
-    if (s_running && zb_network_ready()) {
-        ZapDevice snap{};
-        if (zigbee_pool_snapshot(ieee, &snap) && snap.nwk_addr) {
-            ezb_zdo_nwk_mgmt_leave_req_t req{};
-            req.dst_nwk_addr = snap.nwk_addr;
-            req.field.device_addr.u64 = ieee;
-            req.field.remove_children = false;   // reassign, do not orphan-purge
-            req.field.rejoin          = false;
-            zb_lock::Guard g;
-            const int e = g ? static_cast<int>(ezb_zdo_nwk_mgmt_leave_req(&req)) : -1;
-            if (e != 0) {
-                ESP_LOGW(TAG, "leave req for %016llx failed (%d) -- removing "
-                              "locally anyway", (unsigned long long)ieee, (int)e);
-            }
-        }
+    ZapDevice snap{};
+    if (zigbee_pool_snapshot(ieee, &snap)) {
+        zigbee_leave_req(snap.nwk_addr, ieee);   // best effort; removed locally either way
     }
     return zb_interview_forget(ieee);
 }

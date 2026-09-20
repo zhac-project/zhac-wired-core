@@ -33,12 +33,3 @@ bool radio_ok();
 // still open, and for how long?". The SPA polls exactly that to drive its
 // countdown badge.
 //
-// Both the REST handler and the WS verb go through here so a join opened from
-// one is visible to the other. Two independent deadline copies would drift the
-// moment anyone used both.
-//
-// `duration_s` is 0-254 per the Zigbee spec; 0 closes the window.
-bool radio_permit_join(uint8_t duration_s);
-
-// Remaining seconds, saturating at 0. `open_out` is false once it lapses.
-void radio_permit_join_status(bool* open_out, int* remaining_s_out);

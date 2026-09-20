@@ -67,6 +67,8 @@
 #include "net_discovery.h"
 #include "remote_client.h"
 #include "simple_rules.h"
+#include "device_cmd.h"
+#include "ha_bridge.h"
 #include "spa_serve.h"
 #include "sys_state.h"
 #include "ntp_cfg.h"
@@ -233,6 +235,12 @@ extern "C" void app_main() {
     // loading is deferred to the end of app_main so a script touching the
     // network or HTTP stack at top level cannot race it.
     simple_rules_init();
+    // What follows a device rename, in one place: rules re-resolve names and
+    // Home Assistant sees the new one (device_cmd cannot call either itself).
+    device_cmd_set_changed_hook([](uint64_t ieee) {
+        simple_rules_reload();
+        ha_bridge_device_changed(ieee);
+    });
     const bool lua_ok = lua_engine_init();
     if (!lua_ok) {
         ESP_LOGW(TAG, "lua_engine_init returned false -- scripts disabled");

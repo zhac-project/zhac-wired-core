@@ -10,6 +10,14 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Changed
 
+- **Device rename, delete and permit join go through `device_cmd`** (zhac-components). Rename
+  now reloads the rule engine's name table (before, a renamed device silently stopped matching
+  its rules until reboot) and still tells Home Assistant. Delete has one contract: soft asks
+  the device to leave and hides it (name kept for a rejoin); `hard` also wipes the pool slot,
+  shadow, converter caches and stored row. Before, soft only dropped the pool entry, so the
+  device stayed joined and came back. The join-window deadline moved out of `radio_state`
+  into the shared service; `zigbee_leave_req` is now a real backend entry point.
+
 - **Every attribute write goes through `device_cmd`** (zhac-components): REST, WebSocket,
   MQTT / Home Assistant commands and collection fan-out now share one implementation, so they
   accept the same value types, answer with the same words, and all mirror the command into the

@@ -26,7 +26,7 @@
 // implementations, and the call sites above need no change.
 #include "sdkconfig.h"
 
-// Compiled away when the real backend is present -- it defines the same six
+// Compiled away when the real backend is present -- it defines the same
 // symbols, so linking both would be a duplicate-symbol error. Gated HERE and
 // not in CMake because CONFIG_* is undefined during IDF early expansion.
 #if !CONFIG_ZHAC_ESP_ZIGBEE
@@ -44,6 +44,7 @@ static inline bool no_radio(const char* op) {
 }
 
 bool zigbee_permit_join(uint8_t /*duration_s*/) { return no_radio("permit_join"); }
+bool zigbee_leave_req(uint16_t /*nwk_addr*/, uint64_t /*ieee*/) { return no_radio("leave_req"); }
 
 bool zigbee_zdo_bind(uint16_t /*src_nwk*/, uint64_t /*src_ieee*/, uint8_t /*src_ep*/,
                      uint16_t /*cluster*/, uint64_t /*dst_ieee*/, uint8_t /*dst_ep*/) {
