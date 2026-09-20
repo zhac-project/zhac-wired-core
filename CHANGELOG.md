@@ -10,6 +10,11 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Changed
 
+- **Rule pushes come from the rule engine, not the transport.** `rule.added` / `rule.updated`
+  / `rule.deleted` are built from the `RULE_CHANGED` event, so a rule created, edited, toggled
+  or deleted over REST or by a backup restore now updates open Rules pages and the cloud relay;
+  before, only WebSocket edits did.
+
 - **Device rename, delete and permit join go through `device_cmd`** (zhac-components). Rename
   now reloads the rule engine's name table (before, a renamed device silently stopped matching
   its rules until reboot) and still tells Home Assistant. Delete has one contract: soft asks

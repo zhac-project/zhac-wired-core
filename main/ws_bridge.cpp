@@ -68,6 +68,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <new>
 #include <sys/time.h>
 #include <cinttypes>
 
@@ -915,9 +916,7 @@ static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
     uint16_t nid = 0;
     if (!simple_rules_add(name, dsl, &nid)) { send_err(fd, id, dsl_last_error()); return; }
-    reply_ok_or_err(fd, id, true, nullptr);
-    JsonDocument p; p["id"] = nid; p["name"] = name; p["dsl"] = dsl; p["enabled"] = true;
-    ws_push("rule.added", p);
+    reply_ok_or_err(fd, id, true, nullptr);   // the "rule.added" push comes from RULE_CHANGED
 }
 static void cmd_rule_update(int fd, uint32_t id, JsonDocument& doc) {
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
@@ -926,8 +925,6 @@ static void cmd_rule_update(int fd, uint32_t id, JsonDocument& doc) {
     if (!rid || !dsl) { send_err(fd, id, "missing id/dsl"); return; }
     if (!simple_rules_update(rid, name, dsl)) { send_err(fd, id, dsl_last_error()); return; }
     reply_ok_or_err(fd, id, true, nullptr);
-    JsonDocument p; p["id"] = rid; p["name"] = name; p["dsl"] = dsl;
-    ws_push("rule.updated", p);
 }
 static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
@@ -935,14 +932,12 @@ static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
     if (!rid) { send_err(fd, id, "missing id"); return; }
     bool ok = simple_rules_enable(rid, en);
     reply_ok_or_err(fd, id, ok, "rule not found");
-    if (ok) { JsonDocument p; p["id"] = rid; p["enabled"] = en; ws_push("rule.updated", p); }
 }
 static void cmd_rule_delete(int fd, uint32_t id, JsonDocument& doc) {
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     if (!rid) { send_err(fd, id, "missing id"); return; }
     bool ok = simple_rules_delete(rid);
     reply_ok_or_err(fd, id, ok, "rule not found");
-    if (ok) { JsonDocument p; p["id"] = rid; ws_push("rule.deleted", p); }
 }
 
 // ── script.* (SPA drives scripts over WS; write stays REST) ────────────
@@ -1216,6 +1211,27 @@ static void on_device_leave(const Event& e) {
     remote_client_publish_event("device.removed", buf, (size_t)n);
 }
 
+// Rules changed by any door (WebSocket, REST, a backup restore) -> one push,
+// built here from the store so REST edits reach open tabs and the relay too.
+static void on_rule_changed(const Event& e) {
+    if (ws_server_client_count() == 0) return;
+    RuleChangedEvent c{};
+    std::memcpy(&c, e.data, sizeof(c));
+    JsonDocument p;
+    p["id"] = c.rule_id;
+    if (c.change == RULE_CHANGE_DELETED) { ws_push("rule.deleted", p); return; }
+    auto* s = new (std::nothrow) RuleSlot{};
+    if (!s) return;
+    if (rule_store_load(c.rule_id, s)) {
+        char dsl[501];
+        const size_t dn = s->src_len < 500 ? s->src_len : 500;
+        std::memcpy(dsl, s->src, dn); dsl[dn] = '\0';
+        p["name"] = s->name; p["dsl"] = dsl; p["enabled"] = (bool)s->enabled;
+        ws_push(c.change == RULE_CHANGE_ADDED ? "rule.added" : "rule.updated", p);
+    }
+    delete s;
+}
+
 void ws_bridge_install() {
     ws_server_set_rx_callback(ws_rx);
     event_bus_subscribe(EventType::ZCL_ATTR,    on_zcl_attr);
@@ -1225,6 +1241,7 @@ void ws_bridge_install() {
     event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, on_zcl_attr);
     event_bus_subscribe(EventType::DEVICE_JOIN, on_device_join);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
+    event_bus_subscribe(EventType::RULE_CHANGED, on_rule_changed);
     ESP_LOGI(TAG, "WS rx (ping / status / device.{list,get,rename,delete,"
                    "attr.set,bind,reinterview,configure}) + "
                    "push (zcl_attr / device_join / device_leave) wired");
