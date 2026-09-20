@@ -154,7 +154,9 @@ ten minutes after power-on. After that the web UI says so and asks for a power c
 that was never set up cannot be claimed by whoever finds it on the network a month later.
 Status reports the seconds left as `auth_setup_secs_left`.
 
-If the sign-in storage cannot be opened at boot, the hub locks itself instead of opening up:
+If the storage partition cannot be initialised at boot, the hub no longer erases it by itself:
+it boots locked and empty, reports `storage_error`, and Settings offers the erase. If only the
+sign-in storage cannot be opened, the hub likewise locks itself instead of opening up:
 sign-in stays on with a token that exists only for that boot and is printed on the serial
 console; set-up is refused until storage is reset.
 

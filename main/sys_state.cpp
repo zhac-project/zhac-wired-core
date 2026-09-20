@@ -57,6 +57,9 @@ void sys_state_init() {
 bool sys_metrics_enabled() { return s_metrics_enabled; }
 bool sys_ap_disabled()     { return s_ap_disabled; }
 bool sys_auth_enabled()    { return auth_enabled(); }   // auth.cpp owns access control
+static bool s_storage_error = false;
+void sys_set_storage_error(bool err) { s_storage_error = err; }
+bool sys_storage_error()             { return s_storage_error; }
 static bool s_event_task_ok = false;
 void sys_set_event_task_ok(bool ok) { s_event_task_ok = ok; }
 bool sys_event_task_ok()            { return s_event_task_ok; }

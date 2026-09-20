@@ -147,9 +147,15 @@ extern "C" void app_main() {
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS partition needs erase -- reformatting");
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
+        // Never erase the owner's storage on our own initiative (it held
+        // devices, rules, names, passwords). Boot locked and empty instead:
+        // sign-in falls closed (auth.cpp), status says storage_error, the
+        // Wi-Fi/Ethernet path still comes up, and `system.storage_reset`
+        // erases only when the owner asks from the web UI.
+        sys_set_storage_error(true);
+        ESP_LOGE(TAG, "NVS partition unusable (%s) -- STORAGE ERROR: booting without it. "
+                      "Sign in with the serial token, then reset storage from Settings.",
+                 esp_err_to_name(nvs_err));
     } else {
         ESP_ERROR_CHECK(nvs_err);
     }

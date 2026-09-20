@@ -19,6 +19,10 @@ void sys_state_init();
 bool sys_metrics_enabled();
 bool sys_ap_disabled();
 bool sys_auth_enabled();
+// Set by main when the NVS partition could not be initialised: the hub runs
+// locked and empty until the owner erases storage (system.storage_reset).
+void sys_set_storage_error(bool err);
+bool sys_storage_error();
 // Set by main once TaskEventBus runs; false means rules, MQTT and the web UI
 // see no device events. Read by the post-update health check.
 void sys_set_event_task_ok(bool ok);

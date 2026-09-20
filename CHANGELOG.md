@@ -8,6 +8,15 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 All notable changes to `zhac-wired-core` are recorded here. Format follows the convention
 used across the other ZHAC repos: an `## [Unreleased]` section accumulates work, and its
 
+### Changed
+
+- **Storage faults no longer erase the owner's data.** When the NVS partition cannot be
+  initialised at boot (no free pages, format version change) the hub used to erase it
+  silently: devices, rules, names, passwords gone. It now boots locked and empty instead:
+  sign-in forced on with a serial-only token, status `storage_error: true`, and Settings offers
+  "Erase storage and restart" (`system.storage_reset`, WebSocket) so the erase happens only
+  on the owner's word. Architecture review A3.
+
 ### Fixed
 
 - **Architecture review (2026-09-20) quick fixes.** Release manifest pins the pushed
