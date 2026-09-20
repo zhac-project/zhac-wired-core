@@ -19,7 +19,10 @@ for repo in m["siblings"]:
     path = os.path.join("..", repo)
     if not os.path.isdir(os.path.join(path, ".git")):
         sys.exit(f"{repo}: not checked out next to this repo")
-    dirty = subprocess.run(["git", "-C", path, "status", "--porcelain", "--untracked-files=no"],
+    # A developer's tracked `sdkconfig` (net-core, main-core) is local state, not a
+    # change the release depends on: ignore it, refuse anything else.
+    dirty = subprocess.run(["git", "-C", path, "status", "--porcelain", "--untracked-files=no",
+                            "--", ".", ":!sdkconfig"],
                            capture_output=True, text=True).stdout.strip()
     if dirty:
         sys.exit(f"{repo}: has uncommitted changes -- commit or stash them first")
