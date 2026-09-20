@@ -110,6 +110,7 @@ idf_component_register(
         device_shadow
         device_backend
         zhc_adapter
+        device_cmd
         simple_rules
         rule_store
         cron_parser

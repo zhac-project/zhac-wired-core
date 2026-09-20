@@ -10,6 +10,11 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Changed
 
+- **Every attribute write goes through `device_cmd`** (zhac-components): REST, WebSocket,
+  MQTT / Home Assistant commands and collection fan-out now share one implementation, so they
+  accept the same value types, answer with the same words, and all mirror the command into the
+  shadow (collection fan-out and REST did not before).
+
 - **Storage faults no longer erase the owner's data.** When the NVS partition cannot be
   initialised at boot (no free pages, format version change) the hub used to erase it
   silently: devices, rules, names, passwords gone. It now boots locked and empty instead:

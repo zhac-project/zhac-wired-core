@@ -10,6 +10,8 @@
 
 #include "ArduinoJson.h"
 #include "esp_log.h"
+#include "device_cmd.h"
+#include "device_cmd_json.h"
 #include "groups_store.h"
 #include "zhc_adapter.h"
 #include "zigbee_pool.h"
@@ -105,23 +107,14 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
 
     char key[24] = "state";
     strncpy(key, doc["key"] | "state", sizeof(key) - 1);
-    const double val = doc["val"] | 0.0;   // integral or decimal; see send_number
+    // The collection's members get the same typed write as a single device
+    // (bool / integer / decimal / string), through the one attribute-set path.
+    DevCmdValue val;
+    if (!device_cmd_value_from_json(doc["val"], &val)) val = device_cmd_int(0);
 
     uint8_t sent = 0, failed = 0;
     for (uint8_t i = 0; i < r.member_count; i++) {
-        zigbee_pool_lock();
-        ZapDevice* dev = pool_find_by_ieee(r.members[i].ieee);
-        if (!dev) { zigbee_pool_unlock(); failed++; continue; }
-        const uint64_t ieee_cp = dev->ieee_addr;
-        const uint16_t nwk_cp  = dev->nwk_addr;
-        const uint8_t  ep_cp   = r.members[i].ep ? r.members[i].ep
-                                 : (dev->endpoints[0] ? dev->endpoints[0] : 1);
-        char model_cp[64], manu_cp[64];
-        snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-        snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
-        zigbee_pool_unlock();
-
-        if (zhac_adapter_send_number(ieee_cp, model_cp, manu_cp, nwk_cp, ep_cp, key, val))
+        if (device_cmd_set_attr(r.members[i].ieee, r.members[i].ep, key, &val) == DEVCMD_OK)
             sent++;
         else
             failed++;

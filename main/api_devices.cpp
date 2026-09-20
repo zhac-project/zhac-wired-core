@@ -15,6 +15,8 @@
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "device_cmd.h"
+#include "device_cmd_json.h"
 #include "ArduinoJson.h"
 
 #include "radio_state.h"
@@ -301,7 +303,6 @@ static esp_err_t handle_device_state(httpd_req_t* req) {
     }
     const char* ieee_s = doc["ieee"]  | (const char*)nullptr;
     const char* key    = doc["key"]   | (const char*)nullptr;
-    const double value = doc["value"] | 0.0;   // integral or decimal; see send_number
     if (!ieee_s || !key) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ieee or key");
         return ESP_FAIL;
@@ -312,30 +313,18 @@ static esp_err_t handle_device_state(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    zigbee_pool_lock();
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
-        zigbee_pool_unlock();
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "device not found");
+    // One attribute-set path for every transport (device_cmd): pool snapshot,
+    // value dispatch, optimistic shadow and the result words live there.
+    DevCmdValue val;
+    if (!device_cmd_value_from_json(doc["value"], &val)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, device_cmd_result_str(DEVCMD_BAD_VALUE));
         return ESP_FAIL;
     }
-    // Copy what the send needs and release the pool: the radio dispatch
-    // blocks, and device reports must not wait on it (same as ws_bridge).
-    const uint64_t ieee_cp = dev->ieee_addr;
-    const uint16_t nwk_cp  = dev->nwk_addr;
-    const uint8_t  ep      = dev->endpoints[0] ? dev->endpoints[0] : 1;
-    char model_cp[64], manu_cp[64];
-    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
-    zigbee_pool_unlock();
-    bool ok = zhac_adapter_send_number(ieee_cp, model_cp, manu_cp, nwk_cp, ep, key, value);
-
+    const DevCmdResult r = device_cmd_set_attr(ieee, 0, key, &val);
     httpd_resp_set_type(req, "application/json");
-    if (ok) {
-        return httpd_resp_sendstr(req, "{\"ok\":true}");
-    }
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                         "no zhc converter");
+    if (r == DEVCMD_OK) return httpd_resp_sendstr(req, "{\"ok\":true}");
+    if (r == DEVCMD_NOT_FOUND) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, device_cmd_result_str(r)); return ESP_FAIL; }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, device_cmd_result_str(r));
     return ESP_FAIL;
 }
 
