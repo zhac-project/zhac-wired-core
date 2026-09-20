@@ -42,6 +42,9 @@ idf_component_register(
         "metrics_mqtt.cpp"
         "radio_state.cpp"
         "ws_bridge.cpp"
+        "mqtt_glue.cpp"
+        "ota_update.cpp"
+        "auth.cpp"
         "api_net.cpp"
         "api_status.cpp"
         "api_devices.cpp"
@@ -68,6 +71,13 @@ idf_component_register(
         esp_event
         esp_netif
         esp_http_server
+        # OTA (ota_update.cpp): HTTPS download into the idle slot.
+        esp_https_ota
+        esp_http_client
+        app_update
+        # auth.cpp: PSA hashing for the admin password; getpeername for lockout.
+        mbedtls
+        lwip
         # IDF v6.0 split the monolithic `driver` component; `driver/gpio.h`
         # now comes from esp_driver_gpio. Requiring `driver` builds but the
         # header is not on the include path.
@@ -104,9 +114,35 @@ idf_component_register(
         rule_store
         cron_parser
         mqtt_gw
+        ntp_cfg
+        ha_bridge
         mqtt
         arduinojson
         # -- zhac-net-core ------------------------------------------------
         ws_server
         remote_client
 )
+
+# ── Web UI, embedded ────────────────────────────────────────────────────────
+# tools/pack_spa.py gzips ../www-spa/dist into spa.pack; spa_serve.cpp serves it
+# from flash. Rebuilt whenever index.html changes (Vite renames every changed
+# asset, which changes index.html).
+set(ZHAC_SPA_DIST "${CMAKE_CURRENT_LIST_DIR}/../../www-spa/dist")
+set(ZHAC_SPA_PACK "${CMAKE_BINARY_DIR}/spa.pack")
+set(ZHAC_SPA_DEPS "${CMAKE_CURRENT_LIST_DIR}/../tools/pack_spa.py")
+if(EXISTS "${ZHAC_SPA_DIST}/index.html")
+    list(APPEND ZHAC_SPA_DEPS "${ZHAC_SPA_DIST}/index.html")
+else()
+    message(WARNING "ZHAC: ${ZHAC_SPA_DIST}/index.html not found -- building without "
+                    "the web UI. Run `npm ci && npm run build` in www-spa first.")
+endif()
+idf_build_get_property(zhac_python PYTHON)
+add_custom_command(
+    OUTPUT "${ZHAC_SPA_PACK}"
+    COMMAND "${zhac_python}" "${CMAKE_CURRENT_LIST_DIR}/../tools/pack_spa.py"
+            "${ZHAC_SPA_DIST}" "${ZHAC_SPA_PACK}"
+    DEPENDS ${ZHAC_SPA_DEPS}
+    VERBATIM)
+add_custom_target(zhac_spa_pack DEPENDS "${ZHAC_SPA_PACK}")
+add_dependencies(${COMPONENT_LIB} zhac_spa_pack)
+target_add_binary_data(${COMPONENT_LIB} "${ZHAC_SPA_PACK}" BINARY)

@@ -17,6 +17,7 @@
 // The write endpoints answer 501, not 404: 404 reads as "old firmware, wrong
 // route", 501 reads as "this build cannot do that", which is accurate and far
 // easier to diagnose from a browser console.
+#include "auth.h"
 #include "api_net.h"
 
 #include "ArduinoJson.h"
@@ -130,7 +131,7 @@ bool api_net_register(httpd_handle_t hd) {
         u.uri     = r.uri;
         u.method  = r.method;
         u.handler = r.handler;
-        if (httpd_register_uri_handler(hd, &u) != ESP_OK) {
+        if (auth_register_uri(hd, &u) != ESP_OK) {
             ESP_LOGE(TAG, "failed to register %s", r.uri);
             return false;
         }

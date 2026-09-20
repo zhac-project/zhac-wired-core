@@ -1,0 +1,192 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Publishes a flashable image for every v* tag: ONE merged file
+# (bootloader, partition table, app, web UI) written at offset 0x0 — what
+# the browser flasher in zhac-docs and `esptool write-flash 0x0` take.
+#
+# Siblings are checked out at the commits release-manifest.json names, exactly
+# as build.yml does, so the tag alone rebuilds the same inputs; the manifest
+# and a sources list ship next to the image.
+#
+# P4 only: the S31 needs IDF v6.1, which is still a pre-release (see the
+# commented row in build.yml).
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zhac-wired-core
+
+      # Every sibling at the commit release-manifest.json names. The manifest
+      # is part of the tagged tree, so the tag alone rebuilds the same inputs.
+      - name: Pinned sibling revisions
+        id: pins
+        working-directory: zhac-wired-core
+        run: |
+          for r in zhac-components zhac-net-core embedded-zhc zhac-main-core www-spa zhac-docs; do
+            sha=$(jq -er ".siblings[\"$r\"]" release-manifest.json)
+            echo "${r//-/_}=$sha" >> "$GITHUB_OUTPUT"
+            echo "$r @ $sha"
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-components
+          ref: ${{ steps.pins.outputs.zhac_components }}
+          path: zhac-components
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-net-core
+          ref: ${{ steps.pins.outputs.zhac_net_core }}
+          path: zhac-net-core
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/embedded-zhc
+          ref: ${{ steps.pins.outputs.embedded_zhc }}
+          path: embedded-zhc
+      # components/lua_engine and components/lua_cjson compile zhac-main-core's
+      # sources in place; without this checkout CMake stops at configure.
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-main-core
+          ref: ${{ steps.pins.outputs.zhac_main_core }}
+          path: zhac-main-core
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/www-spa
+          ref: ${{ steps.pins.outputs.www_spa }}
+          path: www-spa
+      # The SPA build regenerates the Lua autocomplete from zhac-docs'
+      # LUA_API.md and writes an EMPTY module when it cannot find it.
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-docs
+          ref: ${{ steps.pins.outputs.zhac_docs }}
+          path: zhac-docs
+
+      # The app reports this as its version (esp_app_desc). From the tag, not
+      # `git describe`: a shallow checkout would describe itself as a bare
+      # hash, and the browser flasher would then offer every release as new.
+      - name: Version from the tag
+        run: echo "${GITHUB_REF_NAME}" > zhac-wired-core/version.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build the web UI (embedded in the app image)
+        run: cd www-spa && npm ci && npm run build
+      # The firmware builds WITHOUT the web UI when dist/ is missing (it serves
+      # a "web UI not built" note instead). Fine on a developer's machine,
+      # fatal in a release.
+      - name: The web UI must be in the image
+        run: |
+          test -s www-spa/dist/index.html || { echo "FAIL: www-spa/dist/index.html missing -- the release would ship without a web UI" >&2; exit 1; }
+          echo "OK: web UI built ($(du -sh www-spa/dist | cut -f1))"
+
+      - name: SKU invariants
+        working-directory: zhac-wired-core
+        run: ./tools/check_sku_invariants.sh
+
+      - name: Build and merge
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32p4
+          path: zhac-wired-core
+          command: idf.py build && idf.py merge-bin -o zhac-wired-p4.bin
+
+      # tools/pack_spa.py packs an EMPTY blob when dist/ is unreadable and the
+      # build still succeeds; a real UI packs to hundreds of kB.
+      - name: The packed web UI is not empty
+        run: |
+          size=$(stat -c %s zhac-wired-core/build/spa.pack)
+          test "$size" -gt 65536 || { echo "FAIL: spa.pack is only $size bytes -- the web UI did not make it into the image" >&2; exit 1; }
+          echo "OK: spa.pack $size bytes"
+
+      # The on-module ESP32-C6 is the P4's Zigbee radio and needs its own
+      # image (stock ot_rcp, re-pinned), flashed once through its header.
+      - name: Build the ESP32-C6 radio image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32c6
+          path: zhac-wired-core
+          command: tools/build-rcp.sh build.rcp/zhac-rcp-c6.bin build.rcp
+
+      - name: Resolved chip config matches main-core
+        working-directory: zhac-wired-core
+        run: ./tools/check_resolved_config.sh
+
+      - name: Name, checksum, notes
+        run: |
+          img="zhac-wired-p4-rev1x-${GITHUB_REF_NAME}.bin"
+          cp zhac-wired-core/build/zhac-wired-p4.bin "$img"
+          # App partition only: what the OTA page downloads. The merged image
+          # above would overwrite the bootloader and partition table.
+          cp zhac-wired-core/build/zhac-wired-core.bin "zhac-wired-p4-rev1x-${GITHUB_REF_NAME}-ota.bin"
+          cp zhac-wired-core/build.rcp/zhac-rcp-c6.bin "zhac-rcp-c6-${GITHUB_REF_NAME}.bin"
+          # What the image was built from: this repo's commit, the IDF, and
+          # every sibling's commit. Enough to rebuild it without this runner.
+          cp zhac-wired-core/release-manifest.json "release-manifest-${GITHUB_REF_NAME}.json"
+          {
+            echo "zhac-wired-core ${GITHUB_SHA} (${GITHUB_REF_NAME})"
+            echo "esp-idf v6.0 (esp32p4 app), v6.0 (esp32c6 radio)"
+            jq -r '.siblings | to_entries[] | "\(.key) \(.value)"' zhac-wired-core/release-manifest.json
+          } > "sources-${GITHUB_REF_NAME}.txt"
+          sha256sum *.bin > SHA256SUMS
+          cat > notes.md <<NOTES
+          ZHAC on one ESP32-P4 board with Ethernet. Status per board, and what is still
+          open: https://github.com/zhac-project/zhac-wired-core#status
+
+          ### Flash it
+
+          From Chrome or Edge, no toolchain: https://zhac-project.github.io/zhac-docs/flash/
+
+          Or with esptool — one file, written at offset 0:
+
+          \`\`\`sh
+          esptool --chip esp32p4 --port /dev/ttyACM0 write-flash 0x0 ${img}
+          \`\`\`
+
+          This image targets ESP32-P4 silicon **v0.x–v1.x**. Check yours first with
+          \`esptool --port <PORT> flash-id\`; a v3.x chip will not boot it.
+
+          Then plug in Ethernet and open http://zhac.local.
+
+          The ESP32-C6 on the module is the Zigbee radio. It needs
+          \`zhac-rcp-c6-${GITHUB_REF_NAME}.bin\` once, through its own serial pins:
+          https://github.com/zhac-project/zhac-wired-core#zigbee-radio-esp32-c6
+
+          Updating a board that already runs ZHAC: the web UI's OTA page lists this
+          release and installs it (the \`-ota.bin\` file; keep the file name as published,
+          the page matches on it). It replaces the firmware and keeps devices, rules and
+          scripts.
+
+          ### What changed
+
+          See [CHANGELOG.md](https://github.com/zhac-project/zhac-wired-core/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
+
+          ### Built from
+          \`sources-${GITHUB_REF_NAME}.txt\` names the commit of this repo and of every sibling
+          repository the image was built against; \`SHA256SUMS\` covers every file above.
+          NOTES
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            zhac-wired-p4-rev1x-*.bin
+            zhac-rcp-c6-*.bin
+            SHA256SUMS
+            release-manifest-*.json
+            sources-*.txt

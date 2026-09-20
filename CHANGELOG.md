@@ -11,8 +11,133 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Added
+
+- **Time from the router.** When no time server is named, the hub asks the router for one
+  (DHCP option 42) and uses it before `pool.ntp.org`; status reports it as `ntp_dhcp_server`
+  and the Settings Time card says so. A hub on a network without internet access then keeps
+  its clock across power cuts with no configuration. Rows of `device.list` carry `model_id` and `known`.
+
+- **The first claim of a hub is bounded.** A hub without a password let the first visitor set
+  one at any time, so an unclaimed or reset hub belonged to whoever found it weeks later.
+  Set-up now answers only in the first ten minutes after power-on (`403 setup_closed` after,
+  status `auth_setup_secs_left`); the web UI explains and asks for a power cycle. Shared
+  helper `zap_setup_window.h` in zhac-components, so net-core behaves the same.
+
+- **A time server you can choose** (Settings, Time; `settings.set {"ntp_server"}`). A hub
+  without internet access can use one on its own network, so its clock returns after a power
+  cut without anyone opening the web UI. Empty means the public default, and status reports
+  the server as `ntp_server`.
+- **`time.set {epoch}` for a hub without internet access.** No board has a battery-backed
+  clock, so an offline hub had no time and its schedules never ran. The web UI now hands over
+  the browser's clock when status says `clock_set: false`. The hub takes it only while its own
+  clock is unset, so a browser never moves a clock that SNTP has set. WebSocket only.
+- **Over-the-air updates.** WS `ota.update {url}` downloads a release's `-ota.bin` over
+  HTTPS (server certificate verified) into the idle slot and reboots into it; the web UI's
+  OTA page drives it and shows progress. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` a new
+  image that dies within its first minute is rolled back.
+- **The web UI is embedded in the app image** (`tools/pack_spa.py`, served gzip-encoded by
+  `spa_serve.cpp`, with a Content-Security-Policy header and cache headers that make an
+  update show at once). An OTA update now carries firmware and UI together.
+
+- **MQTT works on this build, and Home Assistant discovery with it.** The build used to
+  link mqtt_gw's HAP shim — publishes went nowhere and the status always said disconnected.
+  It now links the real client (`ZHAC_MQTT_GW_LOCAL_CLIENT`), keeps the broker settings in
+  NVS `mqtt_cfg` (they used to vanish on reboot), starts it on Ethernet link-up, feeds
+  inbound messages to `Mqtt#` rules and Lua `zhac.on_mqtt`, and runs `ha_bridge` for Home
+  Assistant (Settings → MQTT → Home Assistant discovery).
+- **A missing or wrong radio firmware no longer boot-loops the hub.** With no `ot_rcp` on
+  the C6 (a new Guition board ships Wi-Fi co-processor firmware), OpenThread's spinel
+  driver aborts during radio start. A boot guard in no-init RAM now spots that the previous
+  boot died within 30 s of starting the radio, skips the radio on the next boot, keeps the
+  device pool and web UI up, and reports `radio_error: "radio_crashed"` in status. A reset
+  retries.
+- **ESP32-C6 radio image.** `tools/build-rcp.sh` builds Espressif's stock `ot_rcp` with
+  `rcp/sdkconfig.defaults` (spinel UART on the module's former SDIO traces) into one file
+  for offset 0x0; releases attach it as `zhac-rcp-c6-<tag>.bin`. README documents flashing
+  it once through the C6's own header — the P4 cannot, as neither the C6's UART0 pins nor
+  its BOOT pin reach the P4 on this board.
+- **Release images.** Every `v*` tag builds the P4 firmware and attaches one merged
+  `zhac-wired-p4-rev1x-<tag>.bin` (flash at offset 0x0) plus `SHA256SUMS` to the GitHub
+  release, with flashing instructions in the notes. The browser flasher in `zhac-docs`
+  picks the latest one up. The `rev1x` in the name is the P4 silicon family it boots on.
+
+### Changed
+
+- **A new firmware is kept because it works, not because a minute passed.** After an update the
+  image was marked good on a 60 s timer, so a build whose web server or radio never came up
+  stayed. It is now kept only once storage answers, the web server is up and the Zigbee radio
+  is no worse than before the update (an unplugged cable is deliberately not a reason to go
+  back); unmet after ten minutes it rolls back by itself, and the previous firmware then
+  reports why in status (`ota_rollback_reason`) and on the OTA page. Status carries
+  `ota_state` (`pending` / `verified`), and a second update is refused during the trial.
+- **Releases are rebuildable from the tag alone.** CI and the release build used to check
+  every sibling repository out at its moving default branch, so an image could only be
+  reproduced as long as those branches had not moved. `release-manifest.json` now pins each
+  sibling to a commit, both workflows check them out there, `tools/bump_siblings.sh` moves the
+  pins, and each release ships the manifest plus a `sources-<tag>.txt`. The release also writes
+  the tag into `version.txt`, so the firmware reports the tag as its version instead of a bare
+  hash (which made the browser flasher offer every release as an update), and it fails when the
+  web UI is missing from the image rather than shipping a hub that answers "web UI not built".
+- **`CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT` moved to `sdkconfig.defaults.esp32s31`.** Only
+  IDF v6.1 knows the symbol; on v6.0 it made CI's unknown-symbol check fail for the P4.
+
+- **Partition table: two 6 MB OTA slots replace the single `factory` slot, and the 7 MB
+  `spa` SPIFFS partition is gone.** Boards on the old layout need one full USB flash. The
+  merged release image shrinks from 15.8 MB to about 4.5 MB.
+- **The partition table moves from 0x8000 to 0xC000**, giving the bootloader 40 KB. With app
+  rollback on, the P4 bootloader had 480 bytes to spare. `nvs` moves to 0xD000; the app
+  slots stay where they were. Local builds: delete an old `sdkconfig` or run
+  `idf.py reconfigure`, or the app will look for the table at the old address;
+  `tools/check_resolved_config.sh` now catches that.
+
+### Security
+
+- **The REST and WebSocket APIs require sign-in, by default.** Ported from the dual-chip
+  S3 (`auth.cpp`): a fresh hub asks the first visitor for the admin password
+  (`/api/auth/setup`), the password is exchanged for the 32-hex API token
+  (`/api/auth/login`), every REST route except `/api/status` and the login pair checks
+  `X-Api-Key`, WebSocket clients must send a first `auth` message, and five failures a
+  minute lock a peer out. Before this the whole API — Lua, rules, device control, reset —
+  was open to anyone on the LAN (review 2026-09 tracked divergence). A stored "auth off"
+  from Settings still wins; `CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED` sets the fresh default.
+
 ### Fixed
 
+- **Decimal writes.** `device.attr.set`, `/api/device/state` and collection commands accept
+  `21.5` (they answered "value must be bool / number / string"); the converter scales it, an
+  integer-only converter refuses it as "no zhc converter", and the shadow mirrors it ×100.
+
+- **CI and release builds failed on a clean runner.** `components/lua_engine` and
+  `components/lua_cjson` compile `zhac-main-core`'s sources in place, and neither workflow
+  checked that repo out, so CMake stopped at configure. Both workflows fetch it now, and the
+  README lists it with the other siblings.
+- **Status reports `clock_set`**, so the web UI can say when scheduled rules are waiting for
+  the time (the rule engine now holds them until SNTP has set the clock).
+- **A device's "last seen" always showed "—", and cron rules ran on a 1970 clock.** The
+  board has no RTC and nothing ever set the time. The hub now starts SNTP (pool.ntp.org,
+  as the dual-chip build does) on its first IP address, stores "last seen" as wall-clock
+  time like the dual-chip build, and sends it with each attribute event so the web UI
+  updates it live. Until the first sync it shows "—" as before.
+- **The RCP UART pin prompts had the C6 side swapped.** The SDIO map puts C6 GPIO20 on
+  P4 GPIO14 (the P4's RX), so the C6 transmits on 20, not 21. Values were unaffected; the
+  help text now matches the image `tools/build-rcp.sh` builds. Unconfirmed on hardware.
+- **The router listed the hub as `espressif`.** The DHCP request now carries the mDNS
+  hostname (`zhac` by default), so the router's client list shows it — the fallback for
+  phones that cannot resolve `zhac.local`.
+- **The web UI showed raw IEEE addresses instead of device names.** `device.list` rows
+  carried the name only as `friendly`; the shared UI reads `name`, as the dual-chip build
+  sends. Both keys are sent now.
+- **Temperature, humidity, power and every other decimal value never appeared.** Float
+  attributes are stored ×100 and tagged `VAL_FLOAT`; `device.get` and the `attr.changed`
+  push only handled int/bool/string, so they were dropped. They are divided back at the JSON
+  boundary now, as the dual-chip encoder does.
+- **Settings showed every toggle off and the MQTT fields blank.** WS `status.get` sent only
+  diagnostics. It now shares one builder with REST `/api/status` and adds `sku: "wired"`, so
+  the UI can also hide Wi-Fi and cloud-uplink controls this build does not have.
+- **A device name containing a quote blanked the Devices page** (the list is built with
+  `snprintf`, not a JSON writer). `device.rename` now rejects quotes, backslashes and control
+  characters.
 - **`GET /api/rules` overflowed the HTTP worker stack by 11×.** `handle_get_rules`
   kept `RuleSlot slots[ZAP_MAX_RULES]` — 256 × 536 B = 137 KB — as a local on
   the 12 KB httpd worker, on the unauthenticated REST surface; the frame
@@ -34,7 +159,16 @@ contents become the release-tag annotation at `just release`.
   before every wait on a step/bind semaphore, since the callbacks that post
   them need the lock to run. (Review 2026-09, WC-01.)
 
-Initial firmware. Nothing hardware-verified yet.
+Initial firmware. The `esp32s31` target runs on hardware (network formation, pairing
+and decode of a real device, ZCL groups, permit-join, live web UI); the `esp32p4`
+target builds but has not run on hardware yet.
+
+### Changed (docs)
+
+- **README rewritten for first-time users**: per-target status that matches reality,
+  a board matrix, a silicon-revision check to run before flashing a P4, and a first-boot
+  section (`http://zhac.local`, permit join). The old text still described Phase 0
+  ("no radio, nothing verified").
 
 ### Changed
 

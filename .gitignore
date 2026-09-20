@@ -14,3 +14,6 @@ dependencies.lock
 *.pyc
 __pycache__/
 components/*/test/host/build/
+# release.yml writes the tag here so the app version equals the tag;
+# a local file would pin every build to a stale name.
+version.txt

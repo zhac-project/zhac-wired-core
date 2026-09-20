@@ -31,6 +31,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "device_backend.h"
+#include "esp_attr.h"     // __NOINIT_ATTR
 #include "esp_log.h"
 #include "esp_system.h"   // esp_restart
 #include "esp_timer.h"
@@ -138,11 +139,11 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     // Cheap in-place update under the pool's own visitor lock.
     if (ieee != 0 && ind->lqi != 0) {
         struct LqiCtx { uint8_t lqi; uint32_t now; };
-        LqiCtx lc{ind->lqi, static_cast<uint32_t>(esp_timer_get_time() / 1000000)};
+        LqiCtx lc{ind->lqi, esp_zigbee_backend_wall_clock_s()};
         zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
             auto* x = static_cast<LqiCtx*>(c);
             d->link_quality = x->lqi;
-            d->last_seen    = x->now;
+            if (x->now) d->last_seen = x->now;
         }, &lc);
     }
 
@@ -335,6 +336,46 @@ static void task_zigbee(void*) {
     vTaskDelete(nullptr);
 }
 
+// ── Boot guard: a radio that kills the chip must not kill the hub ─────────
+//
+// With no radio firmware on the C6 (a new Guition board ships it with
+// ESP-Hosted, not ot_rcp) or a mismatched one, OpenThread's spinel driver
+// ends the RCP handshake in DieNow() -> abort(), either inside
+// esp_zigbee_init() or a little later from the Zigbee task. Unguarded that is
+// a boot loop, and the web UI never stays up long enough to say why.
+//
+// kGuardArmed sits in no-init RAM from just before radio init until the stack
+// has survived kGuardWindowS seconds. It survives a panic or watchdog reset
+// but not a power cycle. Finding it armed after such a reset means the last
+// boot most likely died starting the radio: skip the radio this boot, keep the
+// device pool and UI up, and say so in status. The next reset tries again. An
+// unrelated crash inside the window costs one radio-less boot, nothing more.
+static __NOINIT_ATTR uint32_t s_boot_guard;
+static constexpr uint32_t kGuardArmed   = 0x5A424755;   // "ZBGU"
+static constexpr int      kGuardWindowS = 30;
+static const char*        s_last_error  = nullptr;
+
+static bool boot_guard_tripped() {
+    const esp_reset_reason_t r = esp_reset_reason();
+    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
+                         r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    const bool tripped = crashed && s_boot_guard == kGuardArmed;
+    s_boot_guard = 0;   // no-init RAM is garbage after power-on: always clear
+    return tripped;
+}
+
+static void boot_guard_arm() {
+    static esp_timer_handle_t timer = nullptr;
+    esp_timer_create_args_t args{};
+    args.callback = [](void*) { s_boot_guard = 0; };
+    args.name     = "zb_boot_guard";
+    if (!timer && esp_timer_create(&args, &timer) != ESP_OK) return;  // unguarded, as before
+    s_boot_guard = kGuardArmed;
+    esp_timer_start_once(timer, static_cast<uint64_t>(kGuardWindowS) * 1000000ULL);
+}
+
+const char* esp_zigbee_backend_last_error(void) { return s_last_error; }
+
 // ── DeviceBackend implementation ─────────────────────────────────────────
 
 static bool zb_init() {
@@ -372,6 +413,16 @@ static bool zb_init() {
         ESP_LOGI(TAG, "restored %u device(s) from NVS", (unsigned)restored);
     }
 
+    // After the pool restore, so a radio-less boot still lists the devices.
+    if (boot_guard_tripped()) {
+        s_last_error = "radio_crashed";
+        ESP_LOGE(TAG, "the previous boot died while starting the radio -- running "
+                      "WITHOUT Zigbee this boot; reset to retry. On the P4 board "
+                      "this usually means the ESP32-C6 has no ot_rcp firmware.");
+        return false;
+    }
+    boot_guard_arm();
+
     esp_zigbee_config_t cfg{};
     cfg.device_config.device_type         = EZB_NWK_DEVICE_TYPE_COORDINATOR;
     cfg.device_config.install_code_policy = false;
@@ -402,6 +453,7 @@ static bool zb_init() {
     esp_err_t err = esp_zigbee_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_init failed: %s", esp_err_to_name(err));
+        s_last_error = "radio_init_failed";
         return false;
     }
 
@@ -421,6 +473,7 @@ static bool zb_init() {
     err = esp_zigbee_start(true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_start failed: %s", esp_err_to_name(err));
+        s_last_error = "radio_init_failed";
         return false;
     }
 

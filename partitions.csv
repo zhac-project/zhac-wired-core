@@ -1,14 +1,21 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# zhac-wired-core partitions — 16 MB flash, single-slot app (no OTA).
+# zhac-wired-core partitions — 16 MB flash, two OTA app slots.
+# The web UI is embedded in the app image (tools/pack_spa.py), so an OTA
+# update replaces firmware and UI together; there is no `spa` partition.
+# Changing this layout needs one full USB flash (erase), which the browser
+# flasher does anyway.
 # No phy_init: that partition stores WiFi PHY calibration data, and this
 # build has no radio on the host at all.
+# The table itself sits at 0xC000 (CONFIG_PARTITION_TABLE_OFFSET), which gives
+# the bootloader 0x2000-0xC000; nvs follows it and ota_0 stays at 0x20000.
 # Name,         Type,  SubType,  Offset,  Size
-nvs,            data,  nvs,      0x9000,  64K
-factory,        app,   factory,  ,        6M
+nvs,            data,  nvs,      0xD000,  64K
+otadata,        data,  ota,      ,        8K
+ota_0,          app,   ota_0,    0x20000, 6M
+ota_1,          app,   ota_1,    ,        6M
 scripts,        data,  spiffs,   ,        2M
-spa,            data,  spiffs,   ,        7M
 # Zigbee datasets. MUST be subtype `nvs`, NOT `fat`: esp-zigbee-lib v2.x opens
 # it with nvs_open_from_partition() and abort()s inside esp_zigbee_init if that
 # fails -- a boot loop with no error message. IDF's own bundled zigbee examples

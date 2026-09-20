@@ -37,6 +37,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "esp_zb_interview.h"
+#include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
 #include "esp_zb_lock.h"
 
 #include "esp_log.h"
@@ -348,7 +349,7 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
         return false;
     }
     work.nwk_addr  = nwk;
-    work.last_seen = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+    if (const uint32_t t = esp_zigbee_backend_wall_clock_s()) work.last_seen = t;
 
     // 1. Node descriptor -- logical type + manufacturer code. Not fatal:
     //    plenty of devices answer Active_EP but stall on Node_Desc.
@@ -469,7 +470,7 @@ bool pool_upsert(uint64_t ieee, uint16_t nwk) {
     }
     const bool nwk_changed = (d->nwk_addr != nwk);
     d->nwk_addr  = nwk;
-    d->last_seen = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+    if (const uint32_t t = esp_zigbee_backend_wall_clock_s()) d->last_seen = t;
     zigbee_pool_unlock();
     if (nwk_changed) zigbee_pool_mark_dirty();
     return true;
@@ -585,7 +586,7 @@ void rejoin_fn(ZapDevice* d, void* ctx) {
     c->was_removed = zap_dev_is_removed(d);
     d->flags      &= static_cast<uint8_t>(~ZAP_DEV_REMOVED);
     d->nwk_addr    = c->nwk;
-    d->last_seen   = c->now;
+    if (c->now) d->last_seen = c->now;
     c->snap        = *d;
 }
 
@@ -601,7 +602,7 @@ void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
 
     RejoinCtx c{};
     c.nwk = nwk;
-    c.now = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+    c.now = esp_zigbee_backend_wall_clock_s();
 
     if (zigbee_pool_with_device(ieee, rejoin_fn, &c)) {
         // Known device. A full re-interview is only warranted when we never

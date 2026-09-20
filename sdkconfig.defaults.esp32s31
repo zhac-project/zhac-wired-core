@@ -88,3 +88,16 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # equivalent (CONFIG_SPIRAM_RODATA) inherited from zhac-main-core; s31 did not,
 # which is precisely why only s31 crashed.
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# Only IDF v6.1 (the S31's IDF) knows this symbol; on v6.0 kconfgen reports it as
+# unknown and build.yml's Kconfig check fails, so it lives in the S31 file.
+# Lets ws_server register a WebSocket client at handshake time on IDF >= 6.1.
+#
+# v6.1 stopped calling the URI handler for the handshake ("if the request is
+# websocket handshake, then do not call the uri->handler" in httpd_uri.c), and
+# that handler is where ws_server added the socket to its broadcast table. With
+# it off, ws_server falls back to adopting sockets on their first data frame --
+# which works, but such a socket has no handshake headers left to inspect, so a
+# header-authenticated client would have to re-auth by message. Enabling this
+# keeps handshake-time X-Api-Key auth behaving exactly as it does on v6.0.
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y

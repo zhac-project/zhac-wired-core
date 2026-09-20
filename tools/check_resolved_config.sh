@@ -42,6 +42,11 @@ expect() {
 
 TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
 
+# Both targets. Release images and OTA updates assume the table here; an app
+# built with another offset cannot find its partitions.
+expect CONFIG_PARTITION_TABLE_OFFSET 0xC000 \
+    "Moved from 0x8000 to give the bootloader room (see sdkconfig.defaults). An old local sdkconfig keeps 0x8000: delete it or run idf.py reconfigure."
+
 # ---------------------------------------------------------------- esp32s31 --
 if [ "$TARGET" = "esp32s31" ]; then
     expect CONFIG_SPIRAM y          "PSRAM is mandatory for this firmware."

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ESP32-C6 radio co-processor for the Guition JC-ESP32P4-M3 module, layered on
+# top of ESP-IDF's own examples/openthread/ot_rcp/sdkconfig.defaults by
+# tools/build-rcp.sh. Everything else is Espressif's stock ot_rcp.
+#
+# The spinel UART (UART0, 460800 8N1 -- esp_ot_config.h) is routed to the
+# module's former SDIO traces instead of the C6's usual UART0 pins:
+#   C6 GPIO20 (TX) -> P4 GPIO14 (RX)     ZHAC_RCP_UART_RX_GPIO
+#   C6 GPIO21 (RX) <- P4 GPIO15 (TX)     ZHAC_RCP_UART_TX_GPIO
+# The C6's own UART0 pins (16/17) stay free for flashing it.
+CONFIG_OPENTHREAD_UART_PIN_MANUAL=y
+CONFIG_OPENTHREAD_UART_TX_PIN=20
+CONFIG_OPENTHREAD_UART_RX_PIN=21
+
+# A dedicated radio: no Wi-Fi on this C6 to coexist with.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n

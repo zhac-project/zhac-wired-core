@@ -1,0 +1,15 @@
+{
+  "_comment": "Sibling repositories this firmware is built against, by commit. build.yml and release.yml check them out at exactly these revisions; tools/bump_siblings.sh rewrites the file from the workspace's checkouts. Bump it in the same commit as a change that needs a newer sibling.",
+  "idf": {
+    "esp32p4": "v6.0",
+    "esp32s31": "v6.1"
+  },
+  "siblings": {
+    "zhac-components": "e0bb52331297e57046fb75fba9d118e48132671f",
+    "zhac-net-core": "9e7dd32eddddca1c93ffae57f0f60f60e11970bd",
+    "embedded-zhc": "ade63356dd2969850bcb1f7c5e8ec01ecea7f585",
+    "zhac-main-core": "5b3440f1af4ea5da132a086d61f469ce9f1e65ad",
+    "www-spa": "7c785da26afcadbb5e895235dfa0adedd500f83b",
+    "zhac-docs": "3a443017986af9842e1c2da8f5adab054cc407f2"
+  }
+}

@@ -52,6 +52,9 @@
 #include "device_backend.h"
 #include "device_options.h"
 #include "esp_zigbee_backend.h"
+#include "auth.h"
+#include "mqtt_glue.h"
+#include "ota_update.h"
 #include "device_shadow.h"
 #include "eth.h"
 #include "sys_diag.h"
@@ -66,6 +69,7 @@
 #include "simple_rules.h"
 #include "spa_serve.h"
 #include "sys_state.h"
+#include "ntp_cfg.h"
 #include "task_stacks.h"   // zhac::stack::kEventBus (zap_common)
 #include "ws_bridge.h"
 #include "ws_server.h"
@@ -150,7 +154,9 @@ extern "C" void app_main() {
         ESP_ERROR_CHECK(nvs_err);
     }
 
-    // System flags + API-auth token (NVS-backed). Must follow nvs_flash_init.
+    // API access control (token, admin password, lockout), then system flags.
+    // Both NVS-backed: must follow nvs_flash_init.
+    auth_init();
     sys_state_init();
     log_ring_init();   // PSRAM log ring + esp_log vprintf hook (capture early)
 
@@ -228,6 +234,7 @@ extern "C" void app_main() {
     lua_engine_rules_hook_install();
 
     // ── Network ──────────────────────────────────────────────────────
+    ntp_cfg_init();   // before the first DHCP lease: may ask the router for a time server
     eth_start();
     net_discovery_start(CONFIG_ZHAC_MDNS_HOSTNAME);
 
@@ -244,6 +251,7 @@ extern "C" void app_main() {
     httpd_handle_t hd = ws_server_get_handle();
     if (hd) {
         api_status_register(hd);
+        auth_register(hd);   // /api/auth/login|setup (public), /api/auth/password
         api_devices_register(hd);
         api_net_register(hd);      // replaces mono's api_wifi_register
         api_rules_register(hd);
@@ -282,11 +290,11 @@ extern "C" void app_main() {
 #endif
     remote_client_init();   // no-op stub when remote disabled; reads NVS
 
-    // mqtt_gw is config-gated: with no broker URL provisioned in NVS,
-    // mqtt_gw_start() logs and idles until mqtt_gw_configure() arrives from
-    // the REST handler. Boots cleanly either way.
-    mqtt_gw_init();
-    mqtt_gw_start();
+    // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
+    // inbound messages feed rules / Lua / Home Assistant. With no broker
+    // configured it idles. Boots cleanly either way.
+    mqtt_glue_start();
+    ota_update_init();   // ota.update + keep a fresh image once it proves healthy
     metrics_mqtt_publisher_start();   // no-op if the exporter is off
 
     if (lua_ok) {

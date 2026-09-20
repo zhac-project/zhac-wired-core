@@ -29,25 +29,51 @@ jobs:
     steps:
       # zhac-wired-core consumes its siblings as read-only inputs, resolved by
       # relative path, so CI has to lay them out the same way the workspace
-      # does: all repos checked out side by side.
+      # does: all repos checked out side by side -- at the commits
+      # release-manifest.json names, never at a moving branch, so a green
+      # build here means the same inputs a release build resolves.
+      # fetch-depth 0: the app version comes from `git describe`, which on a
+      # shallow checkout degrades to a bare hash.
       - uses: actions/checkout@v4
         with:
           path: zhac-wired-core
+          fetch-depth: 0
+
+      - name: Pinned sibling revisions
+        id: pins
+        working-directory: zhac-wired-core
+        run: |
+          for r in zhac-components zhac-net-core embedded-zhc zhac-main-core www-spa zhac-docs; do
+            sha=$(jq -er ".siblings[\"$r\"]" release-manifest.json)
+            echo "${r//-/_}=$sha" >> "$GITHUB_OUTPUT"
+            echo "$r @ $sha"
+          done
 
       - uses: actions/checkout@v4
         with:
           repository: zhac-project/zhac-components
+          ref: ${{ steps.pins.outputs.zhac_components }}
           path: zhac-components
 
       - uses: actions/checkout@v4
         with:
           repository: zhac-project/zhac-net-core
+          ref: ${{ steps.pins.outputs.zhac_net_core }}
           path: zhac-net-core
 
       - uses: actions/checkout@v4
         with:
           repository: zhac-project/embedded-zhc
+          ref: ${{ steps.pins.outputs.embedded_zhc }}
           path: embedded-zhc
+
+      # components/lua_engine and components/lua_cjson compile zhac-main-core's
+      # sources in place; without this checkout CMake stops at configure.
+      - uses: actions/checkout@v4
+        with:
+          repository: zhac-project/zhac-main-core
+          ref: ${{ steps.pins.outputs.zhac_main_core }}
+          path: zhac-main-core
 
       - name: SKU invariants
         working-directory: zhac-wired-core

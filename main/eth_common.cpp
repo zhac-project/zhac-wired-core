@@ -21,6 +21,8 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "ntp_cfg.h"
+#include "sdkconfig.h"
 
 #include <cstdio>
 #include <cstring>
@@ -84,6 +86,16 @@ static void on_got_ip(void*, esp_event_base_t, int32_t, void* data) {
     s_has_ip = true;
     ESP_LOGI(TAG, "got IP " IPSTR " gw " IPSTR,
              IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw));
+
+    // No RTC on these boards, so the clock starts at 1970 until SNTP sets it.
+    // Device "last seen", cron rules and the timezone setting all need it.
+    // ntp_cfg owns the server (the public default, or a local one from
+    // Settings for a network without internet access).
+    static bool s_sntp_started = false;
+    if (!s_sntp_started) {
+        s_sntp_started = true;
+        ntp_cfg_start();
+    }
 }
 
 // One event per address, and a dual-stack interface legitimately has several:
@@ -138,6 +150,10 @@ void eth_start() {
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     s_netif = esp_netif_new(&netif_cfg);
+    // Same name as mDNS, sent in the DHCP request, so the router's client
+    // list shows "zhac" -- the fallback for phones that cannot resolve
+    // zhac.local. Without it IDF sends its default, "espressif".
+    esp_netif_set_hostname(s_netif, CONFIG_ZHAC_MDNS_HOSTNAME);
 
     esp_eth_mac_t* mac = nullptr;
     esp_eth_phy_t* phy = nullptr;

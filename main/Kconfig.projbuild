@@ -73,6 +73,17 @@ menu "ZHAC wired-core board"
             board uses the equivalent line as a always-high power enable
             instead -- see ZHAC_ETH_PHY_PWR_GPIO.
 
+    config ZHAC_API_AUTH_DEFAULT_ENABLED
+        bool "Require sign-in for the REST and WebSocket APIs on a fresh unit"
+        default y
+        help
+            Secure by default, as on the dual-chip build: a fresh hub asks the
+            first visitor to choose the admin password, and every API call
+            needs the token that password unlocks. A choice stored from the
+            web UI (Settings -> Auth) always wins over this default. Turn it
+            off only for a lab bench -- auth off means anyone on the LAN can
+            run Lua, reflash and reset the network.
+
     config ZHAC_MDNS_HOSTNAME
         string "mDNS hostname (without .local)"
         default "zhac"
@@ -130,16 +141,17 @@ menu "ZHAC wired-core board"
         default 1
 
     # -- Radio wiring --
-    # No radio is built in Phase 0. These are declared now so the board
-    # wiring is recorded in one place and Phase 1 only has to consume them.
-    # Values are the SDIO traces the no-WiFi decision freed -- see
-    # extra/docs/P4_C6_WIRED_GATEWAY_RESEARCH.md section 2.4.
+    # The C6's former SDIO traces, freed by the no-WiFi decision: SDIO D0 is
+    # P4 GPIO14 <-> C6 GPIO20 and D1 is P4 GPIO15 <-> C6 GPIO21 (C6 SDIO slave
+    # pins are fixed by silicon). So the C6 must transmit on 20 and receive on
+    # 21 -- which is what rcp/sdkconfig.defaults builds ot_rcp with. Not yet
+    # confirmed on hardware: if spinel never answers, swap one side.
     config ZHAC_RCP_UART_RX_GPIO
-        int "P4 RX from RCP TX (C6 GPIO21)"
+        int "P4 RX from RCP TX (C6 GPIO20)"
         default 14
 
     config ZHAC_RCP_UART_TX_GPIO
-        int "P4 TX to RCP RX (C6 GPIO20)"
+        int "P4 TX to RCP RX (C6 GPIO21)"
         default 15
 
     config ZHAC_RCP_RESET_GPIO
@@ -150,8 +162,10 @@ menu "ZHAC wired-core board"
         int "RCP BOOT strap (C6 GPIO9), -1 if unwired"
         default -1
         help
-            Needed only by esp_rcp_update for host-driven reflash. Probably
-            not routed on the Guition board -- verify on the schematic. If it
-            is -1 the C6 must be flashed via its own programming connector.
+            Needed only by esp_rcp_update for host-driven reflash, which also
+            needs the RCP UART to be the C6's UART0 pins (16/17) -- the ROM
+            download mode listens nowhere else. On the Guition board neither
+            holds, so the C6 is flashed once through its own header; see
+            README "Zigbee radio (ESP32-C6)" and tools/build-rcp.sh.
 
 endmenu

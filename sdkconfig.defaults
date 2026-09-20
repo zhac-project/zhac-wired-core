@@ -54,6 +54,12 @@ CONFIG_SPIRAM=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# The bootloader starts at 0x2000 and must end before the partition table. At
+# the default 0x8000 that left the P4 bootloader 480 bytes once app rollback was
+# on; 0xC000 gives it 40 KB. Only nvs and otadata move (see partitions.csv).
+# An app built with a different offset cannot find the table: delete an old
+# local `sdkconfig` (or run `idf.py reconfigure`) after pulling this.
+CONFIG_PARTITION_TABLE_OFFSET=0xC000
 
 # --- Diagnostics ------------------------------------------------------------
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
@@ -112,13 +118,16 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
-# Lets ws_server register a WebSocket client at handshake time on IDF >= 6.1.
-#
-# v6.1 stopped calling the URI handler for the handshake ("if the request is
-# websocket handshake, then do not call the uri->handler" in httpd_uri.c), and
-# that handler is where ws_server added the socket to its broadcast table. With
-# it off, ws_server falls back to adopting sockets on their first data frame --
-# which works, but such a socket has no handshake headers left to inspect, so a
-# header-authenticated client would have to re-auth by message. Enabling this
-# keeps handshake-time X-Api-Key auth behaving exactly as it does on v6.0.
-CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
+# OTA (ota_update.cpp): if a freshly updated image dies within its first
+# minute, before it marks itself valid, the bootloader boots the previous
+# slot again. Changes the bootloader: takes effect with a full USB flash.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+
+# Time from the router (ntp_cfg): DHCP option 42 fills SNTP slot 0 when the
+# owner named no server; pool.ntp.org sits in slot 1 as the fallback. A hub
+# on a network without internet access then keeps its clock across power
+# cuts with no configuration at all.
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+CONFIG_LWIP_DHCP_MAX_NTP_SERVERS=1
+CONFIG_LWIP_SNTP_MAX_SERVERS=2

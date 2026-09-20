@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#include "auth.h"
 #include "api_remote.h"
 #include "sdkconfig.h"
 
@@ -86,9 +87,9 @@ static esp_err_t h_disconnect(httpd_req_t* req) {
 bool api_remote_register(httpd_handle_t hd) {
     if (!hd) return false;
     httpd_uri_t u{};
-    u.uri = "/api/remote/status";     u.method = HTTP_GET;  u.handler = h_status;     httpd_register_uri_handler(hd, &u);
-    u.uri = "/api/remote/connect";    u.method = HTTP_POST; u.handler = h_connect;    httpd_register_uri_handler(hd, &u);
-    u.uri = "/api/remote/disconnect"; u.method = HTTP_POST; u.handler = h_disconnect; httpd_register_uri_handler(hd, &u);
+    u.uri = "/api/remote/status";     u.method = HTTP_GET;  u.handler = h_status;     auth_register_uri(hd, &u);
+    u.uri = "/api/remote/connect";    u.method = HTTP_POST; u.handler = h_connect;    auth_register_uri(hd, &u);
+    u.uri = "/api/remote/disconnect"; u.method = HTTP_POST; u.handler = h_disconnect; auth_register_uri(hd, &u);
     ESP_LOGI(TAG, "remote routes registered");
     return true;
 }

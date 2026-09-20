@@ -12,6 +12,7 @@
 // Direct in-process calls into simple_rules + rule_store. No HAP.
 // On parse error, the response includes the dsl_parser-formatted
 // message in `err` so the SPA can show what the user mistyped.
+#include "auth.h"
 #include "api_rules.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -186,15 +187,15 @@ bool api_rules_register(httpd_handle_t hd) {
     httpd_uri_t u{};
 
     u.uri = "/api/rules"; u.method = HTTP_GET;  u.handler = handle_get_rules;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
     u.uri = "/api/rules"; u.method = HTTP_POST; u.handler = handle_post_rules;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     // Wildcard. Specific suffix /enable is detected inside the handler.
     u.uri = "/api/rules/*"; u.handler = handle_rules_item;
-    u.method = HTTP_PUT;    httpd_register_uri_handler(hd, &u);
-    u.method = HTTP_DELETE; httpd_register_uri_handler(hd, &u);
-    u.method = HTTP_POST;   httpd_register_uri_handler(hd, &u);
+    u.method = HTTP_PUT;    auth_register_uri(hd, &u);
+    u.method = HTTP_DELETE; auth_register_uri(hd, &u);
+    u.method = HTTP_POST;   auth_register_uri(hd, &u);
 
     ESP_LOGI(TAG, "/api/rules CRUD + /enable registered");
     return true;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#include "auth.h"
 #include "api_groups.h"
 
 #include <cstdio>
@@ -104,7 +105,7 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
 
     char key[24] = "state";
     strncpy(key, doc["key"] | "state", sizeof(key) - 1);
-    uint64_t val = doc["val"] | (uint64_t)0;
+    const double val = doc["val"] | 0.0;   // integral or decimal; see send_number
 
     uint8_t sent = 0, failed = 0;
     for (uint8_t i = 0; i < r.member_count; i++) {
@@ -120,7 +121,7 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
         snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
         zigbee_pool_unlock();
 
-        if (zhac_adapter_send_uint(ieee_cp, model_cp, manu_cp, nwk_cp, ep_cp, key, val))
+        if (zhac_adapter_send_number(ieee_cp, model_cp, manu_cp, nwk_cp, ep_cp, key, val))
             sent++;
         else
             failed++;
@@ -216,7 +217,7 @@ bool api_groups_register(httpd_handle_t hd) {
     };
     for (auto& r : routes) {
         u.uri = r.uri; u.method = r.m; u.handler = r.h;
-        httpd_register_uri_handler(hd, &u);
+        auth_register_uri(hd, &u);
     }
     ESP_LOGI(TAG, "group routes registered");
     return true;

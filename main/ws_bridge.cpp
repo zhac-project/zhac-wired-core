@@ -25,6 +25,8 @@
 #include "esp_heap_caps.h"
 #include "zigbee_mgr.h"
 #include "device_backend.h"
+#include "zap_clock.h"
+#include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
 #include "sys_diag.h"
 #include "dgm_store.h"
 #include "zigbee_pool.h"
@@ -38,6 +40,10 @@
 #include "device_options.h"
 #include "api_system.h"
 #include "api_groups.h"
+#include "api_status.h"
+#include "auth.h"
+#include "ha_bridge.h"
+#include "ota_update.h"
 #include "eth.h"
 #include "net_discovery.h"
 #include "radio_state.h"
@@ -57,7 +63,9 @@
 #include "freertos/task.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <sys/time.h>
 #include <cinttypes>
 
 static const char* TAG = "ws_bridge";
@@ -76,6 +84,25 @@ static void send_err(int fd, uint32_t id, const char* err) {
 static void     reply_ok_or_err(int fd, uint32_t id, bool ok, const char* err);
 static uint64_t parse_ieee(const char* s);
 
+// time.set {epoch}: the browser's clock for a hub that has none -- no RTC, and
+// SNTP needs the internet. It fills an unset clock only (zap_clock.h), so a
+// browser can start the schedules of an offline hub but never moves a clock
+// SNTP has set. Reply data {"set":false} means the clock was already set.
+static void cmd_time_set(int fd, uint32_t id, JsonDocument& doc) {
+    const int64_t epoch = doc["args"]["epoch"] | static_cast<int64_t>(0);
+    if (!zap_clock_epoch_ok(epoch)) { send_err(fd, id, "bad epoch"); return; }
+    bool set = false;
+    if (!zap_clock_is_set(time(nullptr))) {
+        const timeval tv{static_cast<time_t>(epoch), 0};
+        set = settimeofday(&tv, nullptr) == 0;
+        if (set) ESP_LOGI(TAG, "clock set from the web UI");
+    }
+    char buf[64];
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"set\":%s}}",
+                           id, set ? "true" : "false");
+    ws_server_reply(fd, buf, n);
+}
+
 static void cmd_ping(int fd, uint32_t id) {
     char buf[96];
     int n = snprintf(buf, sizeof(buf),
@@ -90,18 +117,25 @@ static void cmd_status(int fd, uint32_t id) {
     doc["id"] = id;
     doc["ok"] = true;
     JsonObject d = doc["data"].to<JsonObject>();
-    // Full diagnostics set -- see sys_diag.h. This used to emit six fields
-    // with names of its own, which is why the Info page rendered "—" for
-    // CPU, memory, stack and firmware: the SPA was reading different keys.
-    sys_diag_fill(d, SYS_DIAG_CPU_ONDEMAND);
-    d["zigbee_ok"]      = radio_ok();
-    d["zigbee_present"] = radio_present();
-    // 768 covers the full object with headroom; serializeJson truncates
-    // rather than overflowing, but a truncated reply is invalid JSON and the
-    // page would silently show nothing.
-    char buf[768];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
+    // Same builder as REST /api/status (full sys_diag set + network, MQTT,
+    // auth and `sku`). This used to emit the diagnostics only, so the
+    // Settings page showed every toggle off and the MQTT fields blank.
+    api_status_fill(d);
+    // Same size as the REST reply (api_status.cpp). serializeJson truncates
+    // rather than failing, and a truncated reply is invalid JSON that the
+    // page silently drops -- so refuse loudly instead.
+    constexpr size_t CAP = 2560;
+    char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    size_t n = serializeJson(doc, buf, CAP);
+    if (n == 0 || n >= CAP) {
+        ESP_LOGE(TAG, "status.get overflow: %u B needed", (unsigned)measureJson(doc));
+        heap_caps_free(buf);
+        send_err(fd, id, "status too large");
+        return;
+    }
     ws_server_reply(fd, buf, n);
+    heap_caps_free(buf);
 }
 
 // ── settings.set / token.rotate / diagnostics.unhandled ───────────────
@@ -383,14 +417,15 @@ static void cmd_device_list(int fd, uint32_t id) {
         char row[512];
         int rn = snprintf(row, sizeof(row),
             "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
-            "\"friendly\":\"%s\",\"model\":\"%s\",\"manufacturer\":\"%s\","
-            "\"vendor\":\"%s\","
+            "\"friendly\":\"%s\",\"name\":\"%s\","
+            "\"model\":\"%s\",\"manufacturer\":\"%s\","
+            "\"vendor\":\"%s\",\"model_id\":\"%s\",\"known\":%s,"
             "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
             "\"ep_count\":%u}",
             first ? "" : ",",
             d.ieee_addr, d.nwk_addr,
-            d.friendly_name, model_out, d.manufacturer_name,
-            vendor_out,
+            d.friendly_name, d.friendly_name, model_out, d.manufacturer_name,
+            vendor_out, d.model_id, model_buf[0] ? "true" : "false",
             (int64_t)d.last_seen, d.link_quality, d.battery_pct,
             d.endpoint_count);
         if (rn <= 0 || pos + rn + 4 >= 8 * 1024) break;  // truncate gracefully
@@ -483,6 +518,10 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
             case VAL_INT:
             case VAL_BOOL: attrs[sa[j].key] = sa[j].int_val; break;
             case VAL_STR:  attrs[sa[j].key] = sa[j].str_val; break;
+            // Floats are stored x100; divide at the JSON boundary, as
+            // hap_json does for the dual-chip build. Dropping them here
+            // blanked temperature, humidity, power... on the detail page.
+            case VAL_FLOAT: attrs[sa[j].key] = static_cast<float>(sa[j].int_val) / 100.0f; break;
             default: break;
         }
     }
@@ -524,6 +563,15 @@ static void cmd_device_rename(int fd, uint32_t id, JsonDocument& doc) {
     const char* name   = doc["args"]["name"] | (const char*)nullptr;
     if (!ieee_s) { send_err(fd, id, "missing ieee"); return; }
     if (!name || !name[0]) { send_err(fd, id, "missing name"); return; }
+    // device.list builds its rows with snprintf, not a JSON writer: one quote
+    // or backslash in a name would make the whole list invalid JSON and the
+    // Devices page would go blank. Rules also need names without spaces.
+    for (const char* c = name; *c; c++) {
+        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) {
+            send_err(fd, id, "name may not contain quotes, backslashes or control characters");
+            return;
+        }
+    }
     uint64_t ieee = parse_ieee(ieee_s);
     if (ieee == 0) { send_err(fd, id, "bad ieee"); return; }
 
@@ -537,6 +585,7 @@ static void cmd_device_rename(int fd, uint32_t id, JsonDocument& doc) {
     snprintf(dev->friendly_name, sizeof(dev->friendly_name), "%s", name);
     zap_store_mark_dirty(dev, ZAP_PERSIST_HIGH);
     zigbee_pool_unlock();
+    ha_bridge_device_changed(ieee);   // Home Assistant shows the new name
 
     reply_ok_or_err(fd, id, true, nullptr);
 }
@@ -608,19 +657,19 @@ static void cmd_device_delete(int fd, uint32_t id, JsonDocument& doc) {
 // Mirrors net-core's `api_device_attr_set`. Keys live in the
 // PreparedDefinition's `to_zigbee[]` table; unknown keys return
 // "no zhc converter".
-static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
-    const char* ieee_s = doc["args"]["ieee"] | (const char*)nullptr;
-    const char* key    = doc["args"]["key"]  | (const char*)nullptr;
-    if (!ieee_s || !key) { send_err(fd, id, "missing ieee or key"); return; }
-    uint64_t ieee = parse_ieee(ieee_s);
-    if (ieee == 0) { send_err(fd, id, "bad ieee"); return; }
-
+// Write one attribute through the device's converter. Shared by the WS
+// command below and Home Assistant commands arriving over MQTT (ha_glue.cpp).
+// On failure `*err` names the reason in the same words the WS reply uses.
+bool ws_bridge_attr_set(uint64_t ieee, const char* key, JsonVariantConst v,
+                        const char** err) {
+    const char* e = nullptr;
+    const char** err_out = err ? err : &e;
     zigbee_pool_lock();
     ZapDevice* dev = pool_find_by_ieee(ieee);
     if (!dev) {
         zigbee_pool_unlock();
-        send_err(fd, id, "device not found");
-        return;
+        *err_out = "device not found";
+        return false;
     }
     const uint64_t ieee_cp = dev->ieee_addr;
     const uint16_t nwk_cp  = dev->nwk_addr;
@@ -631,8 +680,6 @@ static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
     snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
     snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
     zigbee_pool_unlock();
-
-    JsonVariantConst v = doc["args"]["value"];
     bool ok = false;
     if (v.is<bool>()) {
         ok = zhac_adapter_send_bool(ieee_cp, model_cp, manu_cp,
@@ -645,11 +692,16 @@ static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
         ok = zhac_adapter_send_uint(ieee_cp, model_cp, manu_cp,
                                      nwk_cp, ep_cp, key,
                                      v.as<uint64_t>());
+    } else if (v.is<float>()) {
+        // A decimal (21.5): the converter scales it; an integer-only
+        // converter refuses it, and that comes back as "no zhc converter"
+        // instead of a silently truncated 21.
+        ok = zhac_adapter_send_number(ieee_cp, model_cp, manu_cp,
+                                       nwk_cp, ep_cp, key, v.as<double>());
     } else {
-        send_err(fd, id, "value must be bool / number / string");
-        return;
+        *err_out = "value must be bool / number / string";
+        return false;
     }
-
     // Optimistic shadow update (mirrors main-core hap_dispatch on the dual-chip;
     // mono has no P4 to do it). No-report Tuya LED drivers send no attribute
     // report after a command, so without this the SPA + cloud never reflect the
@@ -665,10 +717,29 @@ static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
             device_shadow_update_optimistic(ieee_cp, key, vt,
                                             (int32_t)v.as<long long>());
         }
+        else if (v.is<float>()) {   // shadow keeps decimals as VAL_FLOAT ×100
+            device_shadow_update_optimistic(ieee_cp, key, VAL_FLOAT,
+                                            (int32_t)lround(v.as<double>() * 100.0));
+        }
+    } else {
+        *err_out = "no zhc converter";
     }
-    reply_ok_or_err(fd, id, ok, "no zhc converter");
+    return ok;
 }
 
+static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
+    const char* ieee_s = doc["args"]["ieee"] | (const char*)nullptr;
+    const char* key    = doc["args"]["key"]  | (const char*)nullptr;
+    if (!ieee_s || !key) { send_err(fd, id, "missing ieee or key"); return; }
+    uint64_t ieee = parse_ieee(ieee_s);
+    if (ieee == 0) { send_err(fd, id, "bad ieee"); return; }
+    const char* err = nullptr;
+    if (ws_bridge_attr_set(ieee, key, doc["args"]["value"], &err)) {
+        reply_ok_or_err(fd, id, true, nullptr);
+    } else {
+        send_err(fd, id, err ? err : "failed");
+    }
+}
 // ── device.options.set ────────────────────────────────────────────────
 //
 // args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?,
@@ -862,6 +933,15 @@ static void cmd_groups_all(int fd, uint32_t id) {
 // Answering "none" is the truthful answer and makes the SPA render its correct
 // "RainMaker bridging is off" copy instead of an error. There is deliberately
 // no uplink.set: there is nothing here to switch to.
+// ota.update {url} — see ota_update.h. Replies at once; progress follows as
+// ota.start / ota.progress / ota.complete events (target "self").
+static void cmd_ota_update(int fd, uint32_t id, JsonDocument& doc) {
+    const char* url = doc["args"]["url"] | (const char*)nullptr;
+    const char* err = nullptr;
+    if (ota_update_start(url, &err)) reply_ok_or_err(fd, id, true, nullptr);
+    else                             send_err(fd, id, err ? err : "failed");
+}
+
 static void cmd_uplink_get(int fd, uint32_t id) {
     char buf[96];
     int n = snprintf(buf, sizeof(buf),
@@ -1075,9 +1155,25 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     const char* cmd = doc["cmd"] | (const char*)nullptr;
     if (!cmd) { send_err(fd, id, "missing cmd"); return; }
 
+    // With auth on, a browser socket must send {"cmd":"auth","args":{"token":
+    // ...}} before anything else runs -- the token rides a frame, never the
+    // URL (as on the dual-chip S3). fd < 0 is the remote relay, which has its
+    // own authentication.
+    if (auth_enabled() && fd >= 0 && !ws_server_fd_is_authed(fd)) {
+        const bool is_auth = std::strcmp(cmd, "auth") == 0;
+        if (is_auth && auth_check_token(doc["args"]["token"] | "")) {
+            ws_server_fd_set_authed(fd);
+            reply_ok_or_err(fd, id, true, nullptr);
+        } else {
+            send_err(fd, id, is_auth ? "auth failed" : "auth required");
+        }
+        return;
+    }
+    if (std::strcmp(cmd, "auth")               == 0) { reply_ok_or_err(fd, id, true, nullptr); return; }
     if (std::strcmp(cmd, "ping")               == 0) { cmd_ping(fd, id);   return; }
     if (std::strcmp(cmd, "status")             == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "status.get")         == 0) { cmd_status(fd, id); return; }
+    if (std::strcmp(cmd, "time.set")           == 0) { cmd_time_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id);              return; }
     if (std::strcmp(cmd, "device.get")         == 0) { cmd_device_get(fd, id, doc);          return; }
     if (std::strcmp(cmd, "device.rename")      == 0) { cmd_device_rename(fd, id, doc);       return; }
@@ -1120,6 +1216,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
     if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
     if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }
+    if (std::strcmp(cmd, "ota.update")          == 0) { cmd_ota_update(fd, id, doc);         return; }
     if (std::strcmp(cmd, "device.groups.list")  == 0) { cmd_device_groups_list(fd, id, doc);  return; }
     if (std::strcmp(cmd, "device.groups.add")   == 0) { cmd_device_groups_add_remove(fd, id, doc, false); return; }
     if (std::strcmp(cmd, "device.groups.remove")== 0) { cmd_device_groups_add_remove(fd, id, doc, true);  return; }
@@ -1170,14 +1267,18 @@ static void on_zcl_attr(const Event& e) {
     d["key"]      = z.key;
     switch (z.val_type) {
         case VAL_INT:
-        case VAL_BOOL: d["value"] = z.int_val; break;
-        case VAL_STR:  d["value"] = z.str_val; break;
+        case VAL_BOOL:  d["value"] = z.int_val; break;
+        case VAL_STR:   d["value"] = z.str_val; break;
+        case VAL_FLOAT: d["value"] = static_cast<float>(z.int_val) / 100.0f; break;  // stored x100
         default: break;
     }
     d["nwk"]      = z.nwk;
     d["ep"]       = z.ep;
     d["cluster"]  = z.cluster;
     d["attr_id"]  = z.attr_id;
+    // The web UI takes this as the device's "last seen". Left out while the
+    // clock is unset, so the UI keeps the value it has.
+    if (const uint32_t t = esp_zigbee_backend_wall_clock_s()) d["ts"] = t;
     char buf[288];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     ws_server_broadcast(buf, n);

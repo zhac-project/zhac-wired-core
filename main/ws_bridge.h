@@ -3,10 +3,16 @@
 #pragma once
 
 #include <ArduinoJson.h>
+#include <cstdint>
 
 // Wire the WS rx dispatcher + outbound event_bus pushes. Must run
 // AFTER ws_server_init() and event_bus_init().
 void ws_bridge_install();
+
+// Write one attribute through the device's converter (the WS `device.attr.set`
+// core, also used for Home Assistant commands). `v`: bool, integer or string.
+// On failure `*err` (if given) names the reason.
+bool ws_bridge_attr_set(uint64_t ieee, const char* key, JsonVariantConst v, const char** err);
 
 // Broadcast a push event to all WS clients (+ relay mirror).
 // data is the payload that becomes {"event": event, "data": data}.

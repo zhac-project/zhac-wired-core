@@ -11,6 +11,7 @@
 //   POST   /api/scripts/<name>/check     — body = source; returns {ok,err,line}
 //
 // Names are alphanum + `_-`, ≤24 chars; enforced by lua_script_cache.
+#include "auth.h"
 #include "api_scripts.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -184,13 +185,13 @@ bool api_scripts_register(httpd_handle_t hd) {
     httpd_uri_t u{};
 
     u.uri = "/api/scripts"; u.method = HTTP_GET; u.handler = handle_get_scripts;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     u.uri = "/api/scripts/*"; u.handler = handle_scripts_item;
-    u.method = HTTP_GET;    httpd_register_uri_handler(hd, &u);
-    u.method = HTTP_PUT;    httpd_register_uri_handler(hd, &u);
-    u.method = HTTP_DELETE; httpd_register_uri_handler(hd, &u);
-    u.method = HTTP_POST;   httpd_register_uri_handler(hd, &u);
+    u.method = HTTP_GET;    auth_register_uri(hd, &u);
+    u.method = HTTP_PUT;    auth_register_uri(hd, &u);
+    u.method = HTTP_DELETE; auth_register_uri(hd, &u);
+    u.method = HTTP_POST;   auth_register_uri(hd, &u);
 
     ESP_LOGI(TAG, "/api/scripts CRUD + /run + /check registered");
     return true;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#include "auth.h"
 #include "api_system.h"
 
 #include <cinttypes>
@@ -10,7 +11,8 @@
 
 #include "ArduinoJson.h"
 #include "esp_log.h"
-#include "mqtt_gw.h"
+#include "mqtt_glue.h"
+#include "ntp_cfg.h"
 #include "sys_state.h"
 #include "zigbee_diagnostics.h"
 #include "log_ring.h"
@@ -24,18 +26,14 @@ bool system_apply_settings(const char* json, size_t len) {
     JsonDocument doc;
     if (deserializeJson(doc, json, len)) return false;
 
-    // MQTT — the mqtt_gw setters self-persist (NVS mqtt_cfg) and restart the
-    // client as needed, so we just forward.
-    if (doc["broker_url"].is<const char*>())
-        mqtt_gw_set_broker_url(doc["broker_url"].as<const char*>());
-    if (doc["mqtt_root_topic"].is<const char*>())
-        mqtt_gw_set_root_topic(doc["mqtt_root_topic"].as<const char*>());
-    if (doc["mqtt_client_id"].is<const char*>())
-        mqtt_gw_set_client_id(doc["mqtt_client_id"].as<const char*>());
-    if (doc["mqtt_enabled"].is<bool>()) {
-        if (doc["mqtt_enabled"].as<bool>()) mqtt_gw_on_sta_up();
-        else                                 mqtt_gw_stop();
-    }
+    // MQTT + Home Assistant discovery: persisted in NVS mqtt_cfg and applied
+    // by mqtt_glue. (The mqtt_gw setters alone do NOT persist -- settings used
+    // to vanish on reboot.)
+    mqtt_glue_apply_settings(doc);
+
+    // Time server: ntp_cfg persists it and restarts SNTP, no reboot.
+    if (doc["ntp_server"].is<const char*>() &&
+        !ntp_cfg_set_server(doc["ntp_server"].as<const char*>())) return false;
 
     // System flags (sys_state persists + applies).
     if (doc["timezone"].is<const char*>())
@@ -144,23 +142,23 @@ bool api_system_register(httpd_handle_t hd) {
 
     u.uri = "/api/settings"; u.method = HTTP_POST;
     u.handler = handle_settings_set;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     u.uri = "/api/token/rotate"; u.method = HTTP_POST;
     u.handler = handle_token_rotate;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     u.uri = "/api/system/token/rotate"; u.method = HTTP_POST;   // net-core URI alias
     u.handler = handle_token_rotate;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     u.uri = "/api/diagnostics/unhandled"; u.method = HTTP_GET;
     u.handler = handle_diagnostics_unhandled;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     u.uri = "/api/logs"; u.method = HTTP_GET;
     u.handler = handle_logs_get;
-    httpd_register_uri_handler(hd, &u);
+    auth_register_uri(hd, &u);
 
     ESP_LOGI(TAG, "settings / token / diagnostics routes registered");
     return true;

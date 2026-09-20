@@ -59,22 +59,14 @@ endif()
 set(COMPONENTS main)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# This SKU has no S3 to forward MQTT to: link mqtt_gw's real client (see
+# zhac-components/components/mqtt_gw/CMakeLists.txt). After project.cmake,
+# which defines idf_build_set_property; before project(), which expands
+# the components that read it.
+idf_build_set_property(ZHAC_MQTT_GW_LOCAL_CLIENT 1)
 project(zhac-wired-core)
 
-# SPA -> "spa" SPIFFS partition image, built from the sibling www-spa output.
-# Run `npm run build` in www-spa FIRST: `idf.py build` never runs it, so a
-# stale or empty partition is otherwise silent. FLASH_IN_PROJECT makes
-# `idf.py flash` write it. Guarded so the firmware still builds with an empty
-# spa partition when dist/ is absent.
-#
-# Unlike zhac-net-core this repo has NO www-spa submodule; it consumes the
-# sibling checkout directly. Do not add a submodule to "match" net-core -- a
-# second checkout is exactly what causes the stale-SPIFFS trap there.
-set(ZHAC_SPA_DIST "${CMAKE_CURRENT_LIST_DIR}/../www-spa/dist")
-if(EXISTS "${ZHAC_SPA_DIST}/index.html")
-    spiffs_create_partition_image(spa "${ZHAC_SPA_DIST}" FLASH_IN_PROJECT)
-    message(STATUS "ZHAC: SPA image <- ${ZHAC_SPA_DIST}")
-else()
-    message(WARNING "ZHAC: ${ZHAC_SPA_DIST}/index.html not found — 'spa' partition "
-                    "will be empty. Build www-spa (npm run build), then reflash.")
-endif()
+# The web UI (www-spa dist/) is packed into the app image by main/CMakeLists.txt
+# (tools/pack_spa.py), not into a SPIFFS partition: an OTA update then carries
+# firmware and UI together. Run `npm run build` in ../www-spa first; without
+# dist/ the firmware still builds and serves a "web UI not built" note.

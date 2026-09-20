@@ -3,8 +3,9 @@
 #pragma once
 #include "esp_http_server.h"
 
-// Mount the SPIFFS partition labelled `spa` at /spa. Safe to call once
-// at boot; idempotent on success. Returns true iff mounted.
+// Check the web UI pack embedded in the app image (tools/pack_spa.py).
+// Returns false if the firmware was built without a www-spa dist/ — pages
+// then answer with a "web UI not built" note; REST and WS still work.
 bool spa_mount();
 
 // Register the SPA catchall handler against the given httpd. Must run
