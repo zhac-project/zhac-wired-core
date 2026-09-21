@@ -10,6 +10,10 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Changed
 
+- **Home Assistant: thermostats, covers, locks, fans and buttons become their own entity
+  types**, and battery devices turn unavailable after a day of silence (zhac-components
+  `ha_bridge`). Soft-deleting a device now removes it from Home Assistant too.
+
 - **Rule pushes come from the rule engine, not the transport.** `rule.added` / `rule.updated`
   / `rule.deleted` are built from the `RULE_CHANGED` event, so a rule created, edited, toggled
   or deleted over REST or by a backup restore now updates open Rules pages and the cloud relay;

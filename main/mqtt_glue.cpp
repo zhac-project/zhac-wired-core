@@ -127,7 +127,8 @@ bool with_device(uint64_t ieee, HaDeviceCb cb, void* ctx) {
     if (serializeJson(a, attrs, kAttrs) >= kAttrs) snprintf(attrs, kAttrs, "{}");
 
     const HaDeviceSnapshot snap{ieee, dev.friendly_name, vendor[0] ? vendor : dev.manufacturer_name,
-                                model[0] ? model : dev.model_id, exposes, attrs};
+                                model[0] ? model : dev.model_id, exposes, attrs,
+                                ha_battery_powered(dev.power_source)};
     cb(snap, ctx);
     heap_caps_free(exposes);
     heap_caps_free(attrs);
