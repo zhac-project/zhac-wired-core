@@ -57,6 +57,8 @@ dependencies:
   # flavour this SKU needs. 2.0.1 has no esp32s31 libraries at all.
   espressif/esp-zigbee-lib: "^2.0.4"
 
+  espressif/led_strip: "^3.0.0"
+
   # -- zhac-net-core (not on EXTRA_COMPONENT_DIRS; named explicitly) ----------
 
   ws_server:

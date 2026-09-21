@@ -303,3 +303,9 @@ build-breaking rather than conventions nobody reads.
 ## Licence
 
 AGPL-3.0-or-later, matching the other firmware cores. SPDX headers are enforced.
+
+## Status LED
+
+Boards with an addressable RGB LED (`CONFIG_ZHAC_STATUS_LED_GPIO`; the ESP32-S31 dev board has
+one on GPIO 60) show: **green blink** while the join window is open, **blue flash** on Zigbee
+traffic, off otherwise.

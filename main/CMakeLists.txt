@@ -53,6 +53,7 @@ idf_component_register(
         "api_rules.cpp"
         "api_scripts.cpp"
         "api_system.cpp"
+        "status_led.cpp"
     INCLUDE_DIRS "."
     # Moves zhc_adapter's ~105 KB of lookup-table .bss to PSRAM. Without it the
     # esp32s31 build has too little internal DRAM left for EMAC DMA descriptors
@@ -111,6 +112,7 @@ idf_component_register(
         device_backend
         zhc_adapter
         device_cmd
+        led_strip
         simple_rules
         rule_store
         cron_parser

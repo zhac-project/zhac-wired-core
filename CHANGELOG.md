@@ -88,6 +88,10 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **Status LED.** The board's addressable RGB LED (`CONFIG_ZHAC_STATUS_LED_GPIO`, 60 on the
+  S31 dev board, off on boards without one) blinks green while the join window is open and
+  flashes blue on Zigbee traffic (a report, a raw frame, a join).
+
 - **`diag.tasks` + a Tasks card on the Diag page**: every task with its CPU share over the last
   five seconds, the core it is pinned to, priority and stack headroom, so "core 0 sits at 25 %"
   gets a name. `CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y` supplies the core.

@@ -168,4 +168,12 @@ menu "ZHAC wired-core board"
             holds, so the C6 is flashed once through its own header; see
             README "Zigbee radio (ESP32-C6)" and tools/build-rcp.sh.
 
+    config ZHAC_STATUS_LED_GPIO
+        int "Status LED GPIO (one addressable WS2812 RGB LED), -1 = none"
+        default 60 if IDF_TARGET_ESP32S31
+        default -1
+        help
+            Green blink while the join window is open, blue flash on Zigbee
+            traffic, off otherwise. The S31 dev board has one on GPIO 60.
+
 endmenu

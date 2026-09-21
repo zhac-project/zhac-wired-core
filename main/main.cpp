@@ -68,6 +68,7 @@
 #include "remote_client.h"
 #include "simple_rules.h"
 #include "device_cmd.h"
+#include "status_led.h"
 #include "ha_bridge.h"
 #include "spa_serve.h"
 #include "sys_state.h"
@@ -172,6 +173,7 @@ extern "C" void app_main() {
     // into it, then the NVS-backed stores, then the device-definition adapter.
     // The radio registers itself against this pipeline immediately below.
     event_bus_init();
+    status_led_start();   // the board's RGB LED: green = join open, blue = Zigbee traffic
     zap_store_init();
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
