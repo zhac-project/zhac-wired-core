@@ -26,6 +26,7 @@
 #include "device_cmd_json.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "sys_tasks.h"
 #include "zigbee_mgr.h"
 #include "device_backend.h"
 #include "zap_clock.h"
@@ -114,6 +115,38 @@ static void cmd_ping(int fd, uint32_t id) {
                      "\"uptime_s\":%" PRIu32 "}",
                      id, (uint32_t)(esp_timer_get_time() / 1000000));
     ws_server_reply(fd, buf, n);
+}
+
+// ── diag.tasks ───────────────────────────────────
+// Every task with its CPU share since the previous call, core, priority and
+// stack headroom -- the Diag page's answer to "what is core 0 doing".
+static void cmd_diag_tasks(int fd, uint32_t id) {
+    constexpr size_t kRows = 48;
+    auto* rows = static_cast<SysTaskRow*>(heap_caps_malloc(sizeof(SysTaskRow) * kRows, MALLOC_CAP_SPIRAM));
+    if (!rows) { send_err(fd, id, "oom"); return; }
+    const size_t n = sys_tasks_snapshot(rows, kRows);
+    JsonDocument doc;
+    doc["id"] = id;
+    doc["ok"] = true;
+    JsonObject d = doc["data"].to<JsonObject>();
+    d["cores"] = portNUM_PROCESSORS;
+    JsonArray arr = d["tasks"].to<JsonArray>();
+    for (size_t i = 0; i < n; i++) {
+        JsonObject t = arr.add<JsonObject>();
+        t["name"] = rows[i].name;   // char[]: copied
+        t["core"] = rows[i].core;
+        t["cpu"]  = rows[i].cpu_pct;
+        t["prio"] = rows[i].prio;
+        t["stack_free"] = rows[i].stack_free;
+    }
+    heap_caps_free(rows);
+    constexpr size_t CAP = 4096;
+    char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    const size_t len = serializeJson(doc, buf, CAP);
+    if (len == 0 || len >= CAP) { heap_caps_free(buf); send_err(fd, id, "too large"); return; }
+    ws_server_reply(fd, buf, len);
+    heap_caps_free(buf);
 }
 
 static void cmd_status(int fd, uint32_t id) {
@@ -1067,6 +1100,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "ping")               == 0) { cmd_ping(fd, id);   return; }
     if (std::strcmp(cmd, "status")             == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "status.get")         == 0) { cmd_status(fd, id); return; }
+    if (std::strcmp(cmd, "diag.tasks")         == 0) { cmd_diag_tasks(fd, id); return; }
     if (std::strcmp(cmd, "time.set")           == 0) { cmd_time_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id);              return; }
     if (std::strcmp(cmd, "device.get")         == 0) { cmd_device_get(fd, id, doc);          return; }

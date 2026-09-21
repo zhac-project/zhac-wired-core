@@ -85,6 +85,10 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **`diag.tasks` + a Tasks card on the Diag page**: every task with its CPU share over the last
+  five seconds, the core it is pinned to, priority and stack headroom, so "core 0 sits at 25 %"
+  gets a name. `CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y` supplies the core.
+
 - **Time from the router.** When no time server is named, the hub asks the router for one
   (DHCP option 42) and uses it before `pool.ntp.org`; status reports it as `ntp_dhcp_server`
   and the Settings Time card says so. A hub on a network without internet access then keeps
