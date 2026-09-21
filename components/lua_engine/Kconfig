@@ -23,7 +23,7 @@ config LUA_ENGINE_INTERNAL_SMALL_THRESHOLD
     int "Internal-RAM threshold for small allocations (bytes)"
     depends on LUA_ENGINE_ENABLED
     default 512
-    range 64 4096
+    range 0 4096
 
 config LUA_ENGINE_MAX_COROUTINES
     int "Max live coroutines"

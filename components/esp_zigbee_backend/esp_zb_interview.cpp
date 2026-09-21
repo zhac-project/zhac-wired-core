@@ -49,6 +49,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "task_stacks.h"
 #include "zap_common.h"
 #include "zap_store.h"
@@ -536,12 +537,12 @@ void zb_interview_init() {
     if (s_join_q) return;
     s_step_sem  = xSemaphoreCreateBinary();
     s_basic_sem = xSemaphoreCreateBinary();
-    s_join_q    = xQueueCreate(16, sizeof(JoinReq));
+    s_join_q    = zhac_queue_create(16, sizeof(JoinReq));
     if (!s_step_sem || !s_basic_sem || !s_join_q) {
         ESP_LOGE(TAG, "alloc failed -- joins will not be interviewed");
         return;
     }
-    if (xTaskCreate(task_interview, "TaskZbIv", zhac::stack::kZbInterview,
+    if (zhac_task_create(task_interview, "TaskZbIv", zhac::stack::kZbInterview,
                     nullptr, 4, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "TaskZbIv create failed -- joins will not be interviewed");
         return;

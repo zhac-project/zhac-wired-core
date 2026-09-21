@@ -45,6 +45,7 @@
 #include "ezbee/platform/radio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "task_stacks.h"
@@ -333,7 +334,8 @@ static void task_zigbee(void*) {
     ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting, to avoid "
                   "a boot loop. /api/status reports the radio as down.",
              (long long)uptime_s, kMainloopRebootMinUptimeS);
-    vTaskDelete(nullptr);
+    vTaskDelete(nullptr);   // PSRAM-stack task (zhac_task_create): the stack is not
+                            // reclaimed on this dead-radio endpoint, and need not be
 }
 
 // ── Boot guard: a radio that kills the chip must not kill the hub ─────────
@@ -477,7 +479,7 @@ static bool zb_init() {
         return false;
     }
 
-    if (xTaskCreate(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
+    if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
                     nullptr, 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
         return false;

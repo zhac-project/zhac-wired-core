@@ -107,3 +107,19 @@ CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
 # Every socket died with "httpd_ws: Failed to setup SHA-1 operation" and the web UI
 # had no live data. Software SHA until the driver supports it.
 CONFIG_MBEDTLS_HARDWARE_SHA=n
+
+# ── Internal DRAM budget ────────────────────────────────────────────────
+# 228 KB free at boot, 5 KB by the time mqtt_client started its task
+# ("Error create mqtt task"); OTA would have failed the same way. The
+# firmware executes from PSRAM (SPIRAM_XIP_FROM_PSRAM above), so task stacks
+# and queues can live there: zhac_task.h routes our own tasks, the options
+# below cover the IDF-side consumers. The "int-heap after <step>" boot lines
+# show the budget per init step.
+CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=0
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_OUTBOX_DATA_ON_EXTERNAL_MEMORY=y
+CONFIG_MQTT_TASK_STACK_ON_EXTERNAL_MEMORY=y
+CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

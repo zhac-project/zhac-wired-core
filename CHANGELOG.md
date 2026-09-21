@@ -10,6 +10,7 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Fixed
 
+- S31: internal DRAM exhausted ~10 s after boot (228 KB → 5 KB: Zigbee init 63 KB, Lua 57 KB, Ethernet 30 KB, httpd 22 KB, then task stacks) so `mqtt_client: Error create mqtt task` and any later task (OTA) failed. Task stacks + queues now live in PSRAM (`zhac_task.h`, TaskEventBus, TaskZigbee, TaskZbIv, httpd via `task_caps`), Lua small allocations go to PSRAM (`LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=0`), mDNS task/memory, MQTT outbox/buffers and mbedTLS allocate from PSRAM. Boot log prints `int-heap after <step>` per init step.
 - **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
   publish instead of polling every 20 ms (shared `event_bus_pump_run`).
 

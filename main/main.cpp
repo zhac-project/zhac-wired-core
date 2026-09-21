@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -119,6 +120,14 @@ static void log_heap_info() {
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
 
+// One line per boot step: where the internal DRAM goes (the S31 ran out of it
+// ~10 s after boot and late tasks such as mqtt_client failed to start).
+static void heap_mark(const char* step) {
+    ESP_LOGI(TAG, "int-heap after %s: free=%u largest=%u", step,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 // ── Event-bus pump ───────────────────────────────────────────────────
 // The event bus delivers into per-subscriber queues; NOTHING runs a
 // subscriber until a pump task drains its type. On dual-chip this pump lives
@@ -174,11 +183,13 @@ extern "C" void app_main() {
     // The radio registers itself against this pipeline immediately below.
     event_bus_init();
     status_led_start();   // the board's RGB LED: green = join open, blue = Zigbee traffic
+    heap_mark("status_led");
     zap_store_init();
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
     device_shadow_init();
     zhac_adapter_init();
+    heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
 
     // ── Radio ────────────────────────────────────────────────────────
@@ -228,6 +239,7 @@ extern "C" void app_main() {
     // lets a rule's `script.run` action push onto the Lua scheduler. Script
     // loading is deferred to the end of app_main so a script touching the
     // network or HTTP stack at top level cannot race it.
+    heap_mark("zigbee");
     simple_rules_init();
     // What follows a device rename, in one place: rules re-resolve names and
     // Home Assistant sees the new one (device_cmd cannot call either itself).
@@ -236,6 +248,7 @@ extern "C" void app_main() {
         ha_bridge_device_changed(ieee);
     });
     const bool lua_ok = lua_engine_init();
+    heap_mark("lua");
     if (!lua_ok) {
         ESP_LOGW(TAG, "lua_engine_init returned false -- scripts disabled");
     }
@@ -243,6 +256,7 @@ extern "C" void app_main() {
 
     // ── Network ──────────────────────────────────────────────────────
     eth_start();
+    heap_mark("eth");
     // After eth_start (esp_netif_init made the TCP/IP thread; the DHCP-option
     // switch runs inside it) and before the first lease lands, which takes the
     // link a second or more: lets lwIP hand the router's time server to SNTP.
@@ -260,6 +274,7 @@ extern "C" void app_main() {
     // handle. Unlike mono there is no placeholder "/" handler -- it would
     // shadow the SPA's index, and spa_register()'s catchall already serves "/".
     ws_server_init();
+    heap_mark("ws_server");
     httpd_handle_t hd = ws_server_get_handle();
     if (hd) {
         api_status_register(hd);
@@ -301,13 +316,16 @@ extern "C" void app_main() {
         }, nullptr);
 #endif
     remote_client_init();   // no-op stub when remote disabled; reads NVS
+    heap_mark("remote_client");
 
     // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
     // inbound messages feed rules / Lua / Home Assistant. With no broker
     // configured it idles. Boots cleanly either way.
     mqtt_glue_start();
+    heap_mark("mqtt_glue");
     ota_update_init();   // ota.update + keep a fresh image once it proves healthy
     metrics_mqtt_publisher_start();   // no-op if the exporter is off
+    heap_mark("metrics");
 
     if (lua_ok) {
         // Safe now: every subsystem a script might call into is initialised.
@@ -322,12 +340,13 @@ extern "C" void app_main() {
     // execute_rule in THIS task's context, so it needs the same depth; a
     // smaller stack risks a runtime overflow. Priority 2 sits below lwIP so
     // networking stays responsive.
-    if (xTaskCreate(task_event_bus, "TaskEventBus", zhac::stack::kEventBus,
+    if (zhac_task_create(task_event_bus, "TaskEventBus", zhac::stack::kEventBus,
                     nullptr, 2, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "TaskEventBus create FAILED -- event subscribers inert");
     } else {
         sys_set_event_task_ok(true);   // the post-update health check asks for this
         ESP_LOGI(TAG, "TaskEventBus up -- event subscribers now serviced");
+        heap_mark("TaskEventBus");
     }
 
     int tick = 0;
