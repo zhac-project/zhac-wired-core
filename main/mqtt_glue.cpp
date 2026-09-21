@@ -19,6 +19,7 @@
 #include "device_shadow.h"
 #include "ha_bridge.h"
 #include "mqtt_gw.h"
+#include "mqtt_gw_cfg.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "ws_bridge.h"
@@ -29,54 +30,6 @@
 static const char* TAG = "mqtt_glue";
 
 namespace {
-
-constexpr const char* kNs = "mqtt_cfg";   // same namespace + keys as net-core
-
-struct Cfg {
-    uint8_t enabled = 0;
-    char    url[128] = {};
-    char    root[32] = {};
-    char    cid[32]  = {};
-};
-
-Cfg read_cfg() {
-    Cfg c;
-    nvs_handle_t h;
-    if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) return c;
-    nvs_get_u8(h, "enabled", &c.enabled);
-    size_t n = sizeof(c.url);  nvs_get_str(h, "broker_url", c.url, &n);
-    n = sizeof(c.root);        nvs_get_str(h, "root_topic", c.root, &n);
-    n = sizeof(c.cid);         nvs_get_str(h, "client_id", c.cid, &n);
-    nvs_close(h);
-    return c;
-}
-
-void write_str(const char* key, const char* v) {
-    nvs_handle_t h;
-    if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_str(h, key, v);
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-void write_u8(const char* key, uint8_t v) {
-    nvs_handle_t h;
-    if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u8(h, key, v);
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-// mqtt://user:pass@host:1883 -> mqtt://host:1883, for status and logs.
-void strip_userinfo(const char* in, char* out, size_t cap) {
-    out[0] = '\0';
-    if (!in || !in[0]) return;
-    const char* sep  = strstr(in, "://");
-    const char* host = sep ? sep + 3 : in;
-    const char* at   = nullptr;
-    for (const char* p = host; *p && *p != '/'; ++p) if (*p == '@') at = p;
-    snprintf(out, cap, "%.*s%s", (int)(host - in), in, at ? at + 1 : host);
-}
 
 // ── Home Assistant data source ────────────────────────────────────────────
 
@@ -205,14 +158,7 @@ void on_got_ip(void*, esp_event_base_t, int32_t, void*) {
 
 void mqtt_glue_start() {
     mqtt_gw_init();
-    const Cfg c = read_cfg();
-    if (c.root[0]) mqtt_gw_set_root_topic(c.root);
-    if (c.enabled && c.url[0]) mqtt_gw_configure(c.url, c.root, c.cid);
-    else if (c.cid[0])         mqtt_gw_set_client_id(c.cid);
-    char safe[128];
-    strip_userinfo(c.url, safe, sizeof(safe));
-    ESP_LOGI(TAG, "MQTT %s broker=%s root=%s", (c.enabled && c.url[0]) ? "enabled" : "disabled",
-             safe[0] ? safe : "(none)", mqtt_gw_get_root_topic());
+    mqtt_gw_cfg_boot();   // shared with mono: NVS settings, root topic, client id, arm if enabled
 
     mqtt_gw_set_rx_callback(on_mqtt_rx);
     char sub[48];
@@ -240,27 +186,7 @@ void mqtt_glue_start() {
 }
 
 void mqtt_glue_apply_settings(JsonDocument& doc) {
-    const char* url  = doc["broker_url"]      | (const char*)nullptr;
-    const char* root = doc["mqtt_root_topic"] | (const char*)nullptr;
-    const char* cid  = doc["mqtt_client_id"]  | (const char*)nullptr;
-    if (root && root[0] && strlen(root) < 32) { write_str("root_topic", root); mqtt_gw_set_root_topic(root); }
-    if (cid && cid[0] && strlen(cid) < 32)    { write_str("client_id", cid);   mqtt_gw_set_client_id(cid); }
-    if (url && url[0] && strlen(url) < 127) {
-        write_str("broker_url", url);
-        // Only a running client picks it up now; a disabled one gets it from
-        // NVS when enabled (mqtt_gw_configure would arm it).
-        if (read_cfg().enabled) mqtt_gw_set_broker_url(url);
-    }
-    if (doc["mqtt_enabled"].is<bool>()) {
-        const bool en = doc["mqtt_enabled"].as<bool>();
-        write_u8("enabled", en ? 1 : 0);
-        if (en) {
-            const Cfg c = read_cfg();
-            if (c.url[0]) { mqtt_gw_configure(c.url, c.root, c.cid); mqtt_gw_on_sta_up(); }
-        } else {
-            mqtt_gw_stop();
-        }
-    }
+    mqtt_gw_cfg_apply(doc);
     if (doc["ha_discovery"].is<bool>() || doc["ha_prefix"].is<const char*>()) {
         const bool en = doc["ha_discovery"] | ha_bridge_enabled();
         ha_bridge_configure(en, doc["ha_prefix"] | ha_bridge_prefix());
@@ -268,12 +194,7 @@ void mqtt_glue_apply_settings(JsonDocument& doc) {
 }
 
 void mqtt_glue_fill_status(JsonObject d) {
-    const Cfg c = read_cfg();
-    char safe[128];
-    strip_userinfo(c.url, safe, sizeof(safe));
-    d["mqtt_enabled"]   = c.enabled != 0;
-    d["mqtt_broker"]    = safe;
-    d["mqtt_client_id"] = c.cid;
-    d["ha_discovery"]   = ha_bridge_enabled();
-    d["ha_prefix"]      = ha_bridge_prefix();
+    mqtt_gw_cfg_fill_status(d);
+    d["ha_discovery"] = ha_bridge_enabled();
+    d["ha_prefix"]    = ha_bridge_prefix();
 }

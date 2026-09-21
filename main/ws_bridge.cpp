@@ -521,7 +521,7 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
         switch (sa[j].val_type) {
             case VAL_INT:
             case VAL_BOOL: attrs[sa[j].key] = sa[j].int_val; break;
-            case VAL_STR:  attrs[sa[j].key] = sa[j].str_val; break;
+            case VAL_STR: { char sv[ATTR_STR_MAX + 1] = {}; memcpy(sv, sa[j].str_val, ATTR_STR_MAX); attrs[sa[j].key] = sv; break; }   // str_val need not end in NUL
             // Floats are stored x100; divide at the JSON boundary, as
             // hap_json does for the dual-chip build. Dropping them here
             // blanked temperature, humidity, power... on the detail page.
@@ -1160,10 +1160,15 @@ static void on_zcl_attr(const Event& e) {
     snprintf(ieee_s, sizeof(ieee_s), "0x%016" PRIX64, z.ieee);
     d["ieee"]     = ieee_s;
     d["key"]      = z.key;
+    // str_val need not end in NUL (ATTR_STR_MAX bytes exactly): handed to
+    // ArduinoJson as-is it read on into the stack, and the value on the wire
+    // became the previous push's own JSON text.
+    char sval[ATTR_STR_MAX + 1] = {};
+    if (z.val_type == VAL_STR) memcpy(sval, z.str_val, ATTR_STR_MAX);
     switch (z.val_type) {
         case VAL_INT:
         case VAL_BOOL:  d["value"] = z.int_val; break;
-        case VAL_STR:   d["value"] = z.str_val; break;
+        case VAL_STR:   d["value"] = sval; break;
         case VAL_FLOAT: d["value"] = static_cast<float>(z.int_val) / 100.0f; break;  // stored x100
         default: break;
     }

@@ -101,3 +101,9 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 # header-authenticated client would have to re-auth by message. Enabling this
 # keeps handshake-time X-Api-Key auth behaving exactly as it does on v6.0.
 CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
+
+# IDF v6.1-beta1: PSA cannot set up SHA-1 on the S31 hardware SHA driver, and the
+# WebSocket handshake (httpd_ws) hashes Sec-WebSocket-Accept with SHA-1 through PSA.
+# Every socket died with "httpd_ws: Failed to setup SHA-1 operation" and the web UI
+# had no live data. Software SHA until the driver supports it.
+CONFIG_MBEDTLS_HARDWARE_SHA=n

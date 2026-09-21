@@ -248,8 +248,12 @@ extern "C" void app_main() {
     lua_engine_rules_hook_install();
 
     // ── Network ──────────────────────────────────────────────────────
-    ntp_cfg_init();   // before the first DHCP lease: may ask the router for a time server
     eth_start();
+    // After eth_start (esp_netif_init made the TCP/IP thread; the DHCP-option
+    // switch runs inside it) and before the first lease lands, which takes the
+    // link a second or more: lets lwIP hand the router's time server to SNTP.
+    // Before eth_start it asserts in tcpip_callback and the hub boot-loops.
+    ntp_cfg_init();
     net_discovery_start(CONFIG_ZHAC_MDNS_HOSTNAME);
 
     // Mount the SPA partition before registering httpd routes so the catchall

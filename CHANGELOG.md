@@ -8,7 +8,36 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 All notable changes to `zhac-wired-core` are recorded here. Format follows the convention
 used across the other ZHAC repos: an `## [Unreleased]` section accumulates work, and its
 
+### Fixed
+
+- **String attributes showed the previous push's JSON text** (first seen on an Aqara
+  WXKG01LM button: `action` read `{"event":"attr.changed",...`). The shadow's string field
+  holds up to 48 bytes with no terminator; the WebSocket push and the device state built the
+  JSON straight from it, so ArduinoJson read on into the stack. Every site copies into a
+  terminated buffer now.
+
+- **Boot loop on the first live boot of the DIY-pass firmware.** `ntp_cfg_init()` (the
+  DHCP time-server switch) ran before `eth_start()`, i.e. before the TCP/IP thread existed,
+  and `esp_sntp_servermode_dhcp()` asserted in `tcpip_callback` two seconds into every boot.
+  It now runs right after `eth_start()`, still well before the first lease lands.
+
+- **S31: the web UI had no live data — every WebSocket handshake failed.** IDF v6.1-beta1
+  hashes `Sec-WebSocket-Accept` through PSA, its mbedtls port drops the software SHA-1 when
+  the hardware SHA driver is on, and that driver cannot set up SHA-1 on the S31
+  (`httpd_ws: Failed to setup SHA-1 operation` on every connect; `ws_clients` stayed 0, the
+  Info page showed only its Help card). `sdkconfig.defaults.esp32s31` now sets
+  `CONFIG_MBEDTLS_HARDWARE_SHA=n`; the P4 builds on IDF 6.0 keep both and are unaffected.
+
+- **Status JSON carried stack garbage as the MQTT client id**, so the web page could not
+  parse `/api/status` and showed the hub as unreachable. ArduinoJson keeps a `const char*` by
+  reference; the status builder handed it a field of a `const` local that died before
+  serialisation. It copies now. Broker URL, root topic and client id read from NVS are also
+  checked to be printable ASCII (an empty client id falls back to the MAC-derived default).
+
 ### Changed
+
+- **MQTT settings handling moved to the shared `mqtt_gw_cfg`** (zhac-components); same
+  behaviour, one implementation with the single-chip build.
 
 - **Home Assistant: thermostats, covers, locks, fans and buttons become their own entity
   types**, and battery devices turn unavailable after a day of silence (zhac-components
