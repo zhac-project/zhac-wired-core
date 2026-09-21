@@ -10,6 +10,9 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Fixed
 
+- **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
+  publish instead of polling every 20 ms (shared `event_bus_pump_run`).
+
 - **String attributes showed the previous push's JSON text** (first seen on an Aqara
   WXKG01LM button: `action` read `{"event":"attr.changed",...`). The shadow's string field
   holds up to 48 bytes with no terminator; the WebSocket push and the device state built the

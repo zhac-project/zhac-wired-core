@@ -132,15 +132,7 @@ static void log_heap_info() {
 // filled forever. Draining a type with no subscribers is a cheap no-op.
 static void task_event_bus(void*) {
     ESP_LOGI(TAG, "TaskEventBus started");
-    while (true) {
-        uint8_t processed = 0;
-        for (uint8_t t = 1; t < static_cast<uint8_t>(EventType::_COUNT); t++) {
-            processed += event_bus_drain(static_cast<EventType>(t), 0);
-        }
-        if (processed == 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));   // idle yield; matches P4 cadence
-        }
-    }
+    event_bus_pump_run(nullptr);   // sleeps until a publish; never returns
 }
 
 extern "C" void app_main() {
