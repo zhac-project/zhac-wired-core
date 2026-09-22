@@ -126,7 +126,19 @@ void on_attr(const Event& e) {
     char v[64];
     char s[ATTR_STR_MAX + 1] = {};
     if (z.val_type == VAL_STR) memcpy(s, z.str_val, ATTR_STR_MAX);
-    if (value_json(z.val_type, z.int_val, s, v, sizeof(v))) ha_bridge_publish_state(z.ieee, z.key, v);
+    if (!value_json(z.val_type, z.int_val, s, v, sizeof(v))) return;
+    ha_bridge_publish_state(z.ieee, z.key, v);   // Home Assistant topics, only while discovery is on
+    // Plain per-device state topic, discovery or not -- what the dual-chip S3
+    // publishes from every HAP update: <root>/devices/<IEEE>/state with
+    // {"ieee":"0x..","attrs":{key:value}}. Without it a broker showed
+    // "connected" and then nothing unless Home Assistant discovery was on.
+    if (z.key[0] == '_' || !mqtt_gw_is_connected()) return;
+    char suffix[48], topic[96], payload[160];
+    snprintf(suffix, sizeof(suffix), "devices/%016llX/state", (unsigned long long)z.ieee);
+    if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) <= 0) return;
+    const int n = snprintf(payload, sizeof(payload), "{\"ieee\":\"0x%016llX\",\"attrs\":{\"%s\":%s}}",
+                           (unsigned long long)z.ieee, z.key, v);
+    if (n > 0 && (size_t)n < sizeof(payload)) mqtt_gw_publish(topic, payload, (size_t)n, 0, false);
 }
 
 // Everything under <root>/# that is not a Home Assistant command goes to the

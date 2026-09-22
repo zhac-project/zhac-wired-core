@@ -67,6 +67,7 @@
 #include "mqtt_gw.h"
 #include "net_discovery.h"
 #include "remote_client.h"
+#include "groups_store.h"
 #include "rule_store.h"
 #include "simple_rules.h"
 #include "device_cmd.h"
@@ -188,6 +189,7 @@ extern "C" void app_main() {
     zap_store_init();
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
+    esp_register_shutdown_handler(zap_store_flush_now);   // as on the P4: pending device-store writes survive a reboot
     device_shadow_init();
     zhac_adapter_init();
     heap_mark("adapter");
@@ -247,6 +249,7 @@ extern "C" void app_main() {
     // "Rule saved" in the UI, nothing persisted, nothing listed.
     rule_store_init();
     rule_store_flush_init();
+    grp_store_init();   // groups store mutex, before any server task exists
     esp_register_shutdown_handler(rule_store_flush_now);
     simple_rules_init();
     // What follows a device rename, in one place: rules re-resolve names and

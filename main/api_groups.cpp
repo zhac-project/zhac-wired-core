@@ -42,6 +42,9 @@ static void parse_members(const char* body, size_t len, GrpRecord& r) {
 
 size_t group_list_json(char* out, size_t cap) {
     static GrpRecord all[GRP_MAX_GROUPS];
+    // Shared static buffer: hold the store lock across load + serialise so a
+    // concurrent group.list on another task cannot refill it mid-read.
+    grp_store_lock();
     uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
     size_t pos = 0;
     pos += snprintf(out + pos, cap - pos, "{\"groups\":[");
@@ -52,6 +55,7 @@ size_t group_list_json(char* out, size_t cap) {
         if (pos + n < cap) { memcpy(out + pos, tmp, n); pos += n; }
     }
     pos += snprintf(out + pos, cap - pos, "]}");
+    grp_store_unlock();
     return pos;
 }
 
@@ -59,10 +63,9 @@ bool group_create(const char* body, size_t len, char* out, size_t cap, size_t* n
     JsonDocument doc;
     if (len == 0 || deserializeJson(doc, body, len)) return false;
     GrpRecord r{};
-    r.id = grp_next_id();
     strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
     parse_members(body, len, r);
-    if (r.id == 0 || !grp_save(r)) return false;
+    if (!grp_create(r)) return false;   // id allocation + save under one lock
     size_t w = grp_to_json(r, out, cap);
     if (n) *n = w;
     return true;

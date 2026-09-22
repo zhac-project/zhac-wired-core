@@ -104,7 +104,9 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
         return e;
     }
 
-    if (req->method == HTTP_PUT) {
+    // Save. The SPA and net-core use POST /api/scripts/<name> (body = source);
+    // this port only took PUT and answered a bare POST with 405 "unsupported".
+    if (req->method == HTTP_PUT || (req->method == HTTP_POST && !is_run && !is_check)) {
         // Raw source body, up to kScriptCap-1 bytes.
         bool existed = lua_script_cache_exists(name);
         char* src = (char*)heap_caps_malloc(kScriptCap, MALLOC_CAP_SPIRAM);
