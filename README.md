@@ -41,8 +41,8 @@ esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash 0x0 zhac-wired-s31-<vers
 
 ## Limits, honestly
 
-- Ethernet only. The S31 has BLE and 802.15.4, no Wi-Fi. That is the point of a hub, but say
-  so before buying.
+- Ethernet only. The chip has Wi-Fi 6, BLE and 802.15.4; this firmware uses the wire and the
+  802.15.4 radio, nothing else. That is the point of a hub, but say so before buying.
 - Board only: no case yet (a printable one is welcome), no PoE; powered over USB-C.
 - The first over-the-air update from the web UI has been built and tested against a release
   feed, not yet through a full release cycle. The browser flasher always works.
