@@ -67,6 +67,7 @@
 #include "mqtt_gw.h"
 #include "net_discovery.h"
 #include "remote_client.h"
+#include "rule_store.h"
 #include "simple_rules.h"
 #include "device_cmd.h"
 #include "status_led.h"
@@ -240,6 +241,13 @@ extern "C" void app_main() {
     // loading is deferred to the end of app_main so a script touching the
     // network or HTTP stack at top level cannot race it.
     heap_mark("zigbee");
+    // The rule store needs its NVS namespace opened and its PSRAM writeback
+    // started before simple_rules loads or saves anything. Without these two
+    // calls (only the P4 main-core had them) every save failed silently:
+    // "Rule saved" in the UI, nothing persisted, nothing listed.
+    rule_store_init();
+    rule_store_flush_init();
+    esp_register_shutdown_handler(rule_store_flush_now);
     simple_rules_init();
     // What follows a device rename, in one place: rules re-resolve names and
     // Home Assistant sees the new one (device_cmd cannot call either itself).

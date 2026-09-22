@@ -26,6 +26,7 @@
 // both SKUs in one repo.
 #include "esp_zigbee_backend.h"
 #include "esp_zb_interview.h"
+#include <ctime>
 #include "sdkconfig.h"
 
 #if CONFIG_ZHAC_ESP_ZIGBEE
@@ -107,8 +108,57 @@ static void feed_late_identity(uint16_t nwk, uint16_t cluster_id,
     zigbee_identity_on_af_incoming(af, static_cast<uint8_t>(17 + zcl_len));
 }
 
+// Tuya end-devices (MiBoxer FUT089Z, TS0044, TS011F, TS0001, ...) read genTime
+// attribute 0x0007 (LocalTime) from the coordinator right after joining and
+// keep asking until they get a real value; the remotes gate their button
+// reporting on it. Nothing on our endpoint serves the Time cluster, so answer
+// here the way the ZNP path's zigbee_respond_gen_time does: UTC seconds since
+// 2000 once the clock is synced, UNSUPPORTED_ATTRIBUTE for everything else
+// (and for the time itself before NTP) so the device stops probing.
+static void respond_gen_time(uint16_t nwk, uint8_t dst_ep, const uint8_t* zcl, uint16_t len) {
+    if (nwk == 0 || !zcl || len < 3) return;
+    const bool   mfg = (zcl[0] & 0x04) != 0;
+    const size_t hdr = mfg ? 5 : 3;
+    if (len < hdr || (zcl[0] & 0x03) != 0x00) return;   // profile-wide frames only
+    if (zcl[hdr - 1] != 0x00) return;                      // Read Attributes
+    const uint8_t tsn = zcl[hdr - 2];
+    constexpr uint32_t kEpoch2000 = 946684800u;             // 1970 -> 2000 in seconds
+    const uint32_t now_unix = static_cast<uint32_t>(time(nullptr));
+    const bool     clock_ok = now_unix > kEpoch2000;
+    const uint32_t utc_2000 = clock_ok ? now_unix - kEpoch2000 : 0;
+    uint8_t body[80];
+    body[0] = 0x18;   // profile-wide, server -> client, default response off
+    body[1] = tsn;
+    body[2] = 0x01;   // Read Attributes Response
+    size_t n = 3;
+    for (size_t i = hdr; i + 1 < len && n + 8 <= sizeof(body); i += 2) {
+        const uint16_t attr = static_cast<uint16_t>(zcl[i] | (static_cast<uint16_t>(zcl[i + 1]) << 8));
+        body[n++] = zcl[i];
+        body[n++] = zcl[i + 1];
+        if ((attr == 0x0007 || attr == 0x0000) && clock_ok) {   // LocalTime / Time
+            body[n++] = 0x00;   // SUCCESS
+            body[n++] = 0xE2;   // UTC time
+            body[n++] = static_cast<uint8_t>(utc_2000);
+            body[n++] = static_cast<uint8_t>(utc_2000 >> 8);
+            body[n++] = static_cast<uint8_t>(utc_2000 >> 16);
+            body[n++] = static_cast<uint8_t>(utc_2000 >> 24);
+        } else {
+            body[n++] = 0x86;   // UNSUPPORTED_ATTRIBUTE
+        }
+    }
+    const bool sent = esp_zb_af_send(nwk, dst_ep, 0x000A, body, n);
+    ESP_LOGI(TAG, "genTime read-resp -> nwk 0x%04x ep %u utc2000=%lu%s%s", nwk, dst_ep,
+             static_cast<unsigned long>(utc_2000),
+             clock_ok ? "" : " (clock not synced: UNSUPPORTED)", sent ? "" : " SEND FAILED");
+}
+
 static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
+    // ZDO answers (profile 0x0000: Bind_rsp 0x8021, Simple_Desc_rsp 0x8004, ...)
+    // reach this hook too. The interview engine gets them through its ZDO
+    // callbacks; feeding them to the ZCL decoder only produced
+    // "decode_frame failed cluster=0x8021" noise and fake unhandled entries.
+    if (ind->profile_id == 0x0000) return false;
 
     // Source may arrive short or extended; the pool is keyed by IEEE.
     uint64_t ieee = 0;
@@ -122,6 +172,10 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
         nwk = ind->src_address.u.short_addr;
         ZapDevice snap{};
         if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) ieee = snap.ieee_addr;
+    }
+
+    if (ind->cluster_id == 0x000A) {
+        respond_gen_time(nwk, ind->src_endpoint, ind->asdu, ind->asdu_length);
     }
 
     if (ieee == 0) {
