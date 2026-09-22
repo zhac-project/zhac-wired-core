@@ -10,6 +10,7 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Fixed
 
+- Joining a sleepy Tuya remote (MiBoxer FUT089Z) never completed, and while its interview looped (10 × 30 s) no other device could join: the single interview task slept between attempts, so a Xiaomi sensor announcing meanwhile waited in the queue until it gave up and left. Now mirrors the ZNP path: a failed Active-Endpoints step assumes endpoint 1 and goes on to the Basic read (five back-to-back reads keep a frame queued for the sleepy child), any frame or rejoin from the device under interview ends the 30 s wait at once, and when another device announces the current one goes back into the queue and the newcomer is interviewed first.
 - S31: internal DRAM exhausted ~10 s after boot (228 KB → 5 KB: Zigbee init 63 KB, Lua 57 KB, Ethernet 30 KB, httpd 22 KB, then task stacks) so `mqtt_client: Error create mqtt task` and any later task (OTA) failed. Task stacks + queues now live in PSRAM (`zhac_task.h`, TaskEventBus, TaskZigbee, TaskZbIv, httpd via `task_caps`), Lua small allocations go to PSRAM (`LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=0`), mDNS task/memory, MQTT outbox/buffers and mbedTLS allocate from PSRAM. Boot log prints `int-heap after <step>` per init step.
 - **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
   publish instead of polling every 20 ms (shared `event_bus_pump_run`).

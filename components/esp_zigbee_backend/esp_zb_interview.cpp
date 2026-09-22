@@ -69,6 +69,7 @@ namespace {
 struct JoinReq {
     uint64_t ieee;
     uint16_t nwk;
+    uint8_t  attempts_done;   // > 0 when re-queued after yielding to a peer
 };
 
 QueueHandle_t     s_join_q   = nullptr;
@@ -102,7 +103,11 @@ uint8_t           s_basic_len = 0;
 // while the interview is still running, and each of those would otherwise
 // occupy a queue slot and trigger a full redundant re-interview afterwards.
 volatile uint64_t s_active_ieee = 0;
-
+// Given from the APS hook (and from a rejoin announce) whenever a frame
+// arrives from the device under interview: a sleepy end-device is awake right
+// then, so the retry loop stops sleeping and fires the next attempt at once.
+// Same shape as the ZNP path's s_wake_sem.
+SemaphoreHandle_t s_wake_sem = nullptr;
 constexpr uint32_t kZdoTimeoutMs   = 5000;
 constexpr uint32_t kBasicTimeoutMs = 5000;
 
@@ -111,7 +116,13 @@ constexpr uint32_t kBasicTimeoutMs = 5000;
 // 2-5 minute Xiaomi wake cycles. Mains devices finish on attempt 1.
 constexpr int      kMaxAttempts    = 10;
 constexpr uint32_t kRetryDelayMs   = 30000;
-
+// Sleepy end-devices (Tuya remotes such as the MiBoxer FUT089Z, Xiaomi
+// sensors) wake for a few hundred ms after a button press and poll their
+// parent then. One 5 s read every 30 s leaves nothing queued for them most of
+// the time; five back-to-back reads keep a frame pending for ~25 s per
+// endpoint, so a press inside that window is answered (ZNP path: 5 x 5 s).
+constexpr int      kBasicReadsPerEp = 5;
+constexpr uint32_t kBasicRetryGapMs = 400;
 void step_done(bool ok) {
     s_step_ok = ok;
     xSemaphoreGive(s_step_sem);
@@ -302,8 +313,12 @@ bool read_basic(ZapDevice* work, uint16_t nwk) {
     uint8_t order[8];
     const uint8_t n = zigbee_interview_build_basic_probe_order(*work, order, sizeof(order));
     for (uint8_t i = 0; i < n; i++) {
-        if (!read_basic_once(nwk, order[i], zcl_seq_next())) continue;
-
+        bool got = false;
+        for (int r = 0; r < kBasicReadsPerEp && !got; r++) {
+            if (r) vTaskDelay(pdMS_TO_TICKS(kBasicRetryGapMs));
+            got = read_basic_once(nwk, order[i], zcl_seq_next());
+        }
+        if (!got) continue;
         // manufacturer_code from the Basic read wins over the node descriptor's
         // only when the read actually carried it; seed with what we have.
         uint16_t mfg_code = work->manufacturer_code;
@@ -364,10 +379,15 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
 
     // 2. Active endpoints. Fatal -- without endpoints there is nothing to read.
     if (!req_active_ep(nwk)) {
-        work.interview_state = static_cast<uint8_t>(InterviewState::FAILED);
-        CommitCtx c{&work, false};
-        zigbee_pool_with_device(ieee, commit_fn, &c);
-        return false;
+        // Sleepy battery devices (MiBoxer FUT089Z, Xiaomi sensors) miss the
+        // wake window for this ZDO step even when their ZCL path works. Same
+        // fallback as z2m and the ZNP path: assume endpoint 1 and go on to the
+        // Basic read instead of burning the attempt. Simple_Desc below is
+        // non-fatal already, so an asleep device costs one more timeout.
+        ESP_LOGW(TAG, "%016llx active_ep failed -- assuming endpoint 1",
+                 (unsigned long long)ieee);
+        s_ep_count   = 1;
+        s_ep_list[0] = 1;
     }
     work.endpoint_count = s_ep_count;
     std::memcpy(work.endpoints, s_ep_list, s_ep_count);
@@ -487,7 +507,8 @@ void task_interview(void*) {
         s_active_ieee = req.ieee;
 
         bool ok = false;
-        for (int attempt = 1; attempt <= kMaxAttempts && !ok; attempt++) {
+        bool yielded = false;
+        for (int attempt = req.attempts_done + 1; attempt <= kMaxAttempts && !ok; attempt++) {
             ok = do_interview(req.ieee, req.nwk);
             if (ok) break;
 
@@ -503,13 +524,34 @@ void task_interview(void*) {
                 }
             }
             if (attempt < kMaxAttempts) {
-                ESP_LOGI(TAG, "%016llx identity incomplete -- retry %d/%d in %us",
+                // A peer announced meanwhile: it is awake NOW and this device
+                // is not. Go back into the queue with the attempts kept and let
+                // the peer be interviewed first -- one sleepy remote must not
+                // block every other join for five minutes.
+                if (uxQueueMessagesWaiting(s_join_q) > 0) {
+                    const JoinReq back{req.ieee, req.nwk, static_cast<uint8_t>(attempt)};
+                    if (xQueueSend(s_join_q, &back, 0) == pdTRUE) {
+                        ESP_LOGI(TAG, "%016llx yields to a queued peer after %d/%d -- "
+                                      "back in the queue",
+                                 (unsigned long long)req.ieee, attempt, kMaxAttempts);
+                        yielded = true;
+                        break;
+                    }
+                }
+                ESP_LOGI(TAG, "%016llx identity incomplete -- retry %d/%d in %us (or on wake)",
                          (unsigned long long)req.ieee, attempt + 1, kMaxAttempts,
                          (unsigned)(kRetryDelayMs / 1000));
-                vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+                xSemaphoreTake(s_wake_sem, 0);   // drain a stale post
+                if (xSemaphoreTake(s_wake_sem, pdMS_TO_TICKS(kRetryDelayMs)) == pdTRUE) {
+                    ESP_LOGI(TAG, "%016llx is awake -- retrying now",
+                             (unsigned long long)req.ieee);
+                }
             }
         }
-
+        if (yielded) {
+            s_active_ieee = 0;
+            continue;
+        }
         if (!ok) {
             ESP_LOGW(TAG, "%016llx interview incomplete after %d attempts -- "
                           "device is in the pool but has no identity",
@@ -537,8 +579,9 @@ void zb_interview_init() {
     if (s_join_q) return;
     s_step_sem  = xSemaphoreCreateBinary();
     s_basic_sem = xSemaphoreCreateBinary();
+    s_wake_sem  = xSemaphoreCreateBinary();
     s_join_q    = zhac_queue_create(16, sizeof(JoinReq));
-    if (!s_step_sem || !s_basic_sem || !s_join_q) {
+    if (!s_step_sem || !s_basic_sem || !s_wake_sem || !s_join_q) {
         ESP_LOGE(TAG, "alloc failed -- joins will not be interviewed");
         return;
     }
@@ -561,7 +604,7 @@ void zb_interview_enqueue(uint64_t ieee, uint16_t nwk) {
                  (unsigned long long)ieee);
         return;
     }
-    const JoinReq r{ieee, nwk};
+    const JoinReq r{ieee, nwk, 0};
     if (xQueueSend(s_join_q, &r, 0) != pdTRUE) {
         ESP_LOGW(TAG, "join queue full -- dropping announce for %016llx",
                  (unsigned long long)ieee);
@@ -628,8 +671,8 @@ void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
         // Known but never identified -- a rejoin is exactly the wake window
         // the retry loop was waiting for.
         zap_store_mark_dirty(&c.snap, ZAP_PERSIST_LOW);
+        zb_interview_note_traffic(ieee);
     }
-
     zb_interview_enqueue(ieee, nwk);
 }
 
@@ -680,8 +723,12 @@ bool zb_interview_trigger(uint64_t ieee) {
         return false;
     }
     if (!s_join_q) return false;
-    const JoinReq r{ieee, snap.nwk_addr};
+    const JoinReq r{ieee, snap.nwk_addr, 0};
     return xQueueSend(s_join_q, &r, 0) == pdTRUE;
+}
+
+void zb_interview_note_traffic(uint64_t ieee) {
+    if (ieee != 0 && s_wake_sem && ieee == s_active_ieee) xSemaphoreGive(s_wake_sem);
 }
 
 bool zb_interview_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t /*src_ep*/,

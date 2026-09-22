@@ -49,6 +49,12 @@ bool zb_interview_forget(uint64_t ieee);
 bool zb_interview_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
                            const uint8_t* zcl, uint8_t zcl_len);
 
+// Any frame (or a rejoin announce) from the device currently under interview:
+// a sleepy end-device is awake right now, so the retry loop fires its next
+// attempt immediately instead of finishing its 30 s sleep. Cheap no-op for
+// every other device.
+void zb_interview_note_traffic(uint64_t ieee);
+
 // Register the configure transports (bind / report / cmd / read / write) with
 // zhc_adapter. Call once at init, before any interview can complete.
 void esp_zb_configure_register();
