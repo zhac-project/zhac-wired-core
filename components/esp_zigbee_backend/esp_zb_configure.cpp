@@ -66,6 +66,7 @@ constexpr uint32_t kBindTimeoutMs = 5000;
 
 SemaphoreHandle_t s_bind_sem = nullptr;
 bool              s_bind_ok  = false;
+uint8_t           s_bind_status = 0xFF;   // ZDP status of the last response, 0xFF = none
 
 // Resolve a device's current short address. Snapshot rather than holding a
 // pool pointer -- pool_remove()'s swap-with-last can retarget the slot.
@@ -77,8 +78,8 @@ bool nwk_of(uint64_t ieee, uint16_t* out) {
 }
 
 void on_bind_result(const ezb_zdp_bind_req_result_t* r, void*) {
-    s_bind_ok = r && r->error == 0 && r->rsp &&
-                r->rsp->status == EZB_ZDP_STATUS_SUCCESS;
+    s_bind_status = (r && r->error == 0 && r->rsp) ? static_cast<uint8_t>(r->rsp->status) : 0xFF;
+    s_bind_ok = s_bind_status == static_cast<uint8_t>(EZB_ZDP_STATUS_SUCCESS);
     xSemaphoreGive(s_bind_sem);
 }
 
@@ -99,6 +100,7 @@ bool do_bind(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
 
     xSemaphoreTake(s_bind_sem, 0);       // drain a stale post
     s_bind_ok = false;
+    s_bind_status = 0xFF;
     int e = -1;
     {
         // Lock only around the request: the bind result arrives via a
@@ -115,7 +117,19 @@ bool do_bind(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
     if (xSemaphoreTake(s_bind_sem, pdMS_TO_TICKS(kBindTimeoutMs)) != pdTRUE) {
         ESP_LOGW(TAG, "%s 0x%04x ep %u cluster 0x%04x timed out",
                  unbind ? "unbind" : "bind", nwk, src_ep, cluster);
-        return false;
+        return false;   // asleep or out of reach: worth another try when it wakes
+    }
+    if (!s_bind_ok && s_bind_status != 0xFF) {
+        // The device answered and said no (binding table full, cluster not
+        // there). Retrying cannot change that, and the ZNP path never even
+        // waits for this answer -- so a rejected bind must not abort the
+        // configure that follows (Tuya magic packet, operation-mode write):
+        // that is what made a TS004F knob stay silent on this backend while
+        // it worked on the P4. Warn and carry on.
+        ESP_LOGW(TAG, "%s 0x%04x ep %u cluster 0x%04x rejected by the device "
+                      "(ZDP status 0x%02x) -- continuing",
+                 unbind ? "unbind" : "bind", nwk, src_ep, cluster, s_bind_status);
+        return true;
     }
     return s_bind_ok;
 }
