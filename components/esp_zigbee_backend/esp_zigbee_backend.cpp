@@ -152,6 +152,15 @@ static void respond_gen_time(uint16_t nwk, uint8_t dst_ep, const uint8_t* zcl, u
              clock_ok ? "" : " (clock not synced: UNSUPPORTED)", sent ? "" : " SEND FAILED");
 }
 
+// Short addresses get reused. The pool learns them from announces, the stack's
+// own address map from every frame -- the map is authoritative.
+static void pool_set_nwk(uint64_t ieee, uint16_t nwk) {
+    zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+        d->nwk_addr = *static_cast<uint16_t*>(c);
+    }, &nwk);
+    zigbee_pool_mark_dirty();
+}
+
 static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
     // ZDO answers (profile 0x0000: Bind_rsp 0x8021, Simple_Desc_rsp 0x8004, ...)
@@ -171,7 +180,43 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     } else {
         nwk = ind->src_address.u.short_addr;
         ZapDevice snap{};
-        if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) ieee = snap.ieee_addr;
+        if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) {
+            ieee = snap.ieee_addr;
+            // A stale pool entry can still hold the address a newly joined
+            // device now uses; every frame from the newcomer would then decode
+            // under the old device and the newcomer would look silent.
+            ezb_extaddr_t ext{};
+            if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
+                ext.u64 != ieee) {
+                pool_set_nwk(ieee, 0);   // the old holder no longer has it
+                ZapDevice real{};
+                if (zigbee_pool_snapshot(ext.u64, &real)) {
+                    pool_set_nwk(ext.u64, nwk);
+                    ESP_LOGW(TAG, "nwk 0x%04x is %016llx, not %016llx -- pool refreshed",
+                             nwk, (unsigned long long)ext.u64, (unsigned long long)ieee);
+                    ieee = ext.u64;
+                } else {
+                    ESP_LOGW(TAG, "nwk 0x%04x is %016llx (not in the pool), not %016llx "
+                                  "-- stale address cleared", nwk,
+                             (unsigned long long)ext.u64, (unsigned long long)ieee);
+                    ieee = 0;
+                }
+            }
+        } else {
+            // Short address the pool does not know: a sleepy device rejoined
+            // through a router without an announce we saw, or came back under
+            // a new address. The stack's address map knows the IEEE; refresh
+            // the pool so the frame decodes under the right device instead of
+            // vanishing into the unhandled counter.
+            ezb_extaddr_t ext{};
+            if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
+                zigbee_pool_snapshot(ext.u64, &snap)) {
+                ieee = ext.u64;
+                pool_set_nwk(ieee, nwk);
+                ESP_LOGI(TAG, "%016llx now at nwk 0x%04x (pool had 0x%04x) -- address refreshed",
+                         (unsigned long long)ieee, nwk, snap.nwk_addr);
+            }
+        }
     }
 
     if (ind->cluster_id == 0x000A) {
@@ -186,6 +231,15 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
         const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
         const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
         zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, 0);
+        // Say so, rate-limited: a device that talks but is not in the pool was
+        // invisible in the log, which reads exactly like a device that is silent.
+        static int64_t s_unknown_log_us = 0;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - s_unknown_log_us > 10 * 1000000LL) {
+            s_unknown_log_us = now_us;
+            ESP_LOGI(TAG, "frame from a source not in the pool: nwk 0x%04x cluster 0x%04x %s 0x%02x",
+                     nwk, ind->cluster_id, cluster_specific ? "cmd" : "attr", attr_or_cmd);
+        }
         return false;
     }
 
@@ -215,6 +269,24 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     // Identity strings for the matcher, straight from the pool snapshot.
     ZapDevice dev{};
     const bool have = zigbee_pool_snapshot(ieee, &dev);
+    // A frame from a device whose configure never completed means it is awake
+    // right now -- the only moment a bind / attribute write reaches a sleepy
+    // end-device (the cube's binds failed on every timed retry). Re-queue
+    // configure while it is listening; the queue skips devices already DONE.
+    // Rate-limited per device so a chatty sensor does not queue it per report.
+    if (have && dev.support_state == static_cast<uint8_t>(SupportState::MATCHED) &&
+        dev.configure_state != static_cast<uint8_t>(ConfigureState::DONE)) {
+        static uint64_t s_kick_ieee = 0;
+        static int64_t  s_kick_us   = 0;
+        const int64_t now_us = esp_timer_get_time();
+        if (ieee != s_kick_ieee || now_us - s_kick_us > 30 * 1000000LL) {
+            s_kick_ieee = ieee;
+            s_kick_us   = now_us;
+            ESP_LOGI(TAG, "%016llx is awake and not configured -- running configure now",
+                     (unsigned long long)ieee);
+            zigbee_configure_enqueue(ieee);
+        }
+    }
     const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
     const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
 

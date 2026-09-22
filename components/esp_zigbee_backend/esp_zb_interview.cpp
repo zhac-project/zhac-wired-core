@@ -662,6 +662,13 @@ void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
                      (unsigned long long)ieee, nwk,
                      c.was_removed ? ", un-removed" : "");
             zap_store_mark_dirty(&c.snap, ZAP_PERSIST_LOW);
+            // A rejoin is a wake window: finish a configure that never landed
+            // (sleepy device, binds timed out) -- the ZNP path's rejoin fast-path
+            // does the same. The queue skips devices already DONE.
+            if (c.snap.configure_state != static_cast<uint8_t>(ConfigureState::DONE) &&
+                c.snap.support_state == static_cast<uint8_t>(SupportState::MATCHED)) {
+                zigbee_configure_enqueue(ieee);
+            }
             Event ev{};
             ev.type = EventType::DEVICE_JOIN;
             std::memcpy(ev.data, &ieee, sizeof(ieee));
