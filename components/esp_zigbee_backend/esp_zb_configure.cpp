@@ -62,7 +62,9 @@ namespace {
 // packets, IAS CIE writes); 128 covers every def in the library with room.
 constexpr size_t kZclMax = 128;
 
-constexpr uint32_t kBindTimeoutMs = 5000;
+// z2m waits 10 s for a ZDO answer; a sleepy TRV polls every few seconds when
+// awake, and 5 s lost binds that 10 s lands.
+constexpr uint32_t kBindTimeoutMs = 10000;
 
 SemaphoreHandle_t s_bind_sem = nullptr;
 bool              s_bind_ok  = false;

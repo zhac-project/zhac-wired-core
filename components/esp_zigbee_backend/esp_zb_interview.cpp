@@ -257,6 +257,11 @@ bool req_simple_desc(uint16_t nwk, uint8_t ep) {
 //   [1] transaction sequence number
 //   [2] command 0x00 = Read Attributes
 //   [3..] attribute ids, little endian
+// Set when the stack would not even queue a Basic read (buffer pool spent by
+// frames still pending for the sleeping device): more reads only make it
+// worse, the queued one is waiting for the device's next poll.
+bool s_basic_send_failed = false;
+
 bool read_basic_once(uint16_t nwk, uint8_t ep, uint8_t tsn) {
     static const uint8_t kAttrs[] = {
         0x01, 0x00,   // 0x0001 manufacturerCode (parsed by the shared helper)
@@ -275,6 +280,7 @@ bool read_basic_once(uint16_t nwk, uint8_t ep, uint8_t tsn) {
     s_basic_nwk = nwk;              // arm the sniffer before sending
 
     const bool sent = esp_zb_af_send(nwk, ep, 0x0000, frame, sizeof(frame));
+    s_basic_send_failed = !sent;
     if (!sent) {
         s_basic_nwk = 0;
         return false;
@@ -332,7 +338,7 @@ bool read_basic(ZapDevice* work, uint16_t nwk) {
     const uint8_t n = zigbee_interview_build_basic_probe_order(*work, order, sizeof(order));
     for (uint8_t i = 0; i < n; i++) {
         bool got = false;
-        for (int r = 0; r < kBasicReadsPerEp && !got && !s_preempt; r++) {
+        for (int r = 0; r < kBasicReadsPerEp && !got && !s_preempt && !s_basic_send_failed; r++) {
             if (r) vTaskDelay(pdMS_TO_TICKS(kBasicRetryGapMs));
             got = read_basic_once(nwk, order[i], zcl_seq_next());
         }
@@ -434,7 +440,13 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
     // 4. Identity. This is the step that decides whether the device is usable,
     //    and the step sleepy devices fail -- hence the retry loop around the
     //    whole interview rather than around individual requests.
-    const bool have_identity = read_basic(&work, nwk);
+    // Identity may already be there from the late path (a Basic report seen
+    // by the APS hook) or an earlier attempt. Reading it again only queues
+    // more frames for a sleeping device, and a miss used to downgrade a
+    // MATCHED device to UNKNOWN. Keep what we have.
+    const bool known_identity = work.model_id[0] || work.manufacturer_name[0];
+    s_basic_send_failed = false;
+    const bool have_identity = known_identity || read_basic(&work, nwk);
     work.interview_state = static_cast<uint8_t>(
         have_identity ? InterviewState::IDENTITY_READY : InterviewState::IDENTITY_PENDING);
 

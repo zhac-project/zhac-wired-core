@@ -43,6 +43,7 @@
 #include "ezbee/app_signals.h"
 #include "ezbee/bdb.h"
 #include "ezbee/nwk.h"
+#include "ezbee/error.h"
 #include "ezbee/af.h"
 #include "zigbee_mgr.h"
 #include "ezbee/zcl/cluster/basic_desc.h"
@@ -435,6 +436,42 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     // Identity strings for the matcher, straight from the pool snapshot.
     ZapDevice dev{};
     const bool have = zigbee_pool_snapshot(ieee, &dev);
+    const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
+    const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
+
+    zhac_adapter_set_runtime_addr(ieee, nwk);
+
+    const bool decoded = zhac_adapter_try_decode(
+        ieee, model, manuf,
+        group_id,
+        ind->cluster_id, ind->src_endpoint, ind->lqi,
+        ind->asdu, ind->asdu_length);
+
+    if (!decoded) {
+        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
+        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
+        zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, ieee);
+    }
+
+    // The decoder found a definition for this device, so its identity is
+    // complete and supported whatever the pool says. A pool entry can lag
+    // (identity came through the late path while an interview attempt was
+    // still failing and wrote UNKNOWN over it -- a Saswell TRV sat at
+    // "iv=2 sup=0" forever, and the configure kick below never fired).
+    // Heal it here: the kick and the rejoin fast-path both key on MATCHED.
+    if (decoded && have &&
+        (dev.support_state != static_cast<uint8_t>(SupportState::MATCHED) ||
+         dev.interview_state != static_cast<uint8_t>(InterviewState::IDENTITY_READY))) {
+        zigbee_pool_with_device(ieee, [](ZapDevice* d, void*) {
+            d->interview_state = static_cast<uint8_t>(InterviewState::IDENTITY_READY);
+            d->support_state   = static_cast<uint8_t>(SupportState::MATCHED);
+        }, nullptr);
+        zigbee_pool_mark_dirty();
+        ESP_LOGI(TAG, "%016llx decodes with a definition but the pool said iv=%u sup=%u -- marked identified+matched",
+                 (unsigned long long)ieee, dev.interview_state, dev.support_state);
+        dev.support_state = static_cast<uint8_t>(SupportState::MATCHED);
+    }
+
     // A frame from a device whose configure never completed means it is awake
     // right now -- the only moment a bind / attribute write reaches a sleepy
     // end-device (the cube's binds failed on every timed retry). Re-queue
@@ -452,22 +489,6 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                      (unsigned long long)ieee);
             zigbee_configure_enqueue(ieee);
         }
-    }
-    const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
-    const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
-
-    zhac_adapter_set_runtime_addr(ieee, nwk);
-
-    const bool decoded = zhac_adapter_try_decode(
-        ieee, model, manuf,
-        group_id,
-        ind->cluster_id, ind->src_endpoint, ind->lqi,
-        ind->asdu, ind->asdu_length);
-
-    if (!decoded) {
-        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
-        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
-        zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, ieee);
     }
 
     return false;
@@ -506,12 +527,27 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     req.asdu_length  = static_cast<uint16_t>(zcl_len);
     req.asdu         = const_cast<uint8_t*>(zcl_data);
 
-    zb_lock::Guard g;
-    if (!g) return false;
-    const ezb_err_t err = ezb_apsde_data_request(&req);
+    // EZB_ERR_NO_MEM (1) means the stack's buffer pool is spent: frames queued
+    // for sleeping children hold a buffer each until delivered or expired
+    // (~8 s). A sleepy thermostat under interview + configure hit this on
+    // every bind, read and DATA_QUERY, so nothing reached it even when awake.
+    // From a task, wait for the pool to drain a little instead of failing
+    // at once; from the stack's own callback context never block.
+    const bool can_wait = xTaskGetCurrentTaskHandle() != zb_lock::stack_task();
+    ezb_err_t err = 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        {
+            zb_lock::Guard g;
+            if (!g) return false;
+            err = ezb_apsde_data_request(&req);
+        }
+        if (err != EZB_ERR_NO_MEM || !can_wait) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     if (err != 0) {
-        ESP_LOGW(TAG, "apsde_data_request to 0x%04x cluster 0x%04x failed (%d)",
-                 nwk_addr, cluster_id, (int)err);
+        ESP_LOGW(TAG, "apsde_data_request to 0x%04x cluster 0x%04x failed (%d)%s",
+                 nwk_addr, cluster_id, (int)err,
+                 err == EZB_ERR_NO_MEM ? " -- stack buffers full (frames pending for sleeping children)" : "");
         return false;
     }
     return true;
