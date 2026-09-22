@@ -10,6 +10,7 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
 
 ### Fixed
 
+- A groupcast-only zone remote (MiBoxer FUT089Z, zones = groups 101–108) showed only battery and voltage: the coordinator was in no group, so its presses never arrived. The backend now registers endpoint 1 with Basic + Groups servers, joins groups 101–108 when the network is up (and every group a device is added to through ZHAC), reads its own membership back at boot (`coordinator endpoint 1 is in N group(s)`), and hands the groupcast's group id to the decoder so `zone` is synthesised. This is the "rank 1" path from `NATIVE_ZCL_GROUPS_DESIGN.md`; the TI ZNP path has no equivalent.
 - MQTT published nothing after "connected" unless Home Assistant discovery was on: device updates only went through the HA bridge. Every update is now also published on `<root>/devices/<IEEE>/state` as `{"ieee","attrs":{key:value}}`, as the dual-chip S3 does.
 - Saving a Lua script from the web UI failed with "Unsupported" (HTTP 405): the SPA and net-core save with `POST /api/scripts/<name>`, this port accepted only `PUT`. POST without `/run` or `/check` now saves.
 - `groups_store` brought up to net-core's version: one recursive store mutex (created at boot via `grp_store_init()`), `grp_create()` allocates the id and saves under the lock (two concurrent creators could take the same slot), `group.list` holds the lock across its shared buffer. The port had carried the pre-lock copy.

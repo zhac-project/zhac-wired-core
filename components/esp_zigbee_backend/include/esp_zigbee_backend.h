@@ -36,3 +36,9 @@ inline uint32_t esp_zigbee_backend_wall_clock_s(void) {
     const time_t t = time(nullptr);
     return t >= 1577836800 ? static_cast<uint32_t>(t) : 0;
 }
+
+// Add this coordinator's endpoint 1 to a ZCL group (self-addressed Add Group to
+// the stack's Groups server). Groupcasts to that group then reach the APS hook
+// -- the only way a groupcast-only zone remote (FUT089Z) is heard. Idempotent.
+bool esp_zb_coordinator_join_group(uint16_t group_id);
+

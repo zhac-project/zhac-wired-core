@@ -24,6 +24,7 @@
 
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
+#include "esp_zigbee_backend.h"
 #include "esp_zb_interview.h"   // esp_zb_af_send
 #include "esp_zb_zcl_frame.h"
 
@@ -64,6 +65,9 @@ SemaphoreHandle_t member_sem() {
 // The trailing zero-length name is REQUIRED by the spec; omitting it makes
 // conformant devices reject the frame as malformed.
 bool zigbee_zcl_group_add(uint16_t nwk_addr, uint8_t ep, uint16_t group_id) {
+    // Whatever group a device joins, the coordinator joins too, so commands
+    // the device (or a remote) sends to that group are heard here.
+    esp_zb_coordinator_join_group(group_id);
     const uint8_t payload[3] = {
         static_cast<uint8_t>(group_id & 0xFF),
         static_cast<uint8_t>((group_id >> 8) & 0xFF),

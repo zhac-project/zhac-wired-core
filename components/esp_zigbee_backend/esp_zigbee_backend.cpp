@@ -43,6 +43,11 @@
 #include "ezbee/app_signals.h"
 #include "ezbee/bdb.h"
 #include "ezbee/nwk.h"
+#include "ezbee/af.h"
+#include "zigbee_mgr.h"
+#include "ezbee/zcl/cluster/basic_desc.h"
+#include "ezbee/zcl/cluster/groups.h"
+#include "ezbee/zcl/cluster/groups_desc.h"
 #include "ezbee/platform/radio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -57,6 +62,7 @@
 #include "zigbee_configure_queue.h"
 #include "zigbee_identity.h"
 #include "zigbee_pool.h"
+#include "zcl_seq.h"
 
 // Defined in zhac-components' zhc_shadow_bridge.cpp; declared in no header.
 extern "C" void zhc_shadow_bridge_register(void);
@@ -161,13 +167,98 @@ static void pool_set_nwk(uint64_t ieee, uint16_t nwk) {
     zigbee_pool_mark_dirty();
 }
 
-static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
+// ── Coordinator endpoint + group membership ─────────────────────────────
+// A hardware zone-remote (MiBoxer FUT089Z: zones -> groups 101..108) is
+// groupcast-only and not bindable, so its presses reach this coordinator only
+// while endpoint 1 is a member of those groups. The stack's Groups server on
+// EP1 keeps the APS group table; a self-addressed Add Group is the public way
+// to fill it. The TI ZNP path has no equivalent (NATIVE_ZCL_GROUPS_DESIGN.md,
+// Part B) -- this is the esp-zigbee "rank 1" path from that document.
+static constexpr uint16_t kDefaultGroups[] = {101, 102, 103, 104, 105, 106, 107, 108};
+
+static void register_coordinator_endpoint() {
+    ezb_af_ep_config_t cfg{};
+    cfg.ep_id              = 1;
+    cfg.app_profile_id     = EZB_AF_HA_PROFILE_ID;
+    cfg.app_device_id      = 0x0005;   // configuration tool, as the ZNP registers
+    cfg.app_device_version = 0;
+    ezb_af_device_desc_t dev = ezb_af_create_device_desc();
+    ezb_af_ep_desc_t     ep  = ezb_af_create_endpoint_desc(&cfg);
+    if (dev == EZB_INVALID_AF_DEVICE_DESC || ep == EZB_INVALID_AF_EP_DESC) {
+        ESP_LOGW(TAG, "coordinator endpoint: descriptor alloc failed -- no group membership");
+        return;
+    }
+    ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_basic_create_cluster_desc(nullptr, EZB_ZCL_CLUSTER_SERVER));
+    // Server keeps the APS group table; client is what lets EP1 SEND Add Group
+    // (the request is refused without it). One descriptor per role: a combined
+    // role mask with a NULL config faulted inside the library on the bench.
+    ezb_zcl_groups_cluster_server_config_t grp_cfg{};
+    grp_cfg.name_support = 0;   // no group names
+    ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_groups_create_cluster_desc(&grp_cfg, EZB_ZCL_CLUSTER_SERVER));
+    ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_groups_create_cluster_desc(nullptr, EZB_ZCL_CLUSTER_CLIENT));
+    ezb_af_device_add_endpoint_desc(dev, ep);
+    const ezb_err_t e = ezb_af_device_desc_register(dev);
+    ESP_LOGI(TAG, "coordinator endpoint 1 (Basic + Groups server): %s (%d)",
+             e == 0 ? "registered" : "FAILED", (int)e);
+}
+
+// The stack's own Groups server calls this to add an endpoint to a group (it
+// is what an incoming Add Group ends in): exported by libesp-zigbee-core but
+// not in any header. Argument order read from the library's call site: the
+// group id, then the endpoint (checked against 1..254 in the prologue). A
+// self-addressed ZCL Add Group does not loop back on this stack, so this is
+// the one working way to make endpoint 1 a group member.
+extern "C" int aps_group_table_add(uint16_t group_id, uint8_t endpoint);
+
+bool esp_zb_coordinator_join_group(uint16_t group_id) {
+    zb_lock::Guard g;
+    if (!g) return false;
+    const int e = aps_group_table_add(group_id, 1);
+    if (e != 0) ESP_LOGW(TAG, "coordinator join group %u: aps_group_table_add -> %d", group_id, e);
+    return e == 0;
+}
+
+static void join_default_groups() {
+    unsigned ok = 0;
+    for (uint16_t g : kDefaultGroups) ok += esp_zb_coordinator_join_group(g) ? 1 : 0;
+    ESP_LOGI(TAG, "coordinator endpoint 1 joined %u/%u groups (%u..%u, zone remotes)", ok,
+             (unsigned)(sizeof(kDefaultGroups) / sizeof(kDefaultGroups[0])),
+             kDefaultGroups[0], kDefaultGroups[sizeof(kDefaultGroups) / sizeof(kDefaultGroups[0]) - 1]);
+}
+
+
+// The joins and the read-back run on their own task: app_main's stack is
+// 4 KB and the ZCL request builder plus a blocking membership query overran
+// it (FreeRTOS assert in the stdout mutex right after "joining groups").
+static void group_join_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(1500));   // let the stack settle after formation
+    join_default_groups();
+    vTaskDelete(nullptr);
+}
+static void spawn_group_join_task() {
+    if (xTaskCreate(group_join_task, "zb_groups", 6144, nullptr, 3, nullptr) != pdPASS)
+        ESP_LOGW(TAG, "group join task create failed -- zone remotes will not be heard");
+}
+
+static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
     // ZDO answers (profile 0x0000: Bind_rsp 0x8021, Simple_Desc_rsp 0x8004, ...)
     // reach this hook too. The interview engine gets them through its ZDO
     // callbacks; feeding them to the ZCL decoder only produced
     // "decode_frame failed cluster=0x8021" noise and fake unhandled entries.
     if (ind->profile_id == 0x0000) return false;
+    // Groupcast destination: the decoder synthesises `zone` from it (FUT089Z 101..108).
+    const uint16_t group_id = (ind->dst_address.addr_mode == EZB_ADDR_MODE_GROUP)
+                                  ? ind->dst_address.u.group_addr.group : 0;
+    if (group_id) {
+        // Rare and diagnostic: proves the coordinator's group membership works.
+        ESP_LOGI(TAG, "groupcast to group %u: cluster 0x%04x from %s 0x%04x, %u bytes", group_id,
+                 ind->cluster_id, ind->src_address.addr_mode == EZB_ADDR_MODE_EXT ? "ieee" : "nwk",
+                 ind->src_address.addr_mode == EZB_ADDR_MODE_EXT
+                     ? (unsigned)(ind->src_address.u.extended_addr.u64 & 0xFFFF)
+                     : (unsigned)ind->src_address.u.short_addr,
+                 (unsigned)ind->asdu_length);
+    }
 
     // Source may arrive short or extended; the pool is keyed by IEEE.
     uint64_t ieee = 0;
@@ -294,7 +385,7 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
 
     const bool decoded = zhac_adapter_try_decode(
         ieee, model, manuf,
-        /*group_id=*/0,
+        group_id,
         ind->cluster_id, ind->src_endpoint, ind->lqi,
         ind->asdu, ind->asdu_length);
 
@@ -304,9 +395,21 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
         zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, ieee);
     }
 
-    // false = "we did not consume it". ZHAC decodes for its own shadow; the
-    // stack still owes the device its normal ZCL/ZDO handling.
     return false;
+}
+
+// The stack sees ZDO (profile 0) and the Groups cluster; everything else is
+// consumed here. With endpoint 1 registered (Basic + Groups, for group
+// membership) the stack's ZCL engine would otherwise process every device
+// report against an endpoint that declares none of those clusters -- on the
+// bench that ended in a ZBOSS assert ten seconds after boot. ZHAC decodes
+// for its own shadow; the devices get no ZCL replies from the stack, exactly
+// as before the endpoint existed.
+static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
+    if (!ind) return false;
+    if (ind->profile_id == 0x0000) return false;          // ZDO: the stack's
+    on_apsde_indication_inner(ind);
+    return ind->cluster_id != 0x0004;                     // Groups: the stack's too
 }
 
 // ── Egress: adapter-encoded ZCL out over APS ─────────────────────────────
@@ -376,6 +479,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
 
     case EZB_BDB_SIGNAL_FORMATION:
         s_formed = true;
+        spawn_group_join_task();   // first formation of this network
         ESP_LOGI(TAG, "network formed: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
                  (unsigned)ezb_nwk_get_current_channel());
@@ -594,7 +698,7 @@ static bool zb_init() {
                       "commissioning cannot be driven", (int)sig_err);
     }
     zhac_adapter_register_send(esp_zb_af_send);
-
+    register_coordinator_endpoint();
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
 
     // autostart=true: run the normal BDB startup. v2.x does NOT auto-run
@@ -691,6 +795,7 @@ static bool zb_init() {
                      (unsigned)ezb_nwk_get_panid(),
                      (unsigned)ezb_nwk_get_current_channel(),
                      CONFIG_ZHAC_ZB_MAX_CHILDREN);
+            spawn_group_join_task();
         } else {
             // Honest: the backend is registered and the stack runs, but joins
             // are impossible until a PAN exists. permit_join will say so too.
