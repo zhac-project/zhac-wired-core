@@ -148,6 +148,15 @@ jobs:
           s31="zhac-wired-s31-${GITHUB_REF_NAME}.bin"
           cp zhac-wired-core/build.s31/zhac-wired-s31.bin "$s31"
           cp zhac-wired-core/build.s31/zhac-wired-core.bin "zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin"
+          # The parts, so the flash page writes only their regions: NVS (devices, rules,
+          # password, settings) lives between the partition table and otadata, and a
+          # merged image pads that gap with 0xFF -- writing it at 0x0 wipes NVS.
+          for sku in s31 p4-rev1x; do
+            b=zhac-wired-core/build; [ "$sku" = s31 ] && b=zhac-wired-core/build.s31
+            cp "$b/bootloader/bootloader.bin"           "zhac-wired-${sku}-${GITHUB_REF_NAME}-bootloader.bin"
+            cp "$b/partition_table/partition-table.bin" "zhac-wired-${sku}-${GITHUB_REF_NAME}-partition-table.bin"
+            cp "$b/ota_data_initial.bin"                "zhac-wired-${sku}-${GITHUB_REF_NAME}-otadata.bin"
+          done
           cp zhac-wired-core/build/zhac-wired-p4.bin "$img"
           # App partition only: what the OTA page downloads. The merged image
           # above would overwrite the bootloader and partition table.
@@ -165,12 +174,19 @@ jobs:
           cat > notes.md <<NOTES
           ## The ready-made hub: Espressif ESP32-S31 Function-CoreBoard
           One board, nothing to wire. From Chrome or Edge, no toolchain:
-          https://zhac-project.github.io/zhac-docs/flash/ -- or with esptool, one file at offset 0:
+          https://zhac-project.github.io/zhac-docs/flash/ -- it writes the four parts below and keeps
+          your devices, rules and settings (tick "erase" on the page for a clean start).
+          With esptool, the same four parts:
           \`\`\`sh
-          esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash 0x0 ${s31}
+          esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash \\
+            0x2000 zhac-wired-s31-${GITHUB_REF_NAME}-bootloader.bin \\
+            0xC000 zhac-wired-s31-${GITHUB_REF_NAME}-partition-table.bin \\
+            0x1D000 zhac-wired-s31-${GITHUB_REF_NAME}-otadata.bin \\
+            0x20000 zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin
           \`\`\`
-          Then plug in Ethernet and open http://zhac.local. Updates from the web UI use
-          \`zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin\` and keep devices, rules and settings.
+          \`${s31}\` is the same image merged into one file for offset 0 -- it also **erases**
+          devices, rules and settings (it covers the NVS area). Updates from the web UI use
+          \`zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin\` and keep everything.
           
           ## ESP32-P4 boards (Guition JC-ESP32P4-M3-DEV)
           ZHAC on one ESP32-P4 board with Ethernet. Status per board, and what is still

@@ -27,8 +27,13 @@ Prefer a terminal? `pip install esptool`, then from the
 [releases page](https://github.com/zhac-project/zhac-wired-core/releases):
 
 ```sh
-esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash 0x0 zhac-wired-s31-<version>.bin
+esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash \
+  0x2000 zhac-wired-s31-<version>-bootloader.bin 0xC000 zhac-wired-s31-<version>-partition-table.bin \
+  0x1D000 zhac-wired-s31-<version>-otadata.bin 0x20000 zhac-wired-s31-<version>-ota.bin
 ```
+
+That keeps devices, rules and settings. The single merged `zhac-wired-s31-<version>.bin` written at
+`0x0` is a clean start: it covers the settings area and erases it.
 
 ## What works on the S31 today (all of it run on hardware)
 
