@@ -23,8 +23,9 @@ jobs:
           # Enable this row once a v6.1 lands -- and keep the IDF version
           # PINNED PER ROW. Do not move the P4 row onto a beta IDF to unify
           # them; the P4 is the shipping SKU.
-          # - target: esp32s31
-          #   idf: v6.1
+          - target: esp32s31
+            idf: v6.1
+            command: idf.py --preview set-target esp32s31 && idf.py build
     name: build (${{ matrix.target }} / idf ${{ matrix.idf }})
     steps:
       # zhac-wired-core consumes its siblings as read-only inputs, resolved by
@@ -85,6 +86,7 @@ jobs:
           esp_idf_version: ${{ matrix.idf }}
           target: ${{ matrix.target }}
           path: zhac-wired-core
+          command: ${{ matrix.command || 'idf.py build' }}
 
       # A line in sdkconfig.defaults can do nothing in two ways, and only one
       # of them is noisy. This job covers the noisy one: unknown symbols, which

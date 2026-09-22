@@ -102,6 +102,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- Releases now ship the ESP32-S31 image (`zhac-wired-s31-<tag>.bin`, offset 0, plus the `-ota.bin`) built on IDF v6.1 next to the P4 image; CI builds the S31 on every push. The browser flasher at zhac-project.github.io/zhac-docs/flash/ installs it. README rewritten around the S31 board: buy, flash from the browser, open zhac.local.
 - **Status LED.** The board's addressable RGB LED (`CONFIG_ZHAC_STATUS_LED_GPIO`, 60 on the
   S31 dev board, off on boards without one) blinks green while the join window is open and
   flashes blue on Zigbee traffic (a report, a raw frame, a join).

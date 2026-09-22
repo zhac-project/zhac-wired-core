@@ -9,8 +9,8 @@
 # as build.yml does, so the tag alone rebuilds the same inputs; the manifest
 # and a sources list ship next to the image.
 #
-# P4 only: the S31 needs IDF v6.1, which is still a pre-release (see the
-# commented row in build.yml).
+# Two app images: the ESP32-S31 (IDF v6.1, the ready-made board we recommend)
+# and the ESP32-P4 (IDF v6.0), plus the C6 radio image for the P4 boards.
 name: release
 on:
   push:
@@ -115,6 +115,21 @@ jobs:
 
       # The on-module ESP32-C6 is the P4's Zigbee radio and needs its own
       # image (stock ot_rcp, re-pinned), flashed once through its header.
+      - name: Build for the ESP32-S31 (own build dir + sdkconfig, so the P4 build stays intact)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.1
+          target: esp32s31
+          path: zhac-wired-core
+          command: >-
+            idf.py -B build.s31 -D SDKCONFIG=sdkconfig.s31ci --preview set-target esp32s31 &&
+            idf.py -B build.s31 -D SDKCONFIG=sdkconfig.s31ci build &&
+            idf.py -B build.s31 -D SDKCONFIG=sdkconfig.s31ci merge-bin -o zhac-wired-s31.bin
+      - name: The S31 image carries the web UI too
+        run: |
+          size=$(stat -c %s zhac-wired-core/build.s31/spa.pack)
+          test "$size" -gt 65536 || { echo "FAIL: build.s31/spa.pack is only $size bytes" >&2; exit 1; }
+          echo "OK: build.s31/spa.pack $size bytes"
       - name: Build the ESP32-C6 radio image
         uses: espressif/esp-idf-ci-action@v1
         with:
@@ -130,6 +145,9 @@ jobs:
       - name: Name, checksum, notes
         run: |
           img="zhac-wired-p4-rev1x-${GITHUB_REF_NAME}.bin"
+          s31="zhac-wired-s31-${GITHUB_REF_NAME}.bin"
+          cp zhac-wired-core/build.s31/zhac-wired-s31.bin "$s31"
+          cp zhac-wired-core/build.s31/zhac-wired-core.bin "zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin"
           cp zhac-wired-core/build/zhac-wired-p4.bin "$img"
           # App partition only: what the OTA page downloads. The merged image
           # above would overwrite the bootloader and partition table.
@@ -140,11 +158,21 @@ jobs:
           cp zhac-wired-core/release-manifest.json "release-manifest-${GITHUB_REF_NAME}.json"
           {
             echo "zhac-wired-core ${GITHUB_SHA} (${GITHUB_REF_NAME})"
-            echo "esp-idf v6.0 (esp32p4 app), v6.0 (esp32c6 radio)"
+            echo "esp-idf v6.1 (esp32s31 app), v6.0 (esp32p4 app), v6.0 (esp32c6 radio)"
             jq -r '.siblings | to_entries[] | "\(.key) \(.value)"' zhac-wired-core/release-manifest.json
           } > "sources-${GITHUB_REF_NAME}.txt"
           sha256sum *.bin > SHA256SUMS
           cat > notes.md <<NOTES
+          ## The ready-made hub: Espressif ESP32-S31 Function-CoreBoard
+          One board, nothing to wire. From Chrome or Edge, no toolchain:
+          https://zhac-project.github.io/zhac-docs/flash/ -- or with esptool, one file at offset 0:
+          \`\`\`sh
+          esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash 0x0 ${s31}
+          \`\`\`
+          Then plug in Ethernet and open http://zhac.local. Updates from the web UI use
+          \`zhac-wired-s31-${GITHUB_REF_NAME}-ota.bin\` and keep devices, rules and settings.
+          
+          ## ESP32-P4 boards (Guition JC-ESP32P4-M3-DEV)
           ZHAC on one ESP32-P4 board with Ethernet. Status per board, and what is still
           open: https://github.com/zhac-project/zhac-wired-core#status
 
@@ -185,6 +213,7 @@ jobs:
         with:
           body_path: notes.md
           files: |
+            zhac-wired-s31-*.bin
             zhac-wired-p4-rev1x-*.bin
             zhac-rcp-c6-*.bin
             SHA256SUMS

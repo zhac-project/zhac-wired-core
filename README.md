@@ -3,39 +3,70 @@ SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 
-# zhac-wired-core
+# ZHAC wired hub — one board, plug in Ethernet, done
 
-ZHAC on a single ESP32 board with an Ethernet jack. The Zigbee coordinator, the full
-[embedded-zhc](https://github.com/zhac-project/embedded-zhc) device library, rules, Lua,
-MQTT and the web UI all run on the board. There is no Wi-Fi, no Linux host and no cloud
-account: plug in Ethernet and open **http://zhac.local**.
+ZHAC is a Zigbee hub that runs entirely on one ESP32 board: the coordinator, a device library
+of about 5,000 devices (generated from zigbee2mqtt's definitions), rules, Lua scripts, MQTT,
+Home Assistant discovery and the web UI. No Wi-Fi, no Linux box, no cloud account.
 
-It is the `zhac-mono-core` architecture (its own `main/`, direct calls through the
-`mono_bridge` shim instead of HAP-over-SPI) with `esp_eth` in place of `esp_wifi`, and
-`esp-zigbee-lib` as the Zigbee stack.
+## Get one running in ten minutes
 
-## Status — 2026-09-18
+You need an **Espressif ESP32-S31 Function-CoreBoard** (about $25: Ethernet, the Zigbee radio,
+USB-C and a status LED are on it, nothing to solder or wire), a USB-C cable, an Ethernet cable,
+and Chrome or Edge on a desktop computer.
 
-| Target | Board | Zigbee radio | State |
-|---|---|---|---|
-| `esp32s31` | Espressif ESP32-S31 Function-Core | the S31's own 802.15.4 | **Runs on hardware.** Forms a network, pairs and decodes a real device, ZCL groups, permit-join, live web UI. Building it needs ESP-IDF v6.1-beta1. |
-| `esp32p4` | Guition JC-ESP32P4-M3-DEV | the ESP32-C6 on the module, running `ot_rcp` | **Builds. Has not run on hardware yet.** |
+1. Connect the board's **USB-to-UART** port (the USB-C next to the RJ45 jack) to the computer.
+2. Open **https://zhac-project.github.io/zhac-docs/flash/**, press **Install** under
+   *ESP32-S31*, pick the serial port. About two minutes.
+3. Plug in Ethernet and open **http://zhac.local**. The first visit asks you to set a password.
+4. Devices → **Permit join**, put your Zigbee device in pairing mode. The LED blinks green while
+   the join window is open and flashes blue on every Zigbee frame.
 
-Still open before anyone should rely on it:
+Updates come from the web UI (Settings → Update) and keep your devices, rules and settings.
+Prefer a terminal? `pip install esptool`, then from the
+[releases page](https://github.com/zhac-project/zhac-wired-core/releases):
 
-- a join → permit-join → bind cycle on hardware since the 2026-09 SDK-lock fix;
-- a first over-the-air update and a first sign-in on hardware (both built, neither run yet).
+```sh
+esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash 0x0 zhac-wired-s31-<version>.bin
+```
+
+## What works on the S31 today (all of it run on hardware)
+
+- Pairing, interviews of sleepy battery devices, configure/bind, Tuya datapoint devices, native
+  ZCL group membership so zone remotes (MiBoxer FUT089Z and the like) are heard.
+- Rules (a small DSL) and Lua scripts; MQTT with a state topic per device; Home Assistant
+  discovery (Settings → MQTT); Telegram-free, cloud-free.
+- Web UI: devices, rules, scripts, groups, diagnostics (tasks, heap, unhandled frames), logs,
+  update. Status LED. A boot guard that keeps the UI up if the radio ever dies.
+
+## Limits, honestly
+
+- Ethernet only. The S31 has BLE and 802.15.4, no Wi-Fi. That is the point of a hub, but say
+  so before buying.
+- Board only: no case yet (a printable one is welcome), no PoE; powered over USB-C.
+- The first over-the-air update from the web UI has been built and tested against a release
+  feed, not yet through a full release cycle. The browser flasher always works.
+- Backup/restore of pairings is not there yet; a full erase means re-pairing.
+- ESP-IDF v6.1 is the first release with the S31. Releases ship prebuilt, so you do not need it
+  unless you build yourself (below).
 
 Bugs, missing devices and reports about other boards go to the
 [ZHAC issue tracker](https://github.com/zhac-project/zhac-platform/issues/new/choose).
+
+## Status — 2026-09-22
+
+| Target | Board | Zigbee radio | State |
+|---|---|---|---|
+| `esp32s31` | Espressif ESP32-S31 Function-CoreBoard | the S31's own 802.15.4 | **Recommended.** Runs on hardware: pairing, rules, MQTT/HA, groups, LED, update page. |
+| `esp32p4` | Guition JC-ESP32P4-M3-DEV | the ESP32-C6 on the module, running `ot_rcp` | Builds and releases. The C6 must be flashed once through its own header. Not run on hardware by the maintainers. |
 
 ## Boards
 
 | Board | SoC | Ethernet | Zigbee radio | Status |
 |---|---|---|---|---|
-| Guition JC-ESP32P4-M3-DEV (≈ $14) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | builds, not yet run |
-| Espressif ESP32-S31 Function-Core | ESP32-S31 | YT8531, 1 Gbit, RGMII | the S31's own 802.15.4 | runs on hardware |
-| Any other ESP32-P4 board | check the revision first | set the `ZHAC_ETH_*` pins in menuconfig | an 802.15.4 ESP chip (C6/H2) running `ot_rcp` on a spare UART | untested — [send a board report](https://github.com/zhac-project/zhac-platform/issues/new?template=board-report.yml) |
+| Espressif ESP32-S31 Function-CoreBoard (≈ $25) | ESP32-S31 | YT8531, 1 Gbit, RGMII | the S31's own 802.15.4 | runs on hardware, recommended |
+| Guition JC-ESP32P4-M3-DEV (≈ $14) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | builds, not yet run on hardware |
+| Any other ESP32-P4 board | check the revision first | set the `ZHAC_ETH_*` pins in menuconfig | an 802.15.4 ESP chip running `ot_rcp` | untested |
 
 The WT0132P4-A1 board used by the dual-chip flagship has **no Ethernet PHY** and cannot
 run this firmware past a boot smoke test. `extra/docs/esp32_p4_gpio_allocation.md`
