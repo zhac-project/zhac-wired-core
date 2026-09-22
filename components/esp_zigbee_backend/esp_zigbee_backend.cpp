@@ -361,7 +361,15 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
             // vanishing into the unhandled counter.
             ezb_extaddr_t ext{};
             if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
-                zigbee_pool_snapshot(ext.u64, &snap)) {
+                !zigbee_pool_snapshot(ext.u64, &snap)) {
+                // Joined (the stack resolves it) but not ours: adopt it. The
+                // pool entry appears now, so this frame and the next ones
+                // decode under the right device; the interview fills identity.
+                zb_interview_adopt(ext.u64, nwk);
+                zigbee_pool_snapshot(ext.u64, &snap);
+                ieee = snap.ieee_addr;
+            } else if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
+                       zigbee_pool_snapshot(ext.u64, &snap)) {
                 ieee = ext.u64;
                 pool_set_nwk(ieee, nwk);
                 ESP_LOGI(TAG, "%016llx now at nwk 0x%04x (pool had 0x%04x) -- address refreshed",

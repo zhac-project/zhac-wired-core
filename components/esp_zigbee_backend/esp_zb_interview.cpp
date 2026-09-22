@@ -594,6 +594,21 @@ void zb_interview_init() {
              kMaxAttempts, (unsigned)(kRetryDelayMs / 1000));
 }
 
+// A device the stack knows (it is joined, the address map resolves it) but
+// the pool does not: ZHAC forgot it -- NVS wiped, or it joined while the
+// firmware was down. Joined devices do not announce again, so without this a
+// forgotten mains device is never interviewed and shows as "not in the pool"
+// forever. The ZNP path adopts such devices from their first frame; same here.
+void zb_interview_adopt(uint64_t ieee, uint16_t nwk) {
+    if (ieee == 0 || nwk == 0) return;
+    ZapDevice snap{};
+    if (zigbee_pool_snapshot(ieee, &snap)) return;   // known: nothing to do
+    if (!pool_upsert(ieee, nwk)) return;             // pool full: logged there
+    ESP_LOGI(TAG, "%016llx at nwk 0x%04x is joined but unknown -- adopting it, interview queued",
+             (unsigned long long)ieee, nwk);
+    zb_interview_enqueue(ieee, nwk);
+}
+
 void zb_interview_enqueue(uint64_t ieee, uint16_t nwk) {
     if (!s_join_q || ieee == 0) return;
     if (s_active_ieee == ieee) {

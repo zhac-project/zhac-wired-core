@@ -53,6 +53,12 @@ bool zb_interview_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
 // a sleepy end-device is awake right now, so the retry loop fires its next
 // attempt immediately instead of finishing its 30 s sleep. Cheap no-op for
 // every other device.
+// A frame from a device the stack knows but the pool does not (NVS wiped, or
+// it joined while ZHAC was down): create the pool entry and queue an
+// interview. Joined devices never announce again, so this is the only way
+// back. No-op for a device already in the pool.
+void zb_interview_adopt(uint64_t ieee, uint16_t nwk);
+
 void zb_interview_note_traffic(uint64_t ieee);
 
 // Register the configure transports (bind / report / cmd / read / write) with
