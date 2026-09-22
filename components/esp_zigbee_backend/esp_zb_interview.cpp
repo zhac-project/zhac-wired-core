@@ -108,6 +108,14 @@ volatile uint64_t s_active_ieee = 0;
 // then, so the retry loop stops sleeping and fires the next attempt at once.
 // Same shape as the ZNP path's s_wake_sem.
 SemaphoreHandle_t s_wake_sem = nullptr;
+// Set when a DIFFERENT device is queued while an attempt runs: that device just
+// announced, so it is awake now, and the running attempt (up to ~40 s of
+// timeouts on a sleeping device) must stop within a step slice so the
+// announcer is interviewed while it still listens. Without this a re-paired
+// remote waited behind every other sleepy device's retries and was asleep
+// again by its turn -- "no manufacturer, no model" after several re-pairs.
+volatile bool s_preempt = false;
+constexpr uint32_t kSliceMs = 200;
 constexpr uint32_t kZdoTimeoutMs   = 5000;
 constexpr uint32_t kBasicTimeoutMs = 5000;
 
@@ -129,7 +137,13 @@ void step_done(bool ok) {
 }
 
 bool step_wait(uint32_t timeout_ms) {
-    if (xSemaphoreTake(s_step_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    // Wait in slices so a newcomer's announce can cut a hopeless wait short.
+    BaseType_t got = pdFALSE;
+    for (uint32_t waited = 0; waited < timeout_ms && got != pdTRUE; waited += kSliceMs) {
+        got = xSemaphoreTake(s_step_sem, pdMS_TO_TICKS(kSliceMs));
+        if (got != pdTRUE && s_preempt) return false;
+    }
+    if (got != pdTRUE) {
         return false;
     }
     return s_step_ok;
@@ -265,7 +279,11 @@ bool read_basic_once(uint16_t nwk, uint8_t ep, uint8_t tsn) {
         s_basic_nwk = 0;
         return false;
     }
-    const bool got = xSemaphoreTake(s_basic_sem, pdMS_TO_TICKS(kBasicTimeoutMs)) == pdTRUE;
+    bool got = false;
+    for (uint32_t waited = 0; waited < kBasicTimeoutMs && !got; waited += kSliceMs) {
+        got = xSemaphoreTake(s_basic_sem, pdMS_TO_TICKS(kSliceMs)) == pdTRUE;
+        if (!got && s_preempt) break;
+    }
     s_basic_nwk = 0;
     return got && s_basic_len > 0;
 }
@@ -314,7 +332,7 @@ bool read_basic(ZapDevice* work, uint16_t nwk) {
     const uint8_t n = zigbee_interview_build_basic_probe_order(*work, order, sizeof(order));
     for (uint8_t i = 0; i < n; i++) {
         bool got = false;
-        for (int r = 0; r < kBasicReadsPerEp && !got; r++) {
+        for (int r = 0; r < kBasicReadsPerEp && !got && !s_preempt; r++) {
             if (r) vTaskDelay(pdMS_TO_TICKS(kBasicRetryGapMs));
             got = read_basic_once(nwk, order[i], zcl_seq_next());
         }
@@ -505,6 +523,7 @@ void task_interview(void*) {
 
         if (!pool_upsert(req.ieee, req.nwk)) continue;
         s_active_ieee = req.ieee;
+        s_preempt = false;
 
         bool ok = false;
         bool yielded = false;
@@ -531,9 +550,10 @@ void task_interview(void*) {
                 if (uxQueueMessagesWaiting(s_join_q) > 0) {
                     const JoinReq back{req.ieee, req.nwk, static_cast<uint8_t>(attempt)};
                     if (xQueueSend(s_join_q, &back, 0) == pdTRUE) {
-                        ESP_LOGI(TAG, "%016llx yields to a queued peer after %d/%d -- "
+                        ESP_LOGI(TAG, "%016llx yields to a queued peer after %d/%d%s -- "
                                       "back in the queue",
-                                 (unsigned long long)req.ieee, attempt, kMaxAttempts);
+                                 (unsigned long long)req.ieee, attempt, kMaxAttempts,
+                                 s_preempt ? " (its announce cut this attempt short)" : "");
                         yielded = true;
                         break;
                     }
@@ -620,6 +640,7 @@ void zb_interview_enqueue(uint64_t ieee, uint16_t nwk) {
         return;
     }
     const JoinReq r{ieee, nwk, 0};
+    if (s_active_ieee != 0) s_preempt = true;   // someone else is awake now: stop waiting on the sleeper
     if (xQueueSend(s_join_q, &r, 0) != pdTRUE) {
         ESP_LOGW(TAG, "join queue full -- dropping announce for %016llx",
                  (unsigned long long)ieee);
