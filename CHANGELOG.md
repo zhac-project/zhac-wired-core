@@ -7,9 +7,14 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 All notable changes to `zhac-wired-core` are recorded here. Format follows the convention
 used across the other ZHAC repos: an `## [Unreleased]` section accumulates work, and its
+contents become the release-tag annotation at `just release`.
+
+## [Unreleased]
 
 ### Fixed
 
+- The v2026092205 release images were built against the previous `zhac-components` / `embedded-zhc` pins in `release-manifest.json`, so they lack the Tuya time-sync answer (0xEF00 cmd 0x24) that release lists. The pins now match the sources the bench build used; flash v2026092206 or later.
+- The hub could not connect to ZHAC Cloud at all: the cloud client (`remote_client`, pulled from zhac-net-core) is switched by `CONFIG_ZHAC_REMOTE_CLIENT_ENABLE`, which only the net-core and mono Kconfig trees define, so every wired build compiled it out and the web UI hid the Remote card. The wired tree now defines the "ZHAC Remote (cloud link)" menu (on by default; the link stays idle until a URL and token are saved). With it on, three more faults showed: the client waited for a Wi-Fi got-IP edge that an Ethernet hub never produces after boot (fixed in net-core `remote_client`); every event reached the cloud wrapped twice (`{"event":..,"data":{"event":..}}`), so the cloud found no device in it; and events were mirrored only while a browser tab was open. Pushes now hand the relay the bare payload and go out whenever the relay is connected. Cloud commands run the same handlers as the local WebSocket, so the remote task gets the httpd worker's 12 KB stack (`CONFIG_ZHAC_REMOTE_TASK_STACK_KB`). Ported from net-core's `api_remote`, which the port had dropped: the link URL must be `wss://` (DS9: a `ws://` link would carry the token and device control in cleartext), URL/token/device id are length-checked (an over-long value used to save fine and then fail to load at every boot), and `remote.status` reports the state by name, so the Remote card shows "Connected" instead of a bare number.
 - A sleepy Tuya thermostat (Saswell SEA801) showed only `local_temperature`: every bind, read and DATA_QUERY to it failed with `apsde_data_request … failed (1)` (the stack's buffer pool spent by frames still pending for the sleeping device), and the interview loop downgraded its late-path identity to unknown. Sends from a task now wait up to 4 s for buffers instead of failing at once; a Basic-read burst stops when the stack refuses to queue one; a device whose identity is already known is not read again; a device the decoder matches while the pool still says unknown is marked identified+matched on the spot (so the configure-while-awake kick fires); bind answers get 10 s (z2m's ZDO timeout) instead of 5 s.
 - A re-paired battery device could stay without manufacturer/model: with several sleepy devices cycling through retries (each failed attempt is ~40 s of timeouts) the newcomer waited minutes for the single interview task and was asleep again by its turn. An announce now preempts the running attempt within 200 ms, so the device that just announced is interviewed while it is awake; the interrupted one goes back into the queue.
 - A device that is joined but unknown to ZHAC (settings wiped, or it joined while the firmware was down) was never interviewed: joined devices do not announce again and this backend only created pool entries on an announce, so mains devices stayed "not in the pool" with no model. A frame from such a device now creates its entry and queues an interview, as the ZNP path does.
@@ -100,9 +105,6 @@ used across the other ZHAC repos: an `## [Unreleased]` section accumulates work,
   the radio dispatch. The REST device list carries decimals (`VAL_FLOAT` ÷ 100). The
   post-update health check also requires the event dispatcher task and readable sign-in
   storage.
-contents become the release-tag annotation at `just release`.
-
-## [Unreleased]
 
 ### Added
 

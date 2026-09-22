@@ -14,30 +14,42 @@
 #include "esp_log.h"
 #include "remote_client.h"
 #include "remote_nvs.h"
+#include "remote_state.h"
 
 static const char* TAG = "api_remote";
 
 size_t remote_status_json(char* out, size_t cap) {
     RemoteStatusSnap s{};
     remote_client_get_status(&s);
+    // State by name, as net-core sends it: the web UI's badge maps "READY" to
+    // "Connected" and showed nothing for a bare number.
     return (size_t)snprintf(out, cap,
-        "{\"enabled\":%s,\"state\":%u,\"connected_since\":%u,\"last_event_at\":%u,"
+        "{\"enabled\":%s,\"state\":\"%s\",\"connected_since\":%u,\"last_event_at\":%u,"
         "\"rtt_ms\":%u,\"tx_drops\":%u,\"auth_fails\":%u}",
-        s.enabled ? "true" : "false", (unsigned)s.state,
+        s.enabled ? "true" : "false", remote_state_name((RemoteState)s.state),
         (unsigned)s.connected_since, (unsigned)s.last_event_at,
         (unsigned)s.rtt_ms, (unsigned)s.tx_drops, (unsigned)s.auth_fails);
 }
 
-bool remote_connect_req(const char* body, size_t len) {
+const char* remote_connect_req(const char* body, size_t len) {
     JsonDocument d;
-    if (!body || len == 0 || deserializeJson(d, body, len)) return false;
+    if (!body || len == 0 || deserializeJson(d, body, len)) return "bad request";
     const char* url = d["url"]       | (const char*)"";
     const char* tok = d["token"]     | (const char*)"";
     const char* did = d["device_id"] | (const char*)"";   // "" keeps stored
-    if (!url[0] || !tok[0]) return false;
-    if (!remote_nvs_save(true, url, tok, did)) return false;
+    if (!url[0] || !tok[0]) return "url + token required";
+    // DS9, as on net-core: TLS only. A ws:// link would carry the bearer token and
+    // the whole device-control surface in cleartext, and the server-certificate
+    // check (esp_crt_bundle) only applies to wss://.
+    if (std::strncmp(url, "wss://", 6) != 0) return "url must start with wss://";
+    // remote_nvs_load() reads into fixed buffers and fails on anything longer, which
+    // left an over-long value saved and the link dead at every boot. Refuse it here.
+    if (std::strlen(url) >= REMOTE_NVS_URL_MAX)   return "url too long";
+    if (std::strlen(tok) >= REMOTE_NVS_TOKEN_MAX) return "token too long";
+    if (std::strlen(did) >= REMOTE_NVS_DEVID_MAX) return "device_id too long";
+    if (!remote_nvs_save(true, url, tok, did)) return "could not save";
     remote_client_enable();
-    return true;
+    return nullptr;
 }
 
 bool remote_disconnect_req(const char* body, size_t len, bool* forget_out) {
@@ -59,13 +71,13 @@ static esp_err_t h_status(httpd_req_t* req) {
 }
 
 static esp_err_t h_connect(httpd_req_t* req) {
-    char body[320];
+    char body[512];   // room for an over-long value to reach the length checks
     int n = httpd_req_recv(req, body, sizeof(body) - 1);
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
     body[n] = '\0';
     httpd_resp_set_type(req, "application/json");
-    if (!remote_connect_req(body, (size_t)n)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "url + token required");
+    if (const char* err = remote_connect_req(body, (size_t)n)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
         return ESP_FAIL;
     }
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -97,7 +109,7 @@ bool api_remote_register(httpd_handle_t hd) {
 #else  // CONFIG_ZHAC_REMOTE_CLIENT_ENABLE off — link-only stubs
 
 size_t remote_status_json(char*, size_t) { return 0; }
-bool   remote_connect_req(const char*, size_t) { return false; }
+const char* remote_connect_req(const char*, size_t) { return "cloud link not built"; }
 bool   remote_disconnect_req(const char*, size_t, bool* f) { if (f) *f = false; return false; }
 bool   api_remote_register(httpd_handle_t) { return true; }
 

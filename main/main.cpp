@@ -315,7 +315,8 @@ extern "C" void app_main() {
     // positions must match EVB_WIFI_UP = 1<<2 / EVB_WIFI_DOWN = 1<<3 in
     // remote_client.cpp, which lives in a read-only sibling repo -- so the
     // names stay WiFi-flavoured even though the events are now Ethernet's.
-    // Only the source changes.
+    // Only the source changes. The lease is usually taken before this runs;
+    // the client's own ~1 s uplink check (Wi-Fi STA or Ethernet) covers that.
     extern EventGroupHandle_t s_remote_evt;   // owned by remote_client.cpp
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
         [](void*, esp_event_base_t, int32_t, void*) {

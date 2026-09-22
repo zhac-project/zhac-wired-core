@@ -13,5 +13,5 @@ bool   api_remote_register(httpd_handle_t hd);
 
 // Shared with the WS command handlers (ws_bridge.cpp):
 size_t remote_status_json(char* out, size_t cap);                       // {enabled,state,...}
-bool   remote_connect_req(const char* body, size_t len);                // save creds + enable
+const char* remote_connect_req(const char* body, size_t len);           // save creds + enable; nullptr = ok, else why not
 bool   remote_disconnect_req(const char* body, size_t len, bool* forget_out);

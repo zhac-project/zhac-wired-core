@@ -177,3 +177,58 @@ menu "ZHAC wired-core board"
             traffic, off otherwise. The S31 dev board has one on GPIO 60.
 
 endmenu
+
+# The cloud link (remote_client, pulled from zhac-net-core by path). That
+# component has no Kconfig of its own -- each firmware root defines these
+# symbols -- and this root never did, so every wired build compiled the client
+# out: no cloud link, and the web UI hid the Remote card.
+menu "ZHAC Remote (cloud link)"
+
+    config ZHAC_REMOTE_CLIENT_ENABLE
+        bool "Build the cloud link (WSS client)"
+        default y
+        help
+            Compiles the client in; it stays idle until a URL and token are
+            saved in Settings -> Remote, so building it costs nothing at run
+            time. Default y here (net-core defaults it n and turns it on in
+            sdkconfig.defaults) so an existing sdkconfig picks it up too.
+
+    config ZHAC_REMOTE_TX_QUEUE_DEPTH
+        int "Remote TX queue depth (events)"
+        depends on ZHAC_REMOTE_CLIENT_ENABLE
+        default 16
+        range 4 64
+
+    config ZHAC_REMOTE_PING_INTERVAL_S
+        int "WSS ping interval (s)"
+        depends on ZHAC_REMOTE_CLIENT_ENABLE
+        default 20
+        range 5 120
+
+    config ZHAC_REMOTE_BACKOFF_MAX_S
+        int "Reconnect backoff cap (s)"
+        depends on ZHAC_REMOTE_CLIENT_ENABLE
+        default 60
+        range 5 600
+
+    config ZHAC_REMOTE_TASK_STACK_KB
+        int "Remote task stack (KB)"
+        depends on ZHAC_REMOTE_CLIENT_ENABLE
+        default 12
+        range 6 32
+        help
+            Cloud commands run the same handlers the local WebSocket runs on
+            the 12 KB httpd worker, and on this build they call the Zigbee,
+            rules and Lua code directly. Keep it at least as deep as that.
+
+    config ZHAC_REMOTE_ALLOW_PRIVILEGED
+        bool "Allow the cloud to invoke privileged commands"
+        depends on ZHAC_REMOTE_CLIENT_ENABLE
+        default n
+        help
+            Off: the cloud cannot reflash, reset the network, run or write
+            Lua, delete devices or change settings -- only reads and
+            recoverable device, rule and group operations. Turn on only for
+            a cloud endpoint you operate and trust.
+
+endmenu
