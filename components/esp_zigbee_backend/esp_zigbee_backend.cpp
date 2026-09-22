@@ -240,6 +240,66 @@ static void spawn_group_join_task() {
         ESP_LOGW(TAG, "group join task create failed -- zone remotes will not be heard");
 }
 
+// ── ZCL Default Response + retry guard ─────────────────────────────────
+// Tuya sleepy remotes (TS0044, TS004F, FUT089Z) resend a command when no ZCL
+// Default Response comes back -- on the bench one press of a TS0044 arrived
+// as two "1_single" actions 300 ms apart and toggled a relay twice. The ZNP
+// path answers every unicast command (zigbee_send_default_response); this
+// backend consumed all ZCL frames and answered nothing. Same rule here: reply
+// to every unicast command whose frame control did not opt out, never to a
+// response, and drop an identical resend that slips through anyway.
+static bool global_cmd_wants_default_response(uint8_t cmd) {
+    switch (cmd) {   // global responses, never ACKed (ZCL 2.5.12)
+        case 0x01: case 0x04: case 0x05: case 0x07: case 0x09:
+        case 0x0B: case 0x0D: case 0x10: case 0x12: case 0x14: case 0x16: return false;
+        default: return true;
+    }
+}
+
+static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16_t cluster,
+                                            const uint8_t* zcl, uint16_t len) {
+    if (nwk == 0 || !zcl || len < 3) return;
+    const uint8_t in_fc = zcl[0];
+    const bool    mfg   = (in_fc & 0x04) != 0;
+    const size_t  hdr   = mfg ? 5 : 3;
+    if (len < hdr) return;
+    const bool    is_cs = (in_fc & 0x03) == 0x01;
+    const uint8_t tsn   = zcl[hdr - 2];
+    const uint8_t cmd   = zcl[hdr - 1];
+    if (in_fc & 0x10) return;                                   // opted out
+    if (!is_cs && (cmd == 0x0B || !global_cmd_wants_default_response(cmd))) return;
+    if (!is_cs && cmd == 0x00 && cluster == 0x000A) return;     // genTime read: answered in full
+    uint8_t out[8];
+    size_t  n  = 0;
+    uint8_t fc = 0x10;                                          // no response to this response
+    if (!(in_fc & 0x08)) fc |= 0x08;                            // flip direction
+    if (mfg) fc |= 0x04;
+    out[n++] = fc;
+    if (mfg) { out[n++] = zcl[1]; out[n++] = zcl[2]; }
+    out[n++] = tsn;
+    out[n++] = 0x0B;                                            // Default Response
+    out[n++] = cmd;
+    out[n++] = 0x00;                                            // SUCCESS
+    esp_zb_af_send(nwk, src_ep ? src_ep : 1, cluster, out, n);
+}
+
+// An identical cluster-specific command (same source, cluster, TSN) inside
+// 1.5 s is the device's retry, not a second press.
+static bool zcl_is_retry(uint16_t nwk, uint16_t cluster, const uint8_t* zcl, uint16_t len) {
+    if (len < 3 || (zcl[0] & 0x03) != 0x01) return false;       // commands only
+    const uint8_t tsn = (zcl[0] & 0x04) ? zcl[3] : zcl[1];
+    struct Seen { uint16_t nwk, cluster; uint8_t tsn; int64_t us; };
+    static Seen s_seen[8];
+    static uint8_t s_next = 0;
+    const int64_t now = esp_timer_get_time();
+    for (const Seen& e : s_seen) {
+        if (e.nwk == nwk && e.cluster == cluster && e.tsn == tsn && now - e.us < 1500 * 1000LL) return true;
+    }
+    s_seen[s_next] = Seen{nwk, cluster, tsn, now};
+    s_next = static_cast<uint8_t>((s_next + 1) % 8);
+    return false;
+}
+
 static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     if (!ind || !ind->asdu || ind->asdu_length == 0) return false;
     // ZDO answers (profile 0x0000: Bind_rsp 0x8021, Simple_Desc_rsp 0x8004, ...)
@@ -312,6 +372,13 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
 
     if (ind->cluster_id == 0x000A) {
         respond_gen_time(nwk, ind->src_endpoint, ind->asdu, ind->asdu_length);
+    }
+    if (group_id == 0) {
+        send_default_response_if_needed(nwk, ind->src_endpoint, ind->cluster_id, ind->asdu, ind->asdu_length);
+        if (zcl_is_retry(nwk, ind->cluster_id, ind->asdu, ind->asdu_length)) {
+            ESP_LOGD(TAG, "retry of a command from nwk 0x%04x cluster 0x%04x dropped", nwk, ind->cluster_id);
+            return false;
+        }
     }
 
     if (ieee == 0) {
