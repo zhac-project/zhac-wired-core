@@ -7,9 +7,9 @@
   "siblings": {
     "zhac-components": "43c799dc2a3bb0d2a716681170f02b5548ed7fd4",
     "zhac-net-core": "4ef0464b3304d1783bf75c0fed20e0c402ab1592",
-    "embedded-zhc": "db22f8f128b6b77fefc2c9bdd2b687ee9a47680f",
+    "embedded-zhc": "510892bbd791a584bf6032e772a6da594538c625",
     "zhac-main-core": "bb1fbab33ad6757b2897d34ebe41b2d466fdc473",
-    "www-spa": "071f513a44405238c94c02edf356b8424f8cfad0",
+    "www-spa": "2722dfe971ee0c80a1c004c841a6e25660f77d36",
     "zhac-docs": "44922fa1f813ccf2a3ec72f73deeb5fec362ea3d"
   }
 }

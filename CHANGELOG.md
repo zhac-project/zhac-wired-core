@@ -11,6 +11,10 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Added
+
+- **Weekly schedule for Saswell SEA801/SEA802 radiator valves** (and their white labels): the device page's States tab shows a Monday-to-Sunday editor, four periods a day (start time + °C), with "Copy Monday to Tue–Fri" and one Save for the changed days. The valve reports each day and takes a day per write (embedded-zhc codec; www-spa editor, pinned in `release-manifest.json`). Home Assistant gets the seven days as editable text entities. The valve runs the program on the clock the hub sends it, so set the hub's timezone.
+
 ### Fixed
 
 - The v2026092205 release images were built against the previous `zhac-components` / `embedded-zhc` pins in `release-manifest.json`, so they lack the Tuya time-sync answer (0xEF00 cmd 0x24) that release lists. The pins now match the sources the bench build used; flash v2026092206 or later.
