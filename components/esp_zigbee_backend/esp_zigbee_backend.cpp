@@ -159,6 +159,27 @@ static void respond_gen_time(uint16_t nwk, uint8_t dst_ep, const uint8_t* zcl, u
              clock_ok ? "" : " (clock not synced: UNSUPPORTED)", sent ? "" : " SEND FAILED");
 }
 
+// Does this device switch its radio off between polls? The adapter holds
+// writes and Tuya queries for such devices and resends them when they next
+// transmit (zhac_adapter_register_sleepy). For the coordinator's own children
+// the neighbour table knows (rx_on_when_idle). A device parented by a router
+// is not in it; there a battery power source (ZCL powerSource 0x03, bit 7 =
+// backup battery) stands in.
+static bool esp_zb_is_sleepy(uint64_t ieee) {
+    {
+        zb_lock::Guard g;
+        if (g) {
+            ezb_nwk_info_iterator_t it = EZB_NWK_INFO_ITERATOR_INIT;
+            ezb_nwk_neighbor_info_t nb{};
+            while (ezb_nwk_get_next_neighbor(&it, &nb) == EZB_ERR_NONE) {
+                if (nb.ieee_addr.u64 == ieee) return nb.rx_on_when_idle == 0;
+            }
+        }
+    }
+    ZapDevice d{};
+    return zigbee_pool_snapshot(ieee, &d) && (d.power_source & 0x7F) == 0x03;
+}
+
 // Short addresses get reused. The pool learns them from announces, the stack's
 // own address map from every frame -- the map is authoritative.
 static void pool_set_nwk(uint64_t ieee, uint16_t nwk) {
@@ -809,6 +830,7 @@ static bool zb_init() {
                       "commissioning cannot be driven", (int)sig_err);
     }
     zhac_adapter_register_send(esp_zb_af_send);
+    zhac_adapter_register_sleepy(esp_zb_is_sleepy);
     register_coordinator_endpoint();
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
 
