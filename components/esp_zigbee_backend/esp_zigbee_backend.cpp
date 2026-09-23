@@ -574,6 +574,23 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     return true;
 }
 
+// Commands the adapter encodes carry a placeholder TSN (0). The ZNP bridge
+// numbers them; this path sent them as they came, so every library command
+// from this hub had TSN 0 -- and a Tuya device takes a frame with the TSN of
+// the one before for a resend of it. Number them from the shared counter.
+// Replies built in this file (genTime, default responses) must keep the
+// request's TSN and call esp_zb_af_send directly.
+static bool esp_zb_adapter_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
+                                const uint8_t* zcl_data, size_t zcl_len) {
+    uint8_t f[128];
+    if (!zcl_data || zcl_len > sizeof(f)) return false;
+    const size_t tsn_at = (zcl_data[0] & 0x04) ? 3 : 1;   // manufacturer code sits before it
+    if (zcl_len < tsn_at + 2) return false;                // TSN and command id
+    std::memcpy(f, zcl_data, zcl_len);
+    f[tsn_at] = zcl_seq_next();
+    return esp_zb_af_send(nwk_addr, dst_ep, cluster_id, f, zcl_len);
+}
+
 // ── Stack lifecycle signals ──────────────────────────────────────────────
 //
 // This handler is not optional decoration -- it DRIVES commissioning.
@@ -829,7 +846,7 @@ static bool zb_init() {
         ESP_LOGE(TAG, "app signal handler registration FAILED (%d) -- "
                       "commissioning cannot be driven", (int)sig_err);
     }
-    zhac_adapter_register_send(esp_zb_af_send);
+    zhac_adapter_register_send(esp_zb_adapter_send);
     zhac_adapter_register_sleepy(esp_zb_is_sleepy);
     register_coordinator_endpoint();
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
