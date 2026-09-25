@@ -56,6 +56,7 @@
 #include "log_ring.h"
 #include "api_remote.h"
 #include "remote_client.h"
+#include "devlist_page.h"
 #include "simple_rules.h"
 #include "rule_store.h"
 #include "zap_common.h"
@@ -418,17 +419,106 @@ static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
 
 // ── device.list ──────────────────────────────────────────────────────
 //
-// JSON array of device summaries — the main devices page. One small
-// JSON doc per row; ws_server_reply takes a single buffer so we batch
-// into one ~8 KB buffer rather than chunked. For 20-30 devices this
-// stays well under cap. Shadow attrs are skipped here — the SPA pulls
-// detail via device.get when the user opens a row.
-static void cmd_device_list(int fd, uint32_t id) {
-    char* buf = (char*)heap_caps_malloc(8 * 1024, MALLOC_CAP_SPIRAM);
+// Device summaries — metadata only; the SPA pulls attrs via device.get
+// when the user opens a row. Two reply shapes, identical rows:
+//   * local SPA: the whole list as one bare array in pool order, in a
+//     buffer sized to the pool. A fixed 8 KB buffer used to stop at
+//     ~25-35 devices without a word.
+//   * cloud (REMOTE_VIRTUAL_FD), or any caller that passes `cursor`: one
+//     page {"items":[...],"next_cursor":"0x…"} of at most 8 KB, in IEEE
+//     order (devlist_page.h). The cloud link carries 8 KB per frame
+//     (remote_client) and the cloud's reconcile follows next_cursor,
+//     which is left out on the last page.
+
+// One row. Friendly labels come from the matched definition ("Tuya" /
+// "TS0203"), falling back to the device's own Basic strings when no def
+// matches. The SPA's device table reads `vendor`, NOT `manufacturer` —
+// omitting it left the Manufacturer column showing "—" for every device
+// even though the raw string was right there in the row. `manufacturer`
+// stays as the raw Basic 0x0004 value, which the detail tab reads. Same
+// contract as hap_json's device_list encoder. Returns snprintf's length:
+// <= 0 or >= cap means the row did not fit.
+static int format_device_row(const ZapDevice& d, bool first, char* row, size_t cap) {
+    char vendor_buf[32] = {};
+    char model_buf[32]  = {};
+    zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
+                                vendor_buf, sizeof(vendor_buf),
+                                model_buf,  sizeof(model_buf));
+    const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
+    const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
+    return snprintf(row, cap,
+        "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
+        "\"friendly\":\"%s\",\"name\":\"%s\","
+        "\"model\":\"%s\",\"manufacturer\":\"%s\","
+        "\"vendor\":\"%s\",\"model_id\":\"%s\",\"known\":%s,"
+        "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
+        "\"ep_count\":%u}",
+        first ? "" : ",",
+        d.ieee_addr, d.nwk_addr,
+        d.friendly_name, d.friendly_name, model_out, d.manufacturer_name,
+        vendor_out, d.model_id, model_buf[0] ? "true" : "false",
+        (int64_t)d.last_seen, d.link_quality, d.battery_pct,
+        d.endpoint_count);
+}
+
+// One cloud page: the devices after IEEE `after` (0 = the first page).
+static void cmd_device_list_page(int fd, uint32_t id, uint64_t after) {
+    constexpr size_t kCap  = 8 * 1024;   // remote_client's per-frame cap
+    constexpr size_t kTail = 48;         // `],"next_cursor":"0x0123456789ABCDEF"}}`
+    char* buf = (char*)heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM);
     if (!buf) { send_err(fd, id, "oom"); return; }
-    int pos = snprintf(buf, 8 * 1024,
+    int pos = snprintf(buf, kCap,
+                       "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"items\":[", id);
+    bool first = true, more = false;
+    uint64_t last = after;
+    int skipped = 0;
+
+    zigbee_pool_lock();
+    ZapDevice* pool = pool_all();
+    const uint16_t cnt = pool_count();
+    for (;;) {
+        const int i = devlist_next(cnt, last,
+            [pool](size_t k) { return pool[k].ieee_addr; },
+            [pool](size_t k) { return !zap_dev_is_removed(&pool[k]); });
+        if (i < 0) break;
+        char row[512];
+        const int rn = format_device_row(pool[i], first, row, sizeof(row));
+        if (rn <= 0 || rn >= (int)sizeof(row)) {   // bounded fields make this unreachable;
+            skipped++;                             // step past it rather than re-send the
+            last = pool[i].ieee_addr;              // same cursor forever
+            continue;
+        }
+        if ((size_t)(pos + rn) + kTail >= kCap) { more = true; break; }
+        std::memcpy(buf + pos, row, rn);
+        pos += rn;
+        first = false;
+        last = pool[i].ieee_addr;
+    }
+    zigbee_pool_unlock();
+    if (skipped) ESP_LOGW(TAG, "device.list: %d row(s) did not fit and were skipped", skipped);
+
+    pos += more ? snprintf(buf + pos, kCap - pos,
+                           "],\"next_cursor\":\"0x%016" PRIX64 "\"}}", last)
+                : snprintf(buf + pos, kCap - pos, "]}}");
+    ws_server_reply(fd, buf, pos);
+    heap_caps_free(buf);
+}
+
+static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
+    const char* cursor = doc["args"]["cursor"] | (const char*)nullptr;
+    if (fd == REMOTE_VIRTUAL_FD || cursor) {
+        cmd_device_list_page(fd, id, cursor ? parse_ieee(cursor) : 0);
+        return;
+    }
+
+    // Every row fits (< 512 B each); 4 rows of slack for a device joining
+    // between this unlocked read and the lock below.
+    const size_t cap = 64 + ((size_t)pool_count() + 4) * 512;
+    char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    int pos = snprintf(buf, cap,
                         "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":[", id);
-    bool first = true;
+    bool first = true, truncated = false;
 
     zigbee_pool_lock();
     ZapDevice* pool = pool_all();
@@ -436,43 +526,18 @@ static void cmd_device_list(int fd, uint32_t id) {
     for (uint16_t i = 0; i < cnt; i++) {
         const ZapDevice& d = pool[i];
         if (zap_dev_is_removed(&d)) continue;
-        // Friendly labels from the matched definition ("Tuya" / "TS0203"),
-        // falling back to the device's own Basic strings when no def matches.
-        // The SPA's device table reads `vendor`, NOT `manufacturer` — omitting
-        // it left the Manufacturer column showing "—" for every device even
-        // though the raw string was right there in the row. `manufacturer`
-        // stays as the raw Basic 0x0004 value, which the detail tab reads.
-        // Same contract as hap_json's device_list encoder.
-        char vendor_buf[32] = {};
-        char model_buf[32]  = {};
-        zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
-                                    vendor_buf, sizeof(vendor_buf),
-                                    model_buf,  sizeof(model_buf));
-        const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
-        const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
-
         char row[512];
-        int rn = snprintf(row, sizeof(row),
-            "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
-            "\"friendly\":\"%s\",\"name\":\"%s\","
-            "\"model\":\"%s\",\"manufacturer\":\"%s\","
-            "\"vendor\":\"%s\",\"model_id\":\"%s\",\"known\":%s,"
-            "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
-            "\"ep_count\":%u}",
-            first ? "" : ",",
-            d.ieee_addr, d.nwk_addr,
-            d.friendly_name, d.friendly_name, model_out, d.manufacturer_name,
-            vendor_out, d.model_id, model_buf[0] ? "true" : "false",
-            (int64_t)d.last_seen, d.link_quality, d.battery_pct,
-            d.endpoint_count);
-        if (rn <= 0 || pos + rn + 4 >= 8 * 1024) break;  // truncate gracefully
+        const int rn = format_device_row(d, first, row, sizeof(row));
+        if (rn <= 0 || rn >= (int)sizeof(row)) continue;
+        if ((size_t)(pos + rn) + 4 >= cap) { truncated = true; break; }
         std::memcpy(buf + pos, row, rn);
         pos += rn;
         first = false;
     }
     zigbee_pool_unlock();
+    if (truncated) ESP_LOGW(TAG, "device.list: truncated, the pool grew while listing");
 
-    if (pos + 3 < 8 * 1024) { buf[pos++] = ']'; buf[pos++] = '}'; }
+    buf[pos++] = ']'; buf[pos++] = '}';
     ws_server_reply(fd, buf, pos);
     heap_caps_free(buf);
 }
@@ -1126,7 +1191,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "status.get")         == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "diag.tasks")         == 0) { cmd_diag_tasks(fd, id); return; }
     if (std::strcmp(cmd, "time.set")           == 0) { cmd_time_set(fd, id, doc); return; }
-    if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id);              return; }
+    if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id, doc);         return; }
     if (std::strcmp(cmd, "device.get")         == 0) { cmd_device_get(fd, id, doc);          return; }
     if (std::strcmp(cmd, "device.rename")      == 0) { cmd_device_rename(fd, id, doc);       return; }
     if (std::strcmp(cmd, "device.delete")      == 0) { cmd_device_delete(fd, id, doc);       return; }
