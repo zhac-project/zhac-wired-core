@@ -17,5 +17,15 @@ add_compile_options(-Wall -Wextra -Werror)
 
 enable_testing()
 
+# The round-trip test parses pages with the same ArduinoJson the firmware
+# vendors (header-only), from the sibling zhac-components checkout.
+set(ZHAC_COMPONENTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../zhac-components"
+    CACHE PATH "zhac-components checkout")
+if(NOT EXISTS "${ZHAC_COMPONENTS}/components/arduinojson/src/ArduinoJson.h")
+    message(FATAL_ERROR "ArduinoJson not found; pass -DZHAC_COMPONENTS=<zhac-components checkout>")
+endif()
+
 add_executable(devlist_page_tests test_devlist_page.cpp)
+target_include_directories(devlist_page_tests PRIVATE
+    "${ZHAC_COMPONENTS}/components/arduinojson/src")
 add_test(NAME devlist_page COMMAND devlist_page_tests)

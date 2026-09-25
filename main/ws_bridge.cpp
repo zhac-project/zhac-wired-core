@@ -436,8 +436,10 @@ static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
 // omitting it left the Manufacturer column showing "—" for every device
 // even though the raw string was right there in the row. `manufacturer`
 // stays as the raw Basic 0x0004 value, which the detail tab reads. Same
-// contract as hap_json's device_list encoder. Returns snprintf's length:
-// <= 0 or >= cap means the row did not fit.
+// contract as hap_json's device_list encoder. Strings are JSON-escaped
+// (devlist_row): one `"` in a device name used to make the whole list
+// invalid, and the cloud's reconcile then stored no device at all.
+// Returns snprintf's length: <= 0 or >= cap means the row did not fit.
 static int format_device_row(const ZapDevice& d, bool first, char* row, size_t cap) {
     char vendor_buf[32] = {};
     char model_buf[32]  = {};
@@ -446,19 +448,11 @@ static int format_device_row(const ZapDevice& d, bool first, char* row, size_t c
                                 model_buf,  sizeof(model_buf));
     const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
     const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
-    return snprintf(row, cap,
-        "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
-        "\"friendly\":\"%s\",\"name\":\"%s\","
-        "\"model\":\"%s\",\"manufacturer\":\"%s\","
-        "\"vendor\":\"%s\",\"model_id\":\"%s\",\"known\":%s,"
-        "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
-        "\"ep_count\":%u}",
-        first ? "" : ",",
-        d.ieee_addr, d.nwk_addr,
-        d.friendly_name, d.friendly_name, model_out, d.manufacturer_name,
-        vendor_out, d.model_id, model_buf[0] ? "true" : "false",
-        (int64_t)d.last_seen, d.link_quality, d.battery_pct,
-        d.endpoint_count);
+    return devlist_row({d.ieee_addr, d.nwk_addr, d.friendly_name, model_out,
+                        d.manufacturer_name, vendor_out, d.model_id, model_buf[0] != 0,
+                        (int64_t)d.last_seen, d.link_quality, d.battery_pct,
+                        d.endpoint_count},
+                       first, row, cap);
 }
 
 // One cloud page: the devices after IEEE `after` (0 = the first page).
@@ -481,7 +475,7 @@ static void cmd_device_list_page(int fd, uint32_t id, uint64_t after) {
             [pool](size_t k) { return pool[k].ieee_addr; },
             [pool](size_t k) { return !zap_dev_is_removed(&pool[k]); });
         if (i < 0) break;
-        char row[512];
+        char row[kDevlistRowCap];
         const int rn = format_device_row(pool[i], first, row, sizeof(row));
         if (rn <= 0 || rn >= (int)sizeof(row)) {   // bounded fields make this unreachable;
             skipped++;                             // step past it rather than re-send the
@@ -511,9 +505,9 @@ static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
         return;
     }
 
-    // Every row fits (< 512 B each); 4 rows of slack for a device joining
+    // Every row fits (< kDevlistRowCap each); 4 rows of slack for a device joining
     // between this unlocked read and the lock below.
-    const size_t cap = 64 + ((size_t)pool_count() + 4) * 512;
+    const size_t cap = 64 + ((size_t)pool_count() + 4) * kDevlistRowCap;
     char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
     if (!buf) { send_err(fd, id, "oom"); return; }
     int pos = snprintf(buf, cap,
@@ -526,7 +520,7 @@ static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
     for (uint16_t i = 0; i < cnt; i++) {
         const ZapDevice& d = pool[i];
         if (zap_dev_is_removed(&d)) continue;
-        char row[512];
+        char row[kDevlistRowCap];
         const int rn = format_device_row(d, first, row, sizeof(row));
         if (rn <= 0 || rn >= (int)sizeof(row)) continue;
         if ((size_t)(pos + rn) + 4 >= cap) { truncated = true; break; }
