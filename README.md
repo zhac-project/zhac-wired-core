@@ -9,11 +9,25 @@ ZHAC is a Zigbee hub that runs entirely on one ESP32 board: the coordinator, a d
 of about 5,000 devices (generated from zigbee2mqtt's definitions), rules, Lua scripts, MQTT,
 Home Assistant discovery and the web UI. No Wi-Fi, no Linux box, no cloud account.
 
+## Choose your board
+
+Both run the same firmware and the same feature list (below) — pick whichever is easier for
+you to get hold of.
+
+| | Espressif ESP32-S31 Function-CoreBoard | Guition JC-ESP32P4-M3-DEV |
+|---|---|---|
+| Price | ≈ $25 delivered, ≈ $14 bare (AliExpress) | ≈ $25 delivered, ≈ $14 bare (AliExpress, widely stocked) |
+| Zigbee radio | the S31's own 802.15.4 (native) | on-module ESP32-C6 running `ot_rcp` over UART |
+| CPU / RAM | dual-core RISC-V, 320 MHz; 512 KB SRAM + up to 32 MB PSRAM | dual-core, 360–400 MHz; 32 MB PSRAM |
+| Setup | one flash | one-time radio install, then flash the hub (two steps) |
+| Status | verified on hardware, including device pairing | Ethernet + coordinator verified on hardware 2026-09-26; device pairing and a 48-hour soak are still pending |
+
+Ten-minute starts for each board are below; both need a USB-C cable, an Ethernet cable, and
+Chrome or Edge on a desktop computer.
+
 ## Get one running in ten minutes
 
-You need an **Espressif ESP32-S31 Function-CoreBoard** (about $25: Ethernet, the Zigbee radio,
-USB-C and a status LED are on it, nothing to solder or wire), a USB-C cable, an Ethernet cable,
-and Chrome or Edge on a desktop computer.
+### Espressif ESP32-S31 Function-CoreBoard
 
 1. Connect the board's **USB-to-UART** port (the USB-C next to the RJ45 jack) to the computer.
 2. Open **https://zhac-project.github.io/zhac-docs/flash/**, press **Install** under
@@ -34,6 +48,20 @@ esptool --chip esp32s31 --port /dev/ttyUSB0 write-flash \
 
 That keeps devices, rules and settings. The single merged `zhac-wired-s31-<version>.bin` written at
 `0x0` is a clean start: it covers the settings area and erases it.
+
+### Guition JC-ESP32P4-M3-DEV (ESP32-P4 + C6)
+
+1. Connect the board's **CH340 USB-to-UART** port to the computer.
+2. Open **https://zhac-project.github.io/zhac-docs/flash/**, under *ESP32-P4*: press **1.
+   Install the Zigbee radio** (fresh board only, about a minute), then **2. Install the hub**
+   (about two minutes). See [Zigbee radio (ESP32-C6)](#zigbee-radio-esp32-c6) below for what
+   the radio step does and why it is only needed once.
+3. Plug in Ethernet and open **http://zhac.local**. The first visit asks you to set a password.
+4. Devices → **Permit join**, put your Zigbee device in pairing mode. The web UI shows when the
+   device joins (this board has no status LED wired by default).
+
+Updates come from the web UI (Settings → Update) and keep your devices, rules and settings.
+Building and flashing from source is in [Build from source](#build-from-source) below.
 
 ## What works on the S31 today (all of it run on hardware)
 
@@ -62,15 +90,15 @@ Bugs, missing devices and reports about other boards go to the
 
 | Target | Board | Zigbee radio | State |
 |---|---|---|---|
-| `esp32s31` | Espressif ESP32-S31 Function-CoreBoard | the S31's own 802.15.4 | **Recommended.** Runs on hardware: pairing, rules, MQTT/HA, groups, LED, update page. |
+| `esp32s31` | Espressif ESP32-S31 Function-CoreBoard | the S31's own 802.15.4 | Verified on hardware: pairing, rules, MQTT/HA, groups, LED, update page. |
 | `esp32p4` | Guition JC-ESP32P4-M3-DEV | the ESP32-C6 on the module, running `ot_rcp` | Builds and releases. Ethernet and the Zigbee coordinator run on hardware (verified 2026-09-26, radio installed via the [C6 RCP installer](#zigbee-radio-esp32-c6)); device pairing and a longer soak are still pending. |
 
 ## Boards
 
 | Board | SoC | Ethernet | Zigbee radio | Status |
 |---|---|---|---|---|
-| Espressif ESP32-S31 Function-CoreBoard (≈ $25) | ESP32-S31 | YT8531, 1 Gbit, RGMII | the S31's own 802.15.4 | runs on hardware, recommended |
-| Guition JC-ESP32P4-M3-DEV (≈ $14) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | Ethernet + coordinator run on hardware (2026-09-26); pairing and soak pending |
+| Espressif ESP32-S31 Function-CoreBoard (≈ $25 delivered, ≈ $14 bare) | ESP32-S31 | YT8531, 1 Gbit, RGMII | the S31's own 802.15.4 | verified on hardware, including pairing |
+| Guition JC-ESP32P4-M3-DEV (≈ $25 delivered, ≈ $14 bare) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | Ethernet + coordinator run on hardware (2026-09-26); pairing and soak pending |
 | Any other ESP32-P4 board | check the revision first | set the `ZHAC_ETH_*` pins in menuconfig | an 802.15.4 ESP chip running `ot_rcp` | untested |
 
 The WT0132P4-A1 board used by the dual-chip flagship has **no Ethernet PHY** and cannot
