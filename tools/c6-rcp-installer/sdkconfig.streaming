@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Overlay, only if the packet build halts with an assert in
+# process_init_event (the C6 runs a streaming-mode 2.12.x slave):
+#   idf.py -B build.streaming -D SDKCONFIG=build.streaming/sdkconfig \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.streaming" build
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y

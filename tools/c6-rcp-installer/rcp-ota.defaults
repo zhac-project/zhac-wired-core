@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Overlay for the ot_rcp app this tool installs by slave OTA (on top of
+# rcp/sdkconfig.defaults). The C6 keeps the FACTORY ESP-Hosted bootloader and
+# partition table, both built for 4 MB flash -> 64 KB MMU pages. Stock ot_rcp
+# says 2 MB, which on the C6 selects 32 KB pages; only recent bootloaders
+# honour a per-app page size (esp_app_desc.mmu_page_size), so match the
+# factory bootloader instead of relying on it. ESP32-C6-MINI-1 = 4 MB, and the
+# hosted table (ota_1 ends at 0x3D0000) needs 4 MB anyway.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

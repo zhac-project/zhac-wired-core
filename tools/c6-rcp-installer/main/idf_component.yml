@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# esp_hosted pinned to 2.12.13: the host that
+# github.com/jimullyot/crowpanel-p4-c6-sdio-ota runs (in PACKET mode) against
+# factory v2.3.0 and v2.12.3 C6 slaves. 3.0.x is a protocol rewrite
+# ("unified coprocessor connectivity") with no field record against old slaves.
+dependencies:
+  idf: ">=6.0"
+  espressif/esp_hosted: "==2.12.13"
+  # Only because esp_hosted's Kconfig takes the co-processor target
+  # (SLAVE_IDF_TARGET_ESP32C6) and its enable default from it. No Wi-Fi is used.
+  espressif/esp_wifi_remote: ">=0.10,<2.0"

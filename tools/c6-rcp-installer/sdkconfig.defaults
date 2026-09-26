@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# c6-rcp-installer -- Guition JC-ESP32P4-M3-DEV (P4 rev v1.x, 16 MB flash).
+
+# --- Chip / flash: identical to zhac-wired-core (sdkconfig.defaults*) --------
+# Same revision family so the zhac-wired-core bootloader already on the board
+# boots this app from ota_0. Without the LESS_V3 gate REV_MIN_0 is silently
+# dropped -- check `grep ESP32P4_REV_MIN_FULL sdkconfig` after a build.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_0=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- Partition table: THE SAME FILE as zhac-wired-core --------------------------
+# The tool is flashed as an app into ota_0 (0x20000) on top of the existing
+# layout, so nvs (0xD000, holds the admin password) is never touched.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xC000
+
+# A panic (e.g. esp_hosted's assert on an SDIO mode mismatch) halts with the
+# log on screen instead of boot-looping.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- ESP-Hosted host, SDIO to the on-module C6 -----------------------------------
+# Pins: ESPHome's board page (reset 54, CMD 19, CLK 18, D0 14, D1 15, D2 16,
+# D3 17, reset active-high) == esp_hosted's P4 Function-EV-Board + C6 defaults.
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=19
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=18
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=14
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_1BIT_BUS_SLOT_1=15
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+# 1-bit @ 10 MHz: what the CrowPanel tool proved over a full OTA. 280 KB
+# takes seconds either way; 4-bit buys nothing here.
+CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=10000
+# PACKET mode: old factory slaves (< ~2.12) cannot speak streaming, and a
+# streaming host against them just goes silent. A 2.12.x slave that DOES
+# default to streaming makes this host assert in process_init_event (loud,
+# halts) -- then rebuild with the sdkconfig.streaming overlay.
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_NONE=y
+# Reset the C6 via GPIO54 on connect (clean slave state); never reboot the P4
+# on a transport error -- the app reports and stops instead.
+CONFIG_ESP_HOSTED_SLAVE_RESET_ON_EVERY_HOST_BOOTUP=y
+# CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE is not set

@@ -9,6 +9,9 @@
 #   . ~/.espressif/v6.0/esp-idf/export.sh
 #   tools/build-rcp.sh build.rcp/zhac-rcp-c6.bin
 #
+# RCP_EXTRA_DEFAULTS=<abs path> layers one more defaults file on top (used by
+# tools/c6-rcp-installer for its slave-OTA variant).
+#
 # The example is copied into the build directory first, so neither the build
 # nor the component manager writes into the ESP-IDF tree.
 set -euo pipefail
@@ -22,7 +25,7 @@ SRC="$WORK/ot_rcp"
 rm -rf "$SRC" && mkdir -p "$WORK"
 cp -r "$IDF_PATH/examples/openthread/ot_rcp" "$SRC"
 $IDF_PY -C "$SRC" -B "$WORK/build" \
-    -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;$ROOT/rcp/sdkconfig.defaults" \
+    -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;$ROOT/rcp/sdkconfig.defaults${RCP_EXTRA_DEFAULTS:+;$RCP_EXTRA_DEFAULTS}" \
     set-target esp32c6 build
 # The pins are the whole point of this image: refuse to publish one without them.
 grep -qx 'CONFIG_OPENTHREAD_UART_TX_PIN=20' "$SRC/sdkconfig" &&
