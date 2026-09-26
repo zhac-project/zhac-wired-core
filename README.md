@@ -58,19 +58,19 @@ That keeps devices, rules and settings. The single merged `zhac-wired-s31-<versi
 Bugs, missing devices and reports about other boards go to the
 [ZHAC issue tracker](https://github.com/zhac-project/zhac-platform/issues/new/choose).
 
-## Status — 2026-09-22
+## Status — 2026-09-26
 
 | Target | Board | Zigbee radio | State |
 |---|---|---|---|
 | `esp32s31` | Espressif ESP32-S31 Function-CoreBoard | the S31's own 802.15.4 | **Recommended.** Runs on hardware: pairing, rules, MQTT/HA, groups, LED, update page. |
-| `esp32p4` | Guition JC-ESP32P4-M3-DEV | the ESP32-C6 on the module, running `ot_rcp` | Builds and releases. The C6 must be flashed once through its own header. Not run on hardware by the maintainers. |
+| `esp32p4` | Guition JC-ESP32P4-M3-DEV | the ESP32-C6 on the module, running `ot_rcp` | Builds and releases. Ethernet and the Zigbee coordinator run on hardware (verified 2026-09-26, radio installed via the [C6 RCP installer](#zigbee-radio-esp32-c6)); device pairing and a longer soak are still pending. |
 
 ## Boards
 
 | Board | SoC | Ethernet | Zigbee radio | Status |
 |---|---|---|---|---|
 | Espressif ESP32-S31 Function-CoreBoard (≈ $25) | ESP32-S31 | YT8531, 1 Gbit, RGMII | the S31's own 802.15.4 | runs on hardware, recommended |
-| Guition JC-ESP32P4-M3-DEV (≈ $14) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | builds, not yet run on hardware |
+| Guition JC-ESP32P4-M3-DEV (≈ $14) | ESP32-P4, silicon v1.x | IP101, 100 Mbit, RMII | on-module ESP32-C6 running `ot_rcp` | Ethernet + coordinator run on hardware (2026-09-26); pairing and soak pending |
 | Any other ESP32-P4 board | check the revision first | set the `ZHAC_ETH_*` pins in menuconfig | an 802.15.4 ESP chip running `ot_rcp` | untested |
 
 The WT0132P4-A1 board used by the dual-chip flagship has **no Ethernet PHY** and cannot
@@ -126,41 +126,78 @@ fall inside v0.0 – v1.99, so one build serves both:
 
 The ESP32-P4 has no radio. On the Guition module the ESP32-C6 next to it is the Zigbee
 radio, running Espressif's stock `ot_rcp` re-pinned to the traces that join the two
-chips (`rcp/sdkconfig.defaults`). A new board ships the C6 with Wi-Fi co-processor
-firmware instead, so it needs `zhac-rcp-c6-<version>.bin` from a release **once**.
+chips (`rcp/sdkconfig.defaults`). A new board ships the C6 with its factory ESP-Hosted
+Wi-Fi co-processor firmware instead, so `ot_rcp` has to be installed onto it **once**
+before the hub can use it.
 
-The P4 cannot do this itself here: the two chips share only the C6's former SDIO pins,
-while the C6's ROM bootloader listens on its UART0 pins (16/17) and needs its BOOT pin
-held low — neither reaches the P4. So the C6 is flashed through its own header:
+**Fresh Guition M3-DEV — two steps:**
+
+1. **Install the Zigbee radio (one time).** Flash
+   `zhac-c6-rcp-installer-p4-rev1x-<version>.bin` at `0x0` (or use the **1. Install the
+   Zigbee radio** button on the
+   [browser flasher](https://zhac-project.github.io/zhac-docs/flash/)). This is a one-off
+   ESP32-P4 app: over the SDIO pins the P4 and C6 already share, it talks to the C6's
+   factory ESP-Hosted slave, OTA-writes `ot_rcp` into its inactive slot, resets the C6 and
+   checks it answers spinel — no JP1, no wires, no USB-serial adapter needed. Allow 5 to
+   30 seconds; if you have no serial monitor open, that is enough time on real hardware
+   (the OTA itself takes a few seconds, most of the rest is a retried SDIO connect). To
+   confirm it worked, either watch the console (`idf.py -p PORT monitor`, or any terminal
+   at 115200) for the line `C6-INSTALL: SUCCESS …`, or just go on to step 2 and check the
+   hub's web UI does not report a radio-down / `radio_crashed` state.
+   **This is one-way:** afterwards the C6 no longer runs ESP-Hosted, so this tool cannot
+   be used again to update the radio later — see "Advanced" below. Running it again on an
+   already-installed C6 is safe: it detects spinel and writes nothing.
+2. **Install the hub.** Flash the normal `zhac-wired-p4-rev1x-<version>.bin` image, as in
+   [Build from source](#build-from-source) / the browser flasher's **2. Install the hub**
+   button.
+
+Full detail — build commands, the exact byte offsets, and what to do if a step
+fails — is in [`tools/c6-rcp-installer/README.md`](tools/c6-rcp-installer/README.md).
+
+<details>
+<summary>Advanced: flashing the C6 by wire (JP1) — for a later radio update, or if you
+have an ESP-Prog</summary>
+
+The installer above is one-way, so updating `ot_rcp` again later, or recovering a C6 that
+never got ESP-Hosted in the first place, needs the C6's own debug header, **JP1** (2×13,
+2.54 mm; labels below are from the **M3-DEV's own schematic**, not the sibling
+JC4880P443C board referenced by earlier notes): `C6_U0RXD` pin 20, `C6_U0TXD` pin 22,
+`C6_IO9` pin 24, `C6_CHIP_PU` pin 26, GND on pins 5 and 6 (pins 16/18 are ambiguous in the
+schematic — use 5/6).
 
 1. Stop the P4 so it stops resetting the C6: hold **BOOT**, tap **RESET**, release BOOT.
-2. Wire a 3.3 V USB-serial adapter: **TX → `C6_U0RXD`**, **RX → `C6_U0TXD`**, **GND → GND**;
-   leave 3.3 V unconnected. (Labels from Guition's schematic of the sibling
-   JC4880P443C board, which uses the same module — check yours.)
-3. Hold **`C6_IO9`** to GND while pulsing **`C6_CHIP_PU`** to GND, then:
+2. Wire a **3.3 V** USB-serial adapter — a 5 V TTL adapter will damage the C6: adapter
+   **TX → JP1-20**, adapter **RX → JP1-22**, adapter **GND → JP1-6**; leave the adapter's
+   3V3/5V pin unconnected.
+3. Put the C6 in download mode: jumper **JP1-24 → JP1-5** (GND), then briefly touch
+   **JP1-26** to GND and release.
+4. `esptool --chip esp32c6 --port /dev/ttyUSB0 erase-flash`, then
+   `esptool --chip esp32c6 --port /dev/ttyUSB0 write-flash 0x0 zhac-rcp-c6-<version>.bin`
+   (or the **Zigbee radio** button on the browser flasher, picking the adapter's port).
+   Build the image yourself with `tools/build-rcp.sh build.rcp/zhac-rcp-c6.bin` after
+   sourcing ESP-IDF v6.0.
+5. Remove the IO9 jumper, power-cycle the board.
 
-```sh
-esptool --chip esp32c6 --port /dev/ttyUSB0 erase-flash
-esptool --chip esp32c6 --port /dev/ttyUSB0 write-flash 0x0 zhac-rcp-c6-<version>.bin
-```
+This route did not produce clean serial for the maintainer even with the wiring above
+(garbled output on both directions) — treat it as a fallback, not the default path. An
+ESP-Prog, which drives IO9/CHIP_PU itself, is more likely to work than a plain adapter.
 
-or use the **Zigbee radio** button on the [browser flasher](https://zhac-project.github.io/zhac-docs/flash/).
-To build the image yourself: `tools/build-rcp.sh build.rcp/zhac-rcp-c6.bin` after sourcing
-ESP-IDF v6.0.
+</details>
 
-Without it the hub still boots. The first attempt to start the radio fails and resets the
-board; the next boot skips the radio, serves the web UI and reports
+Without a working radio the hub still boots. The first attempt to start it fails and
+resets the board; the next boot skips the radio, serves the web UI and reports
 `radio_error: "radio_crashed"`, which the UI shows. Reset to try again.
 
 ### Guition wiring
 
 - ESP32-P4, 32 MB PSRAM, 16 MB NOR flash
 - 100M Ethernet via an **IP101** PHY at SMI address 1, wired to ESP-IDF's default esp32p4
-  EMAC pins — MDC 31, MDIO 52, REF_CLK-in 50, PHY power-enable 51, data 28/29/30/34/35/49
+  EMAC pins — MDC 31, MDIO 52, REF_CLK-in 50, **PHY reset 51** (active low, held high;
+  the schematic names it `PHY_RSTN`, not a power-enable line), data 28/29/30/34/35/49
 - ESP32-C6 on the same module, reached over what were its SDIO traces
   (P4 14/15/54 ↔ C6 20/21/EN) — the Zigbee radio. The spinel UART runs C6 TX 20 →
-  P4 RX 14 and P4 TX 15 → C6 RX 21, derived from the SDIO pin map and **not yet confirmed
-  on hardware**: if the radio never answers, swap `ZHAC_RCP_UART_RX_GPIO`/`_TX_GPIO`.
+  P4 RX 14 and P4 TX 15 → C6 RX 21, **confirmed on hardware 2026-09-26** (coordinator
+  formed a PAN over this link at 460800 baud).
 
 ## First boot
 

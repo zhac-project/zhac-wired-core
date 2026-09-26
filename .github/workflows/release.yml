@@ -138,6 +138,26 @@ jobs:
           path: zhac-wired-core
           command: tools/build-rcp.sh build.rcp/zhac-rcp-c6.bin build.rcp
 
+      # tools/c6-rcp-installer: a one-off ESP32-P4 app that OTA-writes ot_rcp onto the
+      # Guition module's C6 over ESP-Hosted slave OTA (SDIO), no JP1 wiring needed. It
+      # embeds the ot_rcp app built just below -- build that one first.
+      - name: Build the ot_rcp app the C6 installer embeds (4 MB / 64 KB-page variant)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32c6
+          path: zhac-wired-core
+          command: >-
+            RCP_EXTRA_DEFAULTS=$PWD/tools/c6-rcp-installer/rcp-ota.defaults
+            tools/build-rcp.sh build.rcp-ota/merged-unused.bin build.rcp-ota
+      - name: Build the C6 radio installer (ESP32-P4 app)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32p4
+          path: zhac-wired-core/tools/c6-rcp-installer
+          command: idf.py build && idf.py merge-bin -o c6-rcp-installer-merged.bin
+
       - name: Resolved chip config matches main-core
         working-directory: zhac-wired-core
         run: ./tools/check_resolved_config.sh
@@ -162,6 +182,12 @@ jobs:
           # above would overwrite the bootloader and partition table.
           cp zhac-wired-core/build/zhac-wired-core.bin "zhac-wired-p4-rev1x-${GITHUB_REF_NAME}-ota.bin"
           cp zhac-wired-core/build.rcp/zhac-rcp-c6.bin "zhac-rcp-c6-${GITHUB_REF_NAME}.bin"
+          # C6 radio installer: merged image (flash at 0x0, wipes NVS) and the
+          # app-only image (flash at 0x20000 / ota_0, keeps NVS -- see its own README).
+          cp zhac-wired-core/tools/c6-rcp-installer/build/c6-rcp-installer-merged.bin \
+            "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin"
+          cp zhac-wired-core/tools/c6-rcp-installer/build/c6_rcp_installer.bin \
+            "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}-ota.bin"
           # What the image was built from: this repo's commit, the IDF, and
           # every sibling's commit. Enough to rebuild it without this runner.
           cp zhac-wired-core/release-manifest.json "release-manifest-${GITHUB_REF_NAME}.json"
@@ -207,8 +233,11 @@ jobs:
 
           Then plug in Ethernet and open http://zhac.local.
 
-          The ESP32-C6 on the module is the Zigbee radio. It needs
-          \`zhac-rcp-c6-${GITHUB_REF_NAME}.bin\` once, through its own serial pins:
+          The ESP32-C6 on the module is the Zigbee radio. On a fresh board it needs
+          \`ot_rcp\` installed **once** first: flash
+          \`zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin\` at offset 0 (or the
+          browser flasher's "1. Install the Zigbee radio" button), wait ~30 s, then flash
+          the hub image above. Detail, and the JP1-wire fallback:
           https://github.com/zhac-project/zhac-wired-core#zigbee-radio-esp32-c6
 
           Updating a board that already runs ZHAC: the web UI's OTA page lists this
@@ -232,6 +261,7 @@ jobs:
             zhac-wired-s31-*.bin
             zhac-wired-p4-rev1x-*.bin
             zhac-rcp-c6-*.bin
+            zhac-c6-rcp-installer-p4-rev1x-*.bin
             SHA256SUMS
             release-manifest-*.json
             sources-*.txt

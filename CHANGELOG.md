@@ -13,6 +13,8 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **C6 RCP installer** (`tools/c6-rcp-installer/`): a one-off ESP32-P4 app that installs `ot_rcp` onto the Guition JC-ESP32P4-M3-DEV's on-module ESP32-C6 over ESP-Hosted slave OTA (SDIO) — no JP1 wiring, no USB-serial adapter. Verified on hardware 2026-09-26: factory slave 2.0.10, OTA to 100%, `C6-INSTALL: SUCCESS`, then the normal firmware brought up the coordinator (PAN formed, spinel @460800) and Ethernet. It is one-way (the C6 no longer runs ESP-Hosted afterwards) and a no-op if the C6 already speaks spinel. Releases now also publish `zhac-c6-rcp-installer-p4-rev1x-<tag>.bin` (merged, flash at `0x0`) and its app-only `-ota.bin` (flash at `0x20000`, keeps NVS). README's "Zigbee radio (ESP32-C6)" section leads with this two-step flow (install the radio, then the hub); the JP1-wire route moves to an "Advanced" fallback, with pin labels corrected to the M3-DEV's own schematic (it previously borrowed the sibling JC4880P443C board's labels) and the Ethernet PHY reset pin (GPIO51) corrected from "power-enable" to "reset".
+
 - **Weekly schedule for Saswell SEA801/SEA802 radiator valves** (and their white labels): the device page's States tab shows a Monday-to-Sunday editor, four periods a day (start time + °C), with "Copy Monday to Tue–Fri" and one Save for the changed days. The valve reports each day and takes a day per write (embedded-zhc codec; www-spa editor, pinned in `release-manifest.json`). Home Assistant gets the seven days as editable text entities. The valve runs the program on the clock the hub sends it, so set the hub's timezone.
 
 ### Fixed
