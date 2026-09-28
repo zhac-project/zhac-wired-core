@@ -34,6 +34,8 @@
 #include "ws_server.h"
 #include "zigbee_pool.h"
 #include "log_ring.h"
+#include "remote_client.h"
+#include "remote_state.h"
 
 static const char* TAG = "api_status";
 
@@ -134,6 +136,12 @@ void api_status_fill(JsonObject doc) {
     doc["log_ws_enabled"]   = log_sinks_get_ws_enabled();
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     doc["remote_available"] = true;
+    // Same state name the WS `remote.status` command reports (see
+    // remote_status_json in api_remote.cpp) -- one source of truth for the
+    // web UI's Settings > Remote card and the Info page's Cloud row.
+    RemoteStatusSnap remote{};
+    remote_client_get_status(&remote);
+    doc["remote_state"] = remote_state_name((RemoteState)remote.state);
 #else
     doc["remote_available"] = false;
 #endif
