@@ -39,6 +39,31 @@
 
 static const char* TAG = "api_status";
 
+// The cloud link's state. Same state name the WS `remote.status` command
+// reports (see remote_status_json in api_remote.cpp) -- one source of truth
+// for the web UI's Settings > Remote card, the Info page's Cloud row and the
+// MQTT metrics. False when the build has no cloud client.
+static bool fill_remote_state(JsonObject d) {
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+    RemoteStatusSnap remote{};
+    remote_client_get_status(&remote);
+    d["remote_state"] = remote_state_name((RemoteState)remote.state);
+    return true;
+#else
+    (void)d;
+    return false;
+#endif
+}
+
+void api_status_fill_metrics(JsonObject d) {
+    sys_diag_fill_resources(d, SYS_DIAG_CPU_MQTT);   // its own CPU window: the stream's interval
+    d["device_count"] = pool_count_active();
+    NetStatus net{};
+    eth_get_status(&net);
+    d["link_up"] = net.link_up;
+    fill_remote_state(d);
+}
+
 void api_status_fill(JsonObject doc) {
     doc["sku"]      = "wired";
     doc["ota"]      = true;       // ota.update: the web UI shows its update field
@@ -132,19 +157,17 @@ void api_status_fill(JsonObject doc) {
         char dhcp[48];
         if (ntp_cfg_dhcp_server(dhcp, sizeof(dhcp))) doc["ntp_dhcp_server"] = dhcp;
     }
+    {   // POSIX TZ string as applied, "" = never set (UTC). A char[], so copied.
+        char tz[64];
+        sys_get_timezone(tz, sizeof(tz));
+        doc["timezone"] = tz;
+    }
     doc["log_mqtt_enabled"] = log_sinks_get_mqtt_enabled();
     doc["log_ws_enabled"]   = log_sinks_get_ws_enabled();
-#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
-    doc["remote_available"] = true;
-    // Same state name the WS `remote.status` command reports (see
-    // remote_status_json in api_remote.cpp) -- one source of truth for the
-    // web UI's Settings > Remote card and the Info page's Cloud row.
-    RemoteStatusSnap remote{};
-    remote_client_get_status(&remote);
-    doc["remote_state"] = remote_state_name((RemoteState)remote.state);
-#else
-    doc["remote_available"] = false;
-#endif
+    doc["metrics_mqtt_enabled"]    = sys_metrics_mqtt_enabled();
+    doc["metrics_mqtt_interval_s"] = sys_metrics_mqtt_interval_s();
+    const bool remote = fill_remote_state(doc);
+    doc["remote_available"] = remote;
 }
 
 static esp_err_t handle_get_status(httpd_req_t* req) {

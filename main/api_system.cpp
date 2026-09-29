@@ -20,6 +20,8 @@
 
 static const char* TAG = "api_system";
 
+extern "C" void metrics_mqtt_publisher_start();   // metrics_mqtt.cpp
+
 // ── shared logic ──────────────────────────────────────────────────────────
 
 bool system_apply_settings(const char* json, size_t len) {
@@ -36,10 +38,17 @@ bool system_apply_settings(const char* json, size_t len) {
         !ntp_cfg_set_server(doc["ntp_server"].as<const char*>())) return false;
 
     // System flags (sys_state persists + applies).
-    if (doc["timezone"].is<const char*>())
-        sys_set_timezone(doc["timezone"].as<const char*>());
+    if (doc["timezone"].is<const char*>() && !sys_set_timezone(doc["timezone"].as<const char*>()))
+        return false;   // not a POSIX TZ string
     if (doc["metrics_enabled"].is<bool>())
         sys_set_metrics_enabled(doc["metrics_enabled"].as<bool>());
+    if (doc["metrics_mqtt_interval_s"].is<long>())
+        sys_set_metrics_mqtt_interval_s(doc["metrics_mqtt_interval_s"].as<long>());
+    if (doc["metrics_mqtt_enabled"].is<bool>())
+        sys_set_metrics_mqtt_enabled(doc["metrics_mqtt_enabled"].as<bool>());
+    // Starts the publisher task the first time the stream is on; once running
+    // it also takes the Home Assistant sensors down when the stream goes off.
+    metrics_mqtt_publisher_start();
     if (doc["ap_disabled"].is<bool>())
         sys_set_ap_disabled(doc["ap_disabled"].as<bool>());
     if (doc["auth_enabled"].is<bool>())

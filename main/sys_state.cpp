@@ -3,6 +3,7 @@
 
 #include "sys_state.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -16,6 +17,26 @@ static const char* TAG = "sys_state";
 
 static bool s_metrics_enabled = false;
 static bool s_ap_disabled     = false;
+static char s_tz[64]          = "";   // as applied; "" = UTC
+static bool s_metrics_mqtt    = false;
+static int  s_metrics_mqtt_s  = 60;
+
+static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-5) == 1 &&
+              sys_clamp_metrics_interval(1) == 1 && sys_clamp_metrics_interval(30) == 30 &&
+              sys_clamp_metrics_interval(60) == 60 && sys_clamp_metrics_interval(61) == 60 &&
+              sys_clamp_metrics_interval(100000) == 60,
+              "metrics interval clamps to 1..60 s");
+
+// A POSIX TZ string is printable ASCII without spaces or quotes
+// ("<+0530>-5:30"), as zap_ntp_host_ok has it for the time server. Anything
+// else could not be a timezone, and /api/status would carry it into JSON.
+static bool tz_ok(const char* tz) {
+    for (size_t n = 0; tz[n]; n++) {
+        const unsigned char c = static_cast<unsigned char>(tz[n]);
+        if (c <= 0x20 || c >= 0x7F || c == '"' || c == '\\' || n + 1 >= sizeof(s_tz)) return false;
+    }
+    return true;
+}
 
 static uint8_t nvs_get_u8(const char* ns, const char* key, uint8_t def) {
     nvs_handle_t h;
@@ -38,20 +59,24 @@ static void nvs_set_u8_commit(const char* ns, const char* key, uint8_t v) {
 void sys_state_init() {
     s_metrics_enabled = nvs_get_u8("sys_cfg", "metrics_en", 0) != 0;
     s_ap_disabled     = nvs_get_u8("sys_cfg", "ap_disabled", 0) != 0;
+    s_metrics_mqtt    = nvs_get_u8("sys_cfg", "metrics_mqtt", 0) != 0;
+    s_metrics_mqtt_s  = sys_clamp_metrics_interval(nvs_get_u8("sys_cfg", "metrics_mqtt_s", 60));
     // API auth (enabled flag, token, admin password) lives in auth.cpp.
 
     nvs_handle_t h;
-    char tz[64];
+    char tz[sizeof(s_tz)];
     if (nvs_open("sys_cfg", NVS_READONLY, &h) == ESP_OK) {
         size_t sz = sizeof(tz);
-        if (nvs_get_str(h, "timezone", tz, &sz) == ESP_OK && tz[0]) {
+        if (nvs_get_str(h, "timezone", tz, &sz) == ESP_OK && tz[0] && tz_ok(tz)) {
+            memcpy(s_tz, tz, sizeof(s_tz));
             setenv("TZ", tz, 1);
             tzset();
         }
         nvs_close(h);
     }
 
-    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d", s_metrics_enabled, s_ap_disabled);
+    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds", s_metrics_enabled,
+             s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s);
 }
 
 bool sys_metrics_enabled() { return s_metrics_enabled; }
@@ -76,16 +101,33 @@ void sys_set_ap_disabled(bool dis) {
 
 void sys_set_auth_enabled(bool en) { auth_set_enabled(en); }
 
-void sys_set_timezone(const char* tz) {
-    if (!tz) return;
+bool sys_set_timezone(const char* tz) {
+    if (!tz || !tz_ok(tz)) return false;
     nvs_handle_t h;
     if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_str(h, "timezone", tz);
         nvs_commit(h);
         nvs_close(h);
     }
+    snprintf(s_tz, sizeof(s_tz), "%s", tz);
     setenv("TZ", tz, 1);
     tzset();
+    return true;
+}
+
+void sys_get_timezone(char* out, size_t cap) { snprintf(out, cap, "%s", s_tz); }
+
+bool sys_metrics_mqtt_enabled()    { return s_metrics_mqtt; }
+int  sys_metrics_mqtt_interval_s() { return s_metrics_mqtt_s; }
+
+void sys_set_metrics_mqtt_enabled(bool en) {
+    s_metrics_mqtt = en;
+    nvs_set_u8_commit("sys_cfg", "metrics_mqtt", en ? 1 : 0);
+}
+
+void sys_set_metrics_mqtt_interval_s(long s) {
+    s_metrics_mqtt_s = sys_clamp_metrics_interval(s);
+    nvs_set_u8_commit("sys_cfg", "metrics_mqtt_s", static_cast<uint8_t>(s_metrics_mqtt_s));
 }
 
 size_t sys_get_api_token(char* out, size_t cap) { return auth_token_copy(out, cap); }

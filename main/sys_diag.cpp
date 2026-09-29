@@ -13,6 +13,7 @@
 //   psram_free psram_min psram_blk psram_total
 //   stack_hwm                           smallest task stack headroom
 //   uptime fw_version ip mac ws_clients mqtt_connected wifi synced
+//   local_time                          Settings > Time preview
 //
 // The names match zhac-net-core's /api/status so the same SPA renders both
 // SKUs. Any change here is a change to the SPA's data contract.
@@ -30,16 +31,18 @@
 #include "sys_state.h"
 #include "ws_bridge.h"
 #include "ws_server.h"
+#include "zap_clock.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 
 namespace {
 
 // One rolling window per cadence -- see SysDiagCpuSlot. Sharing a window
 // between the 10 s tick and an on-demand request would make both report
 // nonsense, because each call consumes the delta the other was measuring.
-sys_metrics_cpu_ctx_t s_cpu_ctx[2] = {};
+sys_metrics_cpu_ctx_t s_cpu_ctx[3] = {};
 
 // Smallest remaining stack across every live task, in bytes.
 //
@@ -80,7 +83,7 @@ uint32_t min_stack_headroom(char* worst_name, size_t cap) {
 
 }  // namespace
 
-void sys_diag_fill(JsonObject d, SysDiagCpuSlot slot) {
+void sys_diag_fill_resources(JsonObject d, SysDiagCpuSlot slot) {
     uint8_t c0 = 0, c1 = 0;
     sys_metrics_sample_cpu_pct(s_cpu_ctx[slot], c0, c1);
     d["cpu_c0"] = c0;
@@ -110,6 +113,21 @@ void sys_diag_fill(JsonObject d, SysDiagCpuSlot slot) {
     d["stack_hwm"] = min_stack_headroom(worst, sizeof(worst));
     if (worst[0]) d["stack_hwm_task"] = worst;
     d["uptime"]    = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+}
+
+void sys_diag_fill(JsonObject d, SysDiagCpuSlot slot) {
+    sys_diag_fill_resources(d, slot);
+
+    // The hub's clock in its own timezone, for Settings > Time; absent until
+    // SNTP or a browser has set it. Formatted here: the web UI does no time
+    // arithmetic. A char[], so ArduinoJson copies it.
+    const time_t now = time(nullptr);
+    struct tm lt{};
+    char when[40];
+    if (zap_clock_is_set(now) && localtime_r(&now, &lt) &&
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M %Z", &lt) > 0) {
+        d["local_time"] = when;
+    }
 
     if (const esp_app_desc_t* app = esp_app_get_description()) {
         d["fw_version"] = app->version;

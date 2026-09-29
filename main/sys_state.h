@@ -6,7 +6,8 @@
 // api_system.cpp / main.cpp; here they get their own small module so the
 // settings + status + token handlers can share them.
 //
-// NVS: namespace "sys_cfg"  keys: metrics_en (u8), ap_disabled (u8), timezone (str)
+// NVS: namespace "sys_cfg"  keys: metrics_en (u8), ap_disabled (u8), timezone (str),
+//                                 metrics_mqtt (u8), metrics_mqtt_s (u8)
 //      namespace "zhac_auth" keys: enabled (u8), token (str, 33 incl NUL)
 #pragma once
 #include <cstddef>
@@ -31,7 +32,19 @@ bool sys_event_task_ok();
 void sys_set_metrics_enabled(bool en);   // persists sys_cfg/metrics_en
 void sys_set_ap_disabled(bool dis);      // persists sys_cfg/ap_disabled
 void sys_set_auth_enabled(bool en);      // persists zhac_auth/enabled + applies to ws_server
-void sys_set_timezone(const char* tz);   // persists sys_cfg/timezone + setenv("TZ")
+
+// Timezone: a POSIX TZ string ("EET-2EEST,M3.5.0/3,M10.5.0/4") -- printable
+// ASCII without spaces or quotes, under 64 bytes -- or "": never set, UTC.
+bool sys_set_timezone(const char* tz);   // persists sys_cfg/timezone + setenv("TZ"); false = refused
+void sys_get_timezone(char* out, size_t cap);   // what is applied, "" if nothing
+
+// "Stream metrics to MQTT" (metrics_mqtt.cpp): on/off and seconds between
+// publishes, 1..60, 60 until set.
+constexpr int sys_clamp_metrics_interval(long s) { return s < 1 ? 1 : s > 60 ? 60 : static_cast<int>(s); }
+bool sys_metrics_mqtt_enabled();
+int  sys_metrics_mqtt_interval_s();
+void sys_set_metrics_mqtt_enabled(bool en);     // persists sys_cfg/metrics_mqtt
+void sys_set_metrics_mqtt_interval_s(long s);   // clamps, persists sys_cfg/metrics_mqtt_s
 
 // Copy the current API token into out (33 bytes incl NUL). Returns length.
 size_t sys_get_api_token(char* out, size_t cap);

@@ -20,12 +20,19 @@
 // Each cadence therefore gets its own slot:
 //   0 = the periodic status.tick push
 //   1 = on-demand WS status.get / REST /api/status
+//   2 = the MQTT metrics stream (metrics_mqtt.cpp)
 enum SysDiagCpuSlot : uint8_t {
     SYS_DIAG_CPU_TICK   = 0,
     SYS_DIAG_CPU_ONDEMAND = 1,
+    SYS_DIAG_CPU_MQTT   = 2,
 };
 
 void sys_diag_fill(JsonObject d, SysDiagCpuSlot cpu_ctx_slot);
+
+// The Resources card alone: cpu_c0 cpu_c1 heap heap_min int_free int_min
+// int_blk psram_free psram_min psram_blk psram_total stack_hwm stack_hwm_task
+// uptime. sys_diag_fill starts with exactly this.
+void sys_diag_fill_resources(JsonObject d, SysDiagCpuSlot cpu_ctx_slot);
 
 // Broadcast a `status.tick` event carrying the same payload. Called from the
 // main loop; without it the Info page only updates on mount and on WS

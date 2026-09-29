@@ -336,7 +336,7 @@ extern "C" void app_main() {
     mqtt_glue_start();
     heap_mark("mqtt_glue");
     ota_update_init();   // ota.update + keep a fresh image once it proves healthy
-    metrics_mqtt_publisher_start();   // no-op if the exporter is off
+    metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
     heap_mark("metrics");
 
     if (lua_ok) {
