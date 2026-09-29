@@ -39,6 +39,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **Sensors showed "last seen" tens of hours ago after a flash or a power cut** (zhac-components `zap_store` / `device_shadow`, branch `fix/last-seen-persist`). Last seen lived in RAM only; a reboot reloaded the value the device record had when it was last rewritten, usually 5 minutes after the previous boot. It is now saved every 10 minutes when it changed and on every restart and OTA, and a boot restores the newest saved value, so a hard reset loses at most 10 minutes. Attribute states are now also written on a restart or OTA (new `device_shadow_flush_now` shutdown handler, `main/main.cpp`) instead of losing up to 5 minutes of changes per device. The boot no longer rewrites every device record 5 minutes after start.
 - **Tuya LCD sensors showed "connection lost" and no clock; many Tuya devices never got the time** (zhac-components fd85ae0, embedded-zhc b9e71bc): the hub never answered their gateway-status query, and answered time requests only for the 2 of 291 definitions that set a time format. It now answers the status query for every device and the time for all 327 devices z2m gives one. Verified on a `_TZE204_d7lpruvi` LCD sensor.
 - **Colour lights now report `color_mode`** (embedded-zhc a1b56c5), as z2m does, for the ~600 lights on the shared colour converter (Tuya TS0505B among them).
 - **Home Assistant bridge could run out of stack** (zhac-components 33145e4): 368 B were left of its 8 KB; now 12 KB, in PSRAM.

@@ -191,6 +191,7 @@ extern "C" void app_main() {
     zap_store_flush_init();
     esp_register_shutdown_handler(zap_store_flush_now);   // as on the P4: pending device-store writes survive a reboot
     device_shadow_init();
+    esp_register_shutdown_handler(device_shadow_flush_now);   // attr states the 5-min sweep has not written yet
     zhac_adapter_init();
     heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
