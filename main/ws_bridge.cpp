@@ -996,6 +996,40 @@ static void cmd_rule_delete(int fd, uint32_t id, JsonDocument& doc) {
     bool ok = simple_rules_delete(rid);
     reply_ok_or_err(fd, id, ok, "rule not found");
 }
+// rules.status: per-rule run counters (RAM, reset on reboot) for the Rules page,
+// data [{id, last_fired, runs, last_skip, ago}]. Kept out of rule.list and the
+// rule.* pushes on purpose: the cloud mirrors the rule collection and diffs it,
+// so volatile fields there would churn every sync. `ago` (s since the last run)
+// shows "Last ran" without trusting either clock.
+static void cmd_rules_status(int fd, uint32_t id) {
+    constexpr uint16_t kMax = 64;   // simple_rules keeps at most 64 active rules
+    auto* st = (SimpleRuleStatus*)heap_caps_malloc(sizeof(SimpleRuleStatus) * kMax, MALLOC_CAP_SPIRAM);
+    if (!st) { send_err(fd, id, "oom"); return; }
+    const uint16_t n = simple_rules_status(st, kMax);
+    JsonDocument d;
+    d["id"] = id; d["ok"] = true;
+    JsonArray arr = d["data"].to<JsonArray>();
+    for (uint16_t i = 0; i < n; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["id"] = st[i].rule_id;
+        o["last_fired"] = st[i].last_fired;
+        o["runs"] = st[i].runs;
+        o["last_skip"] = st[i].last_skip;
+        if (st[i].runs) o["ago"] = st[i].ago_s;
+    }
+    const size_t cap = measureJson(d) + 1;
+    char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (buf) ws_server_reply(fd, buf, serializeJson(d, buf, cap));   // before st is freed
+    else send_err(fd, id, "oom");
+    heap_caps_free(buf); heap_caps_free(st);
+}
+// rule.run {id}: "Run now" -- the rule's actions at once, %value% = the trigger
+// attribute's current value. Replies once they ran; rules.status has the outcome.
+static void cmd_rule_run(int fd, uint32_t id, JsonDocument& doc) {
+    uint16_t rid = doc["args"]["id"] | (uint16_t)0;
+    if (!rid) { send_err(fd, id, "missing id"); return; }
+    reply_ok_or_err(fd, id, simple_rules_run_now(rid), "rule not found");
+}
 
 // ── script.* (SPA drives scripts over WS; write stays REST) ────────────
 static void cmd_script_list(int fd, uint32_t id) {
@@ -1158,6 +1192,8 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "rule.update")        == 0) { cmd_rule_update(fd, id, doc);         return; }
     if (std::strcmp(cmd, "rule.enable")        == 0) { cmd_rule_enable(fd, id, doc);         return; }
     if (std::strcmp(cmd, "rule.delete")        == 0) { cmd_rule_delete(fd, id, doc);         return; }
+    if (std::strcmp(cmd, "rule.run")           == 0) { cmd_rule_run(fd, id, doc);            return; }
+    if (std::strcmp(cmd, "rules.status")       == 0) { cmd_rules_status(fd, id);             return; }
     if (std::strcmp(cmd, "script.list")        == 0) { cmd_script_list(fd, id);              return; }
     if (std::strcmp(cmd, "script.read")        == 0) { cmd_script_read(fd, id, doc);         return; }
     if (std::strcmp(cmd, "script.delete")      == 0) { cmd_script_delete(fd, id, doc);       return; }
