@@ -19,6 +19,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **Browser-flasher links use `https://zhac.org/flash/`** (README, and the release notes the release workflow writes); the old github.io address only redirects there.
 - **`timer <n> 0` stops timer n** (Tasmota's `RuleTimer<n> 0`; it used to fire in 1 ms), and **timer/cron rule runs log at DEBUG** (a `*/5`-second cron rule filled the log); device, MQTT and "Run now" runs stay at INFO (zhac-components simple_rules).
 - **Rules fire when a device's value changes, not on every report** (zhac-components `simple_rules`). `ON door#contact=1 DO …` runs when the door opens and no longer each time the sensor repeats "open" (a Tuya contact sensor's 4-hourly heartbeat used to switch a socket on by itself); a bare `#attr` runs when the value differs. `action` / `click` / `event` / `scene` and the bare `ON <device>` wildcard still run on every report; time, event, timer, MQTT and boot triggers are unchanged. Rules start from the restored device state at boot and after every save, edit, enable or rename, so none of those runs a rule. Rules that relied on repeats (a motion timer re-armed by repeated `occupancy=1`) now run once per change — zhac-docs `RULES_DSL.md` "What changed".
 
@@ -148,7 +149,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
-- Releases now ship the ESP32-S31 image (`zhac-wired-s31-<tag>.bin`, offset 0, plus the `-ota.bin`) built on IDF v6.1 next to the P4 image; CI builds the S31 on every push. The browser flasher at zhac-project.github.io/zhac-docs/flash/ installs it. README rewritten around the S31 board: buy, flash from the browser, open zhac.local.
+- Releases now ship the ESP32-S31 image (`zhac-wired-s31-<tag>.bin`, offset 0, plus the `-ota.bin`) built on IDF v6.1 next to the P4 image; CI builds the S31 on every push. The browser flasher at zhac.org/flash/ installs it. README rewritten around the S31 board: buy, flash from the browser, open zhac.local.
 - **Status LED.** The board's addressable RGB LED (`CONFIG_ZHAC_STATUS_LED_GPIO`, 60 on the
   S31 dev board, off on boards without one) blinks green while the join window is open and
   flashes blue on Zigbee traffic (a report, a raw frame, a join).

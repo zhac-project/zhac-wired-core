@@ -30,7 +30,7 @@ Chrome or Edge on a desktop computer.
 ### Espressif ESP32-S31 Function-CoreBoard
 
 1. Connect the board's **USB-to-UART** port (the USB-C next to the RJ45 jack) to the computer.
-2. Open **https://zhac-project.github.io/zhac-docs/flash/**, press **Install** under
+2. Open **https://zhac.org/flash/**, press **Install** under
    *ESP32-S31*, pick the serial port. About two minutes.
 3. Plug in Ethernet and open **http://zhac.local**. The first visit asks you to set a password.
 4. Devices → **Permit join**, put your Zigbee device in pairing mode. The LED blinks green while
@@ -52,7 +52,7 @@ That keeps devices, rules and settings. The single merged `zhac-wired-s31-<versi
 ### Guition JC-ESP32P4-M3-DEV (ESP32-P4 + C6)
 
 1. Connect the board's **CH340 USB-to-UART** port to the computer.
-2. Open **https://zhac-project.github.io/zhac-docs/flash/**, under *ESP32-P4*: press **1.
+2. Open **https://zhac.org/flash/**, under *ESP32-P4*: press **1.
    Install the Zigbee radio** (fresh board only, about a minute), then **2. Install the hub**
    (about two minutes). See [Zigbee radio (ESP32-C6)](#zigbee-radio-esp32-c6) below for what
    the radio step does and why it is only needed once.
@@ -163,7 +163,7 @@ before the hub can use it.
 1. **Install the Zigbee radio (one time).** Flash
    `zhac-c6-rcp-installer-p4-rev1x-<version>.bin` at `0x0` (or use the **1. Install the
    Zigbee radio** button on the
-   [browser flasher](https://zhac-project.github.io/zhac-docs/flash/)). This is a one-off
+   [browser flasher](https://zhac.org/flash/)). This is a one-off
    ESP32-P4 app: over the SDIO pins the P4 and C6 already share, it talks to the C6's
    factory ESP-Hosted slave, OTA-writes `ot_rcp` into its inactive slot, resets the C6 and
    checks it answers spinel — no JP1, no wires, no USB-serial adapter needed. Allow 5 to

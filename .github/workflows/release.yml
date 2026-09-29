@@ -200,7 +200,7 @@ jobs:
           cat > notes.md <<NOTES
           ## The ready-made hub: Espressif ESP32-S31 Function-CoreBoard
           One board, nothing to wire. From Chrome or Edge, no toolchain:
-          https://zhac-project.github.io/zhac-docs/flash/ -- it writes the four parts below and keeps
+          https://zhac.org/flash/ -- it writes the four parts below and keeps
           your devices, rules and settings (tick "erase" on the page for a clean start).
           With esptool, the same four parts:
           \`\`\`sh
@@ -220,7 +220,7 @@ jobs:
 
           ### Flash it
 
-          From Chrome or Edge, no toolchain: https://zhac-project.github.io/zhac-docs/flash/
+          From Chrome or Edge, no toolchain: https://zhac.org/flash/
 
           Or with esptool — one file, written at offset 0:
 
