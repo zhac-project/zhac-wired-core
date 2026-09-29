@@ -1143,6 +1143,28 @@ static void cmd_zigbee_reset(int fd, uint32_t id) {
     esp_restart();
 }
 
+// ── system.restart (plain reboot, nothing erased) ──────────────────────
+// Settings → "Restart hub". Unlike cmd_storage_reset/cmd_zigbee_reset above,
+// nothing is torn down first, so there is no reason to block the WS
+// dispatcher for the 500 ms grace period: the delay + esp_restart() run on
+// their own short-lived task instead, off the httpd/WS handler, after the
+// reply is already on the wire. esp_restart() still runs the registered
+// shutdown handlers (zap_store_flush_now, device_shadow_flush_now,
+// rule_store_flush_now), so device states and last_seen are saved same as
+// any other reboot.
+static void restart_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+static void cmd_system_restart(int fd, uint32_t id) {
+    ESP_LOGI(TAG, "restart requested from the web UI");
+    reply_ok_or_err(fd, id, true, nullptr);
+    if (xTaskCreate(restart_task, "restart", 2048, nullptr, 2, nullptr) != pdPASS) {
+        vTaskDelay(pdMS_TO_TICKS(500));   // task create (OOM) failed -- still honor the request
+        esp_restart();
+    }
+}
+
 // Dispatch a parsed command envelope. Shared by the local WS rx path and,
 // when remote is enabled, the relay path via dispatch_envelope_for_remote().
 static void dispatch_envelope(int fd, JsonDocument& doc) {
@@ -1212,6 +1234,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "zigbee.settings.set") == 0) { cmd_zigbee_settings_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "zigbee.reset")        == 0) { cmd_zigbee_reset(fd, id);             return; }
     if (std::strcmp(cmd, "system.storage_reset") == 0) { cmd_storage_reset(fd, id);           return; }
+    if (std::strcmp(cmd, "system.restart")       == 0) { cmd_system_restart(fd, id);          return; }
     if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
     if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
     if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }

@@ -67,6 +67,7 @@ void api_status_fill_metrics(JsonObject d) {
 void api_status_fill(JsonObject doc) {
     doc["sku"]      = "wired";
     doc["ota"]      = true;       // ota.update: the web UI shows its update field
+    doc["restart"]  = true;       // system.restart: the web UI shows the Restart hub button
     doc["ota_state"] = ota_update_state();   // "pending" while a new image is on trial
     if (const char* why = ota_update_rollback_reason()) doc["ota_rollback_reason"] = why;
 
