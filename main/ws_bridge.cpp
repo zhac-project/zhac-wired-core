@@ -572,6 +572,16 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
     const uint64_t ieee_cp = dev->ieee_addr;
     zigbee_pool_unlock();
 
+    // "No motion" interval (z2m option occupancy_timeout), only for sensors
+    // whose def offers one: the def's default and the interval in force (the
+    // user's choice once made via device.options.set, else that default).
+    if (const uint16_t occ_def = zhac_adapter_occupancy_timeout_default(model_cp, manu_cp)) {
+        DeviceConfig cfg{};
+        device_shadow_get_config(ieee_cp, &cfg);   // no entry yet: nothing chosen
+        D["occupancy_timeout"]         = device_shadow_occupancy_effective(cfg, occ_def);
+        D["occupancy_timeout_default"] = occ_def;
+    }
+
     char exposes_json[2048];
     size_t exp_n = zhac_adapter_build_exposes_json(
         ieee_cp, model_cp, manu_cp, exposes_json, sizeof(exposes_json));

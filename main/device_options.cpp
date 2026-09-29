@@ -41,8 +41,11 @@ static void key_for(uint64_t ieee, char out[16]) {
 static bool apply_opts(uint64_t ieee, const JsonDocument& doc) {
     bool ok = true;
     if (doc["occupancy_timeout"].is<int>()) {
-        ok = device_shadow_set_occupancy_timeout(
-                 ieee, (uint16_t)doc["occupancy_timeout"].as<int>()) && ok;
+        // Seconds, 0 = never clear occupancy. Out of range is refused rather
+        // than wrapped into some other interval.
+        const int s = doc["occupancy_timeout"].as<int>();
+        ok = s >= 0 && s <= 65535 &&
+             device_shadow_set_occupancy_timeout(ieee, static_cast<uint16_t>(s)) && ok;
     }
     if (doc["flood_protection"].is<int>()) {
         ok = device_shadow_set_debounce_ms(

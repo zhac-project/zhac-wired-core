@@ -11,8 +11,13 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Added
+
+- **"No motion" interval for sensors that never report "no motion"** (embedded-zhc `PreparedDefinition::occupancy_timeout`, zhac-components device_shadow). The 24 definitions zigbee2mqtt gives the `occupancy_timeout` option (Aqara/Xiaomi PIRs, Tuya TS0202_1 and SM0202, Bitron, Konke, Hive, ORVIBO, …) get its default automatically: the hub reports `occupancy = 0` 90 s after the last motion (Aqara RTCGQ12/13/15LM 62 s, RTCGQ14LM 32 s), so change-only motion rules see motion stop. `device.get` carries `occupancy_timeout` (in force) and `occupancy_timeout_default` for those devices; `device.options.set {occupancy_timeout}` sets the user's own (0 = never; out of 0–65535 is now refused instead of wrapped). **Web UI** (www-spa 36c56f4): Device → Options "No motion interval (s)"; the motion recipe turns the light off N minutes after the motion stops.
+
 ### Changed
 
+- **`timer <n> 0` stops timer n** (Tasmota's `RuleTimer<n> 0`; it used to fire in 1 ms), and **timer/cron rule runs log at DEBUG** (a `*/5`-second cron rule filled the log); device, MQTT and "Run now" runs stay at INFO (zhac-components simple_rules).
 - **Rules fire when a device's value changes, not on every report** (zhac-components `simple_rules`). `ON door#contact=1 DO …` runs when the door opens and no longer each time the sensor repeats "open" (a Tuya contact sensor's 4-hourly heartbeat used to switch a socket on by itself); a bare `#attr` runs when the value differs. `action` / `click` / `event` / `scene` and the bare `ON <device>` wildcard still run on every report; time, event, timer, MQTT and boot triggers are unchanged. Rules start from the restored device state at boot and after every save, edit, enable or rename, so none of those runs a rule. Rules that relied on repeats (a motion timer re-armed by repeated `occupancy=1`) now run once per change — zhac-docs `RULES_DSL.md` "What changed".
 
 ### Added
