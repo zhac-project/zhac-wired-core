@@ -21,6 +21,10 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **Device support caught up with zigbee2mqtt 2.14.2** (embedded-zhc a23efb7, zigbee-herdsman-converters v26.105.0 → v26.115.1): 46 new devices and 99 upstream changes ported; deferrals and reasons in zhac-tools `parity/catchup_26105_26115/R8_WORKLIST.md`.
+  - **Illuminance is now in lux.** The 69 definitions on the standard illuminance cluster, and the fallback for unknown devices, published the raw register (10000·log10(lux)+1) under the lux unit, so 1000 lx showed as 30001. Rules and dashboards that compare light levels need new numbers.
+  - **Door locks: operation and programming events are no longer swapped** (ZCL command 0x20 is the operation event, 0x21 the programming event).
+  - Develco SMSZB-120 / HESZB-120 bind and report on endpoints 35 / 38, as z2m does (was 1).
 - **A decimal number in a rule trigger is in real units** (zhac-components `simple_rules`): `ON sensor#temperature>25.5 DO …` now means 25.5 °C. It used to be rounded to 26 and compared with the raw ×100 reading, so it fired at once and never again. Whole numbers keep their old raw meaning (`temperature>2500` is still 25.00 °C), so existing rules behave the same; a decimal against a whole-number reading now compares exactly (`level=2.5` no longer matches 3). Beyond ±21474836.47 a decimal is refused. zhac-docs `RULES_DSL.md`.
 - **Browser-flasher links use `https://zhac.org/flash/`** (README, and the release notes the release workflow writes); the old github.io address only redirects there.
 - **`timer <n> 0` stops timer n** (Tasmota's `RuleTimer<n> 0`; it used to fire in 1 ms), and **timer/cron rule runs log at DEBUG** (a `*/5`-second cron rule filled the log); device, MQTT and "Run now" runs stay at INFO (zhac-components simple_rules).
