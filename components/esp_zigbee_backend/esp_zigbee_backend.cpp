@@ -38,6 +38,7 @@
 #include "esp_timer.h"
 #include "event_bus.h"
 #include "esp_zb_lock.h"
+#include "esp_zb_lqi.h"
 #include "esp_zigbee.h"
 #include "ezbee/aps.h"
 #include "ezbee/app_signals.h"
@@ -433,13 +434,18 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
 
     // Link quality. Every APS indication carries it and nothing else on this
     // backend ever wrote it, so the UI showed lqi 0 for every device forever.
+    // The number comes from RSSI: the radio's own LQI byte sits near 10 whatever
+    // the signal (esp_zb_lqi.h). RSSI 0 / 127 means the stack had no reading.
+    // A non-zero raw LQI still gates the last_seen refresh, as before.
     // Cheap in-place update under the pool's own visitor lock.
+    const bool    have_rssi = ind->rssi < 0;
+    const uint8_t lqi       = have_rssi ? zhc_zb::lqi_from_rssi(ind->rssi) : 0;
     if (ieee != 0 && ind->lqi != 0) {
-        struct LqiCtx { uint8_t lqi; uint32_t now; };
-        LqiCtx lc{ind->lqi, esp_zigbee_backend_wall_clock_s()};
+        struct LqiCtx { bool have; uint8_t lqi; uint32_t now; };
+        LqiCtx lc{have_rssi, lqi, esp_zigbee_backend_wall_clock_s()};
         zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
             auto* x = static_cast<LqiCtx*>(c);
-            d->link_quality = x->lqi;
+            if (x->have) d->link_quality = x->lqi;
             if (x->now) d->last_seen = x->now;
         }, &lc);
     }
@@ -465,7 +471,7 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     const bool decoded = zhac_adapter_try_decode(
         ieee, model, manuf,
         group_id,
-        ind->cluster_id, ind->src_endpoint, ind->lqi,
+        ind->cluster_id, ind->src_endpoint, lqi,
         ind->asdu, ind->asdu_length);
 
     if (!decoded) {
