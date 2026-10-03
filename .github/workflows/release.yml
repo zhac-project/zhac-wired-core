@@ -197,7 +197,11 @@ jobs:
             jq -r '.siblings | to_entries[] | "\(.key) \(.value)"' zhac-wired-core/release-manifest.json
           } > "sources-${GITHUB_REF_NAME}.txt"
           sha256sum *.bin > SHA256SUMS
-          cat > notes.md <<NOTES
+          : > notes.md
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            printf '%s\n\n' "**Test build, not a release.** It is published for testing a fix on real hubs and will be deleted once a release includes it. Keep to the latest release unless you were asked to try this one." > notes.md
+          fi
+          cat >> notes.md <<NOTES
           ## The ready-made hub: Espressif ESP32-S31 Function-CoreBoard
           One board, nothing to wire. From Chrome or Edge, no toolchain:
           https://zhac.org/flash/ -- it writes the four parts below and keeps
@@ -254,8 +258,13 @@ jobs:
           repository the image was built against; \`SHA256SUMS\` covers every file above.
           NOTES
 
+      # A tag with a suffix (v2026100301-rc1) is a test build: a pre-release,
+      # which the hub's Firmware page labels and GitHub never marks "latest",
+      # so the browser flasher keeps offering the last real release.
       - uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           body_path: notes.md
           files: |
             zhac-wired-s31-*.bin
