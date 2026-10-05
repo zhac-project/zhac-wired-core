@@ -17,3 +17,7 @@ bool ws_bridge_attr_set(uint64_t ieee, const char* key, JsonVariantConst v, cons
 // Broadcast a push event to all WS clients (+ relay mirror).
 // data is the payload that becomes {"event": event, "data": data}.
 void ws_push(const char* event, JsonDocument& data);
+
+// hub.caps {caps, remote_scripts} to the open hub-page tabs and the cloud relay: what this firmware
+// supports for remote editing, and the script switch (spec 2026-10-05 §3.6). Sent when the switch changes.
+void ws_push_hub_caps();

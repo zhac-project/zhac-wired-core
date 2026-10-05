@@ -7,7 +7,7 @@
 // settings + status + token handlers can share them.
 //
 // NVS: namespace "sys_cfg"  keys: metrics_en (u8), ap_disabled (u8), timezone (str),
-//                                 metrics_mqtt (u8), metrics_mqtt_s (u8)
+//                                 metrics_mqtt (u8), metrics_mqtt_s (u8), remote_scripts (u8)
 //      namespace "zhac_auth" keys: enabled (u8), token (str, 33 incl NUL)
 #pragma once
 #include <cstddef>
@@ -45,6 +45,12 @@ bool sys_metrics_mqtt_enabled();
 int  sys_metrics_mqtt_interval_s();
 void sys_set_metrics_mqtt_enabled(bool en);     // persists sys_cfg/metrics_mqtt
 void sys_set_metrics_mqtt_interval_s(long s);   // clamps, persists sys_cfg/metrics_mqtt_s
+
+// "Allow script changes from the cloud" (spec 2026-10-05 §3.1): sys_cfg/remote_scripts (u8 0/1), missing =
+// off, so a storage reset turns it off. Changed only from this hub's own page (settings.set / POST
+// /api/settings); the cloud relay refuses that key (local_only). Read by the relay's gate on task_remote.
+bool sys_remote_scripts();
+void sys_set_remote_scripts(bool on);   // persists sys_cfg/remote_scripts
 
 // Copy the current API token into out (33 bytes incl NUL). Returns length.
 size_t sys_get_api_token(char* out, size_t cap);

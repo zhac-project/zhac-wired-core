@@ -56,6 +56,7 @@
 #include "log_ring.h"
 #include "api_remote.h"
 #include "remote_client.h"
+#include "remote_allow.h"
 #include "simple_rules.h"
 #include "rule_store.h"
 #include "zap_common.h"
@@ -161,7 +162,7 @@ static void cmd_status(int fd, uint32_t id) {
     // Same size as the REST reply (api_status.cpp). serializeJson truncates
     // rather than failing, and a truncated reply is invalid JSON that the
     // page silently drops -- so refuse loudly instead.
-    constexpr size_t CAP = 2560;
+    constexpr size_t CAP = 3072;   // as GET /api/status (api_status.cpp)
     char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
     if (!buf) { send_err(fd, id, "oom"); return; }
     size_t n = serializeJson(doc, buf, CAP);
@@ -954,6 +955,19 @@ void ws_push(const char* event, JsonDocument& data) {
     push_event(event, buf, n);
 }
 
+// What this firmware supports for remote editing (spec 2026-10-05 §3.6): rules.v1 = paged rule.list,
+// rule.create answers its id, rule.update takes base, rule.check; scripts.v1 = the script ops and events
+// and the switch. Sent in remote.auth and in hub.caps.
+static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\"]";
+
+void ws_push_hub_caps() {
+    if (!push_listeners()) return;
+    char buf[96];
+    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s}", kRemoteCapsJson,
+                           sys_remote_scripts() ? "true" : "false");
+    if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
+}
+
 // ── rule.* (SPA drives rules over WS; calls simple_rules + rule_store) ──
 static void cmd_rule_list(int fd, uint32_t id) {
     auto* slots = (RuleSlot*)heap_caps_malloc(sizeof(RuleSlot) * ZAP_MAX_RULES, MALLOC_CAP_SPIRAM);
@@ -1263,6 +1277,21 @@ static void ws_rx(int fd, const char* data, size_t len) {
 // the remote send-hook registered in remote_client_init().
 extern "C" void dispatch_envelope_for_remote(int fd, JsonDocument& doc) {
     dispatch_envelope(fd, doc);
+}
+
+// The relay passes script.write / run / reload and system.restart only while this hub's own page has
+// "Allow script changes from the cloud" on (spec 2026-10-05 §3.1). Overrides remote_client's weak
+// default (false). Both overrides must stay in THIS object: it also defines dispatch_envelope_for_remote,
+// which remote_client.cpp calls, so the linker always pulls it in. A strong definition in an object
+// nothing references is never extracted from its archive, and the weak default silently wins.
+extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
+
+// remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default
+// (none), which dual-chip and mono keep, so the cloud treats those as read-only.
+extern "C" size_t remote_hello_extra(char* out, size_t cap) {
+    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s", kRemoteCapsJson,
+                           sys_remote_scripts() ? "true" : "false");
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 #endif
 

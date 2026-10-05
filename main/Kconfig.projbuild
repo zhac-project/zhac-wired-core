@@ -226,9 +226,20 @@ menu "ZHAC Remote (cloud link)"
         depends on ZHAC_REMOTE_CLIENT_ENABLE
         default n
         help
-            Off: the cloud cannot reflash, reset the network, run or write
-            Lua, delete devices or change settings -- only reads and
-            recoverable device, rule and group operations. Turn on only for
-            a cloud endpoint you operate and trust.
+            Off: the cloud cannot reflash (ota.s3/ota.p4), reset the Zigbee
+            network (zigbee.reset), delete devices (device.delete), change
+            settings (settings.set), rotate the token (system.token.rotate)
+            or switch the uplink mode (uplink.set) -- only reads and
+            recoverable device, rule and group operations. On exposes
+            exactly the privileged list in zhac-net-core's
+            components/remote_client/remote_allow.cpp (kRemotePrivilegedCmds).
+            Turn on only for a cloud endpoint you operate and trust.
+
+            Lua is not part of this option. script.write, script.reload,
+            system.restart and a direct script.run are gated by this hub's
+            own "Allow script changes from the cloud" switch, off until the
+            hub's own page turns it on (kept in NVS, so a storage reset
+            turns it off). A rule's script.run action is not gated by that
+            switch; the cloud limits such rules to owners and admins.
 
 endmenu

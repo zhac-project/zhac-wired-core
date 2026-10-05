@@ -3,6 +3,7 @@
 
 #include "sys_state.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@ static bool s_ap_disabled     = false;
 static char s_tz[64]          = "";   // as applied; "" = UTC
 static bool s_metrics_mqtt    = false;
 static int  s_metrics_mqtt_s  = 60;
+static std::atomic<bool> s_remote_scripts{false};   // read on task_remote, written on the httpd task
 
 static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-5) == 1 &&
               sys_clamp_metrics_interval(1) == 1 && sys_clamp_metrics_interval(30) == 30 &&
@@ -61,6 +63,7 @@ void sys_state_init() {
     s_ap_disabled     = nvs_get_u8("sys_cfg", "ap_disabled", 0) != 0;
     s_metrics_mqtt    = nvs_get_u8("sys_cfg", "metrics_mqtt", 0) != 0;
     s_metrics_mqtt_s  = sys_clamp_metrics_interval(nvs_get_u8("sys_cfg", "metrics_mqtt_s", 60));
+    s_remote_scripts.store(nvs_get_u8("sys_cfg", "remote_scripts", 0) != 0);
     // API auth (enabled flag, token, admin password) lives in auth.cpp.
 
     nvs_handle_t h;
@@ -75,8 +78,8 @@ void sys_state_init() {
         nvs_close(h);
     }
 
-    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds", s_metrics_enabled,
-             s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s);
+    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds remote_scripts=%d", s_metrics_enabled,
+             s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s, (int)s_remote_scripts.load());
 }
 
 bool sys_metrics_enabled() { return s_metrics_enabled; }
@@ -133,3 +136,10 @@ void sys_set_metrics_mqtt_interval_s(long s) {
 size_t sys_get_api_token(char* out, size_t cap) { return auth_token_copy(out, cap); }
 
 bool sys_rotate_api_token(char* out, size_t cap) { return auth_rotate_token(out, cap); }
+
+bool sys_remote_scripts() { return s_remote_scripts.load(); }
+
+void sys_set_remote_scripts(bool on) {
+    s_remote_scripts.store(on);
+    nvs_set_u8_commit("sys_cfg", "remote_scripts", on ? 1 : 0);
+}

@@ -17,6 +17,7 @@
 #include "zigbee_diagnostics.h"
 #include "log_ring.h"
 #include "esp_heap_caps.h"
+#include "ws_bridge.h"
 
 static const char* TAG = "api_system";
 
@@ -53,6 +54,20 @@ bool system_apply_settings(const char* json, size_t len) {
         sys_set_ap_disabled(doc["ap_disabled"].as<bool>());
     if (doc["auth_enabled"].is<bool>())
         sys_set_auth_enabled(doc["auth_enabled"].as<bool>());
+
+    // "Allow script changes from the cloud" (spec 2026-10-05 §3.1). Only this hub's own page gets here with
+    // the key: the cloud relay answers settings.set carrying it with local_only. Only JSON true turns it
+    // on; any other value (false, 0, "true", {}) turns it off, so a malformed request can never leave it
+    // on. null counts as absent, as it does for the relay's local_only check. A change pushes hub.caps,
+    // so the cloud knows at once.
+    if (!doc["remote_scripts"].isNull()) {
+        const bool on = doc["remote_scripts"].is<bool>() && doc["remote_scripts"].as<bool>();
+        if (on != sys_remote_scripts()) {
+            sys_set_remote_scripts(on);
+            ESP_LOGW(TAG, "script changes from the cloud: %s", on ? "allowed" : "off");
+            ws_push_hub_caps();
+        }
+    }
 
     // Live-log sinks (MQTT / WS), enable + min-level (level = first char).
     if (doc["log_mqtt_enabled"].is<bool>() || doc["log_mqtt_level"].is<const char*>()) {

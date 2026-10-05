@@ -169,6 +169,10 @@ void api_status_fill(JsonObject doc) {
     doc["metrics_mqtt_interval_s"] = sys_metrics_mqtt_interval_s();
     const bool remote = fill_remote_state(doc);
     doc["remote_available"] = remote;
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+    // The hub page shows its "Allow script changes from the cloud" switch only when this is present.
+    doc["remote_scripts"] = sys_remote_scripts();
+#endif
 }
 
 static esp_err_t handle_get_status(httpd_req_t* req) {
@@ -179,9 +183,11 @@ static esp_err_t handle_get_status(httpd_req_t* req) {
     // pushed it past 1024. serializeJson TRUNCATES rather than failing, so the
     // overflow shipped a 200 with a JSON document cut off mid-key -- every
     // client just sees a parse error. Same trap as ws_push (fixed there too).
-    // Now 2560 on the heap: the same doc also answers WS status.get, which
+    // Then 2560 on the heap: the same doc also answers WS status.get, which
     // added the sku / settings keys the web UI reads.
-    constexpr size_t CAP = 2560;
+    // 3072: the remote_scripts field must not push this past the buffer ("status too large" blanks the
+    // Settings page).
+    constexpr size_t CAP = 3072;
     char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
