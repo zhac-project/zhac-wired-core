@@ -29,6 +29,10 @@ static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-
               sys_clamp_metrics_interval(100000) == 60,
               "metrics interval clamps to 1..60 s");
 
+static_assert(sys_remote_scripts_after_save(true, true) && !sys_remote_scripts_after_save(false, true) &&
+              !sys_remote_scripts_after_save(true, false) && !sys_remote_scripts_after_save(false, false),
+              "remote_scripts: RAM is on only when on was asked for and saved; off always applies");
+
 // A POSIX TZ string is printable ASCII without spaces or quotes
 // ("<+0530>-5:30"), as zap_ntp_host_ok has it for the time server. Anything
 // else could not be a timezone, and /api/status would carry it into JSON.
@@ -49,12 +53,16 @@ static uint8_t nvs_get_u8(const char* ns, const char* key, uint8_t def) {
     return v;
 }
 
-static void nvs_set_u8_commit(const char* ns, const char* key, uint8_t v) {
+// ESP_OK once the value is committed, else the first NVS error. The flags below keep ignoring it, as they
+// always did; sys_set_remote_scripts must not.
+static esp_err_t nvs_set_u8_commit(const char* ns, const char* key, uint8_t v) {
     nvs_handle_t h;
-    if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u8(h, key, v);
-    nvs_commit(h);
+    esp_err_t e = nvs_open(ns, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    e = nvs_set_u8(h, key, v);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
+    return e;
 }
 
 
@@ -139,7 +147,9 @@ bool sys_rotate_api_token(char* out, size_t cap) { return auth_rotate_token(out,
 
 bool sys_remote_scripts() { return s_remote_scripts.load(); }
 
-void sys_set_remote_scripts(bool on) {
-    s_remote_scripts.store(on);
-    nvs_set_u8_commit("sys_cfg", "remote_scripts", on ? 1 : 0);
+bool sys_set_remote_scripts(bool on) {
+    const esp_err_t e = nvs_set_u8_commit("sys_cfg", "remote_scripts", on ? 1 : 0);
+    if (e != ESP_OK) ESP_LOGE(TAG, "remote_scripts=%d not saved: %s", (int)on, esp_err_to_name(e));
+    s_remote_scripts.store(sys_remote_scripts_after_save(on, e == ESP_OK));
+    return e == ESP_OK;
 }

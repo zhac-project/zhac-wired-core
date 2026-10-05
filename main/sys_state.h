@@ -50,7 +50,11 @@ void sys_set_metrics_mqtt_interval_s(long s);   // clamps, persists sys_cfg/metr
 // off, so a storage reset turns it off. Changed only from this hub's own page (settings.set / POST
 // /api/settings); the cloud relay refuses that key (local_only). Read by the relay's gate on task_remote.
 bool sys_remote_scripts();
-void sys_set_remote_scripts(bool on);   // persists sys_cfg/remote_scripts
+// Saves to NVS first, then RAM takes `on && saved` (below): OFF applies at once even when the save fails, ON
+// only once it is saved, so RAM never says on while NVS does not. false = the save failed. After a failed OFF
+// NVS may still say on and a reboot would bring it back, so the caller must tell the user.
+bool sys_set_remote_scripts(bool on);
+constexpr bool sys_remote_scripts_after_save(bool on, bool saved) { return on && saved; }
 
 // Copy the current API token into out (33 bytes incl NUL). Returns length.
 size_t sys_get_api_token(char* out, size_t cap);

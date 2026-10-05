@@ -60,12 +60,25 @@ bool system_apply_settings(const char* json, size_t len) {
     // on; any other value (false, 0, "true", {}) turns it off, so a malformed request can never leave it
     // on. null counts as absent, as it does for the relay's local_only check. A change pushes hub.caps,
     // so the cloud knows at once.
+    // A failed NVS save answers false (the page gets "bad settings", REST 400), never OK: off still applies
+    // at once, but NVS may keep saying on, and a reboot would bring it back.
     if (!doc["remote_scripts"].isNull()) {
         const bool on = doc["remote_scripts"].is<bool>() && doc["remote_scripts"].as<bool>();
-        if (on != sys_remote_scripts()) {
-            sys_set_remote_scripts(on);
-            ESP_LOGW(TAG, "script changes from the cloud: %s", on ? "allowed" : "off");
-            ws_push_hub_caps();
+        const bool was = sys_remote_scripts();
+        // On in RAM means saved, so on again needs nothing. Off is saved even when RAM already says off: after
+        // a failed save NVS may still say on, and sending off again must be able to repair that (NVS skips a
+        // write of the same value, so a consistent hub writes nothing).
+        if (!(on && was)) {
+            const bool saved = sys_set_remote_scripts(on);
+            if (sys_remote_scripts() != was) {   // off applies at once, on only once saved
+                ESP_LOGW(TAG, "script changes from the cloud: %s", on ? "allowed" : "off");
+                ws_push_hub_caps();
+            }
+            if (!saved) {
+                ESP_LOGE(TAG, "script changes from the cloud: %s not saved, %s", on ? "allowed" : "off",
+                         on ? "it stays off" : "it is off now but may be on again after a reboot");
+                return false;
+            }
         }
     }
 
