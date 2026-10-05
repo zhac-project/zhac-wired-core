@@ -58,28 +58,35 @@ static bool parse_name(const char* uri, char* out, size_t cap,
     return true;
 }
 
-// The request body in a PSRAM buffer of kScriptCap + 1 bytes (NUL-terminated, *total bytes). A body over
-// kScriptCap sets *too_large and returns nullptr: the hub used to keep the first 16,383 bytes of such a
-// body and say ok. nullptr without *too_large: out of memory.
-static char* read_body(httpd_req_t* req, int* total, bool* too_large) {
-    *too_large = req->content_len > kScriptCap;
-    if (*too_large) return nullptr;
+// The request body, all content_len bytes of it, in a PSRAM buffer of kScriptCap + 1 bytes (NUL-terminated).
+// On any failure the error response is sent here and nullptr returned, and the caller returns ESP_FAIL
+// without writing, checking or pushing anything: 413 over kScriptCap (the hub used to keep the first 16,383
+// bytes of such a body and say ok), 500 out of memory, 408 when a receive timed out (10 s on this server) and
+// 400 when it failed or the client closed before the whole body arrived (the loop used to stop right there,
+// and the cut text was saved over the stored script, pushed, and answered ok).
+static char* read_body(httpd_req_t* req) {
+    if (req->content_len > kScriptCap) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "a script is at most 16384 bytes");
+        return nullptr;
+    }
     char* buf = static_cast<char*>(heap_caps_malloc(kScriptCap + 1, MALLOC_CAP_SPIRAM));
-    if (!buf) return nullptr;
-    int n = 0;
-    while (n < static_cast<int>(req->content_len)) {
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc");
+        return nullptr;
+    }
+    size_t n = 0;
+    while (n < req->content_len) {
         const int got = httpd_req_recv(req, buf + n, req->content_len - n);
-        if (got <= 0) break;
+        if (got <= 0) {
+            heap_caps_free(buf);
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "body timed out");
+            else httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body incomplete");
+            return nullptr;
+        }
         n += got;
     }
     buf[n] = '\0';
-    *total = n;
     return buf;
-}
-
-static esp_err_t too_large(httpd_req_t* req) {
-    httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "a script is at most 16384 bytes");
-    return ESP_FAIL;
 }
 
 // ── GET /api/scripts ────────────────────────────────────────────────────
@@ -131,14 +138,8 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     // this port only took PUT and answered a bare POST with 405 "unsupported".
     if (req->method == HTTP_PUT || (req->method == HTTP_POST && !is_run && !is_check)) {
         const bool existed = lua_script_cache_exists(name);
-        int total = 0;
-        bool over = false;
-        char* src = read_body(req, &total, &over);
-        if (over) return too_large(req);
-        if (!src) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc");
-            return ESP_FAIL;
-        }
+        char* src = read_body(req);
+        if (!src) return ESP_FAIL;
         const bool ok = lua_script_cache_write(name, src);
         // size and fp of what is stored: the store keeps the text up to its first NUL
         if (ok) ws_push_script_saved(name, src, std::strlen(src), existed);
@@ -170,11 +171,8 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_POST && is_check) {
-        int total = 0;
-        bool over = false;
-        char* src = read_body(req, &total, &over);
-        if (over) return too_large(req);
-        if (!src) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc"); return ESP_FAIL; }
+        char* src = read_body(req);
+        if (!src) return ESP_FAIL;
         char err[128] = {0};
         int line = 0;
         bool ok = lua_engine_check_syntax(name, src, err, sizeof(err), &line);
