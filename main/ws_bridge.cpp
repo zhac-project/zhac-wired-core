@@ -73,16 +73,43 @@
 #include <new>
 #include <sys/time.h>
 #include <cinttypes>
+#include <algorithm>
+#include "json_buf.h"       // JsonWriter: escaped, UTF-8-safe replies
+#include "psa/crypto.h"     // fingerprints, hashed with PSA as auth.cpp does
+#include "remote_xfer.h"    // kRemotePageBudget
 
 static const char* TAG = "ws_bridge";
 
 // ── Inbound dispatch ────────────────────────────────────────────────────
+// Error replies {id, ok:false, err} (spec 2026-10-05 §3.3: shape unchanged). The text goes through
+// JsonWriter: escaped and UTF-8-safe. It was spliced with %s, and the rule parser's messages quote what
+// the user typed, so one `"` made the reply invalid JSON and the page and the cloud saw no answer.
 static void send_err(int fd, uint32_t id, const char* err) {
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf),
-                     "{\"id\":%" PRIu32 ",\"ok\":false,\"err\":\"%s\"}",
-                     id, err);
+    char buf[1100];   // 160 bytes of message, escaped as \u00XX at worst
+    JsonWriter w(buf, sizeof(buf));
+    w.fmt("{\"id\":%" PRIu32 ",\"ok\":false,\"err\":\"", id).str(err ? err : "", 160).raw("\"}");
+    size_t n = w.finish();
+    if (!n) n = (size_t)snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":false,\"err\":\"error\"}", id);
     ws_server_reply(fd, buf, n);
+}
+
+// The `fp` of a rule's text or a script (§3.3): lowercase hex SHA-256 of the bytes, 64 characters.
+// psa_crypto_init ran at boot (auth.cpp). False, and "", on a PSA failure.
+static bool sha256_hex(const void* data, size_t len, char out[65]) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    uint8_t h[32];
+    size_t olen = 0;
+    if (psa_hash_compute(PSA_ALG_SHA_256, static_cast<const uint8_t*>(data), len, h, sizeof(h), &olen) != PSA_SUCCESS ||
+        olen != sizeof(h)) {
+        out[0] = '\0';
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(h); i++) {
+        out[2 * i]     = kHex[h[i] >> 4];
+        out[2 * i + 1] = kHex[h[i] & 0x0F];
+    }
+    out[64] = '\0';
+    return true;
 }
 
 // Forward declarations — defined lower in the file, but used by the
@@ -336,13 +363,9 @@ static uint64_t parse_ieee(const char* s) {
 // Send a `{id,ok,...}` reply with a single boolean status; on
 // failure, attach an `err` string for the SPA toast.
 static void reply_ok_or_err(int fd, uint32_t id, bool ok, const char* err) {
-    char buf[128];
-    int n = ok
-        ? snprintf(buf, sizeof(buf),
-                   "{\"id\":%" PRIu32 ",\"ok\":true}", id)
-        : snprintf(buf, sizeof(buf),
-                   "{\"id\":%" PRIu32 ",\"ok\":false,\"err\":\"%s\"}",
-                   id, err ? err : "failed");
+    if (!ok) { send_err(fd, id, err ? err : "failed"); return; }
+    char buf[64];
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true}", id);
     ws_server_reply(fd, buf, n);
 }
 
@@ -969,43 +992,128 @@ void ws_push_hub_caps() {
 }
 
 // ── rule.* (SPA drives rules over WS; calls simple_rules + rule_store) ──
-static void cmd_rule_list(int fd, uint32_t id) {
-    auto* slots = (RuleSlot*)heap_caps_malloc(sizeof(RuleSlot) * ZAP_MAX_RULES, MALLOC_CAP_SPIRAM);
-    char* buf   = (char*)heap_caps_malloc(16 * 1024, MALLOC_CAP_SPIRAM);
-    if (!slots || !buf) { heap_caps_free(slots); heap_caps_free(buf); send_err(fd, id, "oom"); return; }
-    uint16_t cnt = rule_store_load_all(slots, ZAP_MAX_RULES);
-    int pos = snprintf(buf, 16 * 1024, "{\"id\":%u,\"ok\":true,\"data\":[", (unsigned)id);
-    for (uint16_t i = 0; i < cnt; i++) {
-        const RuleSlot& s = slots[i];
-        JsonDocument o;
-        o["id"] = s.rule_id; o["enabled"] = (bool)s.enabled;
-        o["trigger_type"] = s.trigger_type; o["rule_type"] = s.rule_type; o["name"] = s.name;
-        char dsl[501]; size_t dn = s.src_len < 500 ? s.src_len : 500;
-        memcpy(dsl, s.src, dn); dsl[dn] = '\0'; o["dsl"] = dsl;
-        char row[768]; size_t rn = serializeJson(o, row, sizeof(row));
-        if (pos + (int)rn + 4 >= 16 * 1024) break;
-        if (i) buf[pos++] = ',';
-        memcpy(buf + pos, row, rn); pos += rn;
-    }
-    pos += snprintf(buf + pos, 16 * 1024 - pos, "]}");
-    ws_server_reply(fd, buf, pos);
-    heap_caps_free(slots); heap_caps_free(buf);
+// One rule as rule.list carries it: {id, enabled, trigger_type, rule_type, name, dsl}, escaped and
+// UTF-8-safe (a name strncpy-cut mid-character on the hub page would otherwise close every WebSocket that
+// lists it). 0 when it does not fit `cap`.
+static size_t rule_row_json(const RuleSlot& s, char* out, size_t cap) {
+    JsonWriter w(out, cap);
+    const size_t dn = s.src_len < sizeof(s.src) ? s.src_len : sizeof(s.src);
+    w.fmt("{\"id\":%u,\"enabled\":%s,\"trigger_type\":%u,\"rule_type\":%u,\"name\":\"",
+          (unsigned)s.rule_id, s.enabled ? "true" : "false", (unsigned)s.trigger_type, (unsigned)s.rule_type)
+     .str(s.name, sizeof(s.name))
+     .raw("\",\"dsl\":\"")
+     .str(reinterpret_cast<const char*>(s.src), dn)
+     .raw("\"}");
+    return w.finish();
 }
+
+// rule.list. With `cursor` (spec 2026-10-05 §3.4; "0" = from the start): {"items":[rows by id, after the
+// cursor, at most 6,144 bytes of rows], "next_cursor":"<last id>"}, no next_cursor on the last page. Rows
+// are sorted by id, so a deleted rule never shifts the next page. Without a cursor: the bare array the
+// hub page and older clouds read, cut near 16 KB as it always was.
+static void cmd_rule_list(int fd, uint32_t id, JsonDocument& doc) {
+    constexpr size_t kRowCap  = 3400;        // a 23-byte name and a 499-byte text, all escaped as \u00XX
+    constexpr size_t kListCap = 16 * 1024;
+    auto* slots = (RuleSlot*)heap_caps_malloc(sizeof(RuleSlot) * ZAP_MAX_RULES, MALLOC_CAP_SPIRAM);
+    char* row   = (char*)heap_caps_malloc(kRowCap, MALLOC_CAP_SPIRAM);
+    char* buf   = (char*)heap_caps_malloc(kListCap, MALLOC_CAP_SPIRAM);
+    if (!slots || !row || !buf) {
+        heap_caps_free(slots); heap_caps_free(row); heap_caps_free(buf);
+        send_err(fd, id, "oom");
+        return;
+    }
+    const uint16_t cnt = rule_store_load_all(slots, ZAP_MAX_RULES);
+    std::sort(slots, slots + cnt, [](const RuleSlot& a, const RuleSlot& b) { return a.rule_id < b.rule_id; });
+    JsonVariantConst cur = doc["args"]["cursor"];
+    JsonWriter w(buf, kListCap);
+    if (cur.isNull()) {
+        w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":[", id);
+        uint16_t rows = 0;
+        for (uint16_t i = 0; i < cnt; i++) {
+            const size_t rn = rule_row_json(slots[i], row, kRowCap);
+            if (!rn) continue;
+            if (w.len() + rn + 4 >= kListCap) break;
+            if (rows++) w.ch(',');
+            w.raw(row, rn);
+        }
+        w.raw("]}");
+    } else {
+        const unsigned long after = cur.is<const char*>()
+            ? strtoul(cur.as<const char*>(), nullptr, 10) : cur.as<unsigned long>();
+        w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"items\":[", id);
+        size_t used = 0;
+        unsigned last = 0;
+        uint16_t rows = 0;
+        bool more = false;
+        for (uint16_t i = 0; i < cnt; i++) {
+            if (slots[i].rule_id <= after) continue;
+            const size_t rn = rule_row_json(slots[i], row, kRowCap);
+            if (!rn) continue;
+            if (rows && used + rn + 1 > kRemotePageBudget) { more = true; break; }
+            if (rows++) w.ch(',');
+            w.raw(row, rn);
+            used += rn + 1;
+            last = slots[i].rule_id;
+        }
+        w.raw("]");
+        if (more) w.fmt(",\"next_cursor\":\"%u\"", last);
+        w.raw("}}");
+    }
+    const size_t n = w.finish();
+    if (n) ws_server_reply(fd, buf, n);
+    else send_err(fd, id, "oom");
+    heap_caps_free(slots); heap_caps_free(row); heap_caps_free(buf);
+}
+
+// rule.create {name, dsl} -> data {"id": <new id>} (spec §3.3; it used to answer without the id, so the
+// cloud had to list the rules again to find it).
 static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
     uint16_t nid = 0;
     if (!simple_rules_add(name, dsl, &nid)) { send_err(fd, id, dsl_last_error()); return; }
-    reply_ok_or_err(fd, id, true, nullptr);   // the "rule.added" push comes from RULE_CHANGED
+    char buf[80];   // the "rule.added" push comes from RULE_CHANGED
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"id\":%u}}", id, (unsigned)nid);
+    ws_server_reply(fd, buf, (size_t)n);
 }
+
+// rule.update {id, name, dsl, base?}. With `base` (spec §4.5, no silent overwrite): the stored text's
+// fingerprint must still be the one the editor opened, else `changed` and nothing is written.
 static void cmd_rule_update(int fd, uint32_t id, JsonDocument& doc) {
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
     if (!rid || !dsl) { send_err(fd, id, "missing id/dsl"); return; }
+    if (const char* base = doc["args"]["base"] | (const char*)nullptr) {
+        // ponytail: compare, then save, are two calls; a hub-page save landing in the microseconds between
+        // them is not caught. Move the compare under simple_rules' mutex if that ever matters.
+        auto* cur = new (std::nothrow) RuleSlot{};
+        char fp[65] = "";
+        const bool same = cur && rule_store_load(rid, cur) &&
+            sha256_hex(cur->src, cur->src_len <= sizeof(cur->src) ? cur->src_len : sizeof(cur->src), fp) &&
+            std::strcmp(fp, base) == 0;
+        delete cur;
+        if (!same) { send_err(fd, id, "changed"); return; }
+    }
     if (!simple_rules_update(rid, name, dsl)) { send_err(fd, id, dsl_last_error()); return; }
     reply_ok_or_err(fd, id, true, nullptr);
+}
+
+// rule.check {dsl} -> data {"ok", "err"} (spec §3.3): parsed as a save would, nothing stored, no
+// RULE_CHANGED. The cloud checks before every save because the hub's save errors are free text.
+static void cmd_rule_check(int fd, uint32_t id, JsonDocument& doc) {
+    const char* dsl = doc["args"]["dsl"] | (const char*)nullptr;
+    if (!dsl) { send_err(fd, id, "missing dsl"); return; }
+    char err[96];
+    const bool ok = simple_rules_check(dsl, err, sizeof(err));
+    char buf[700];   // a 96-byte message escaped as \u00XX at worst
+    JsonWriter w(buf, sizeof(buf));
+    w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"ok\":%s,\"err\":\"", id, ok ? "true" : "false")
+     .str(err, sizeof(err)).raw("\"}}");
+    const size_t n = w.finish();
+    if (n) ws_server_reply(fd, buf, n);
+    else send_err(fd, id, "oom");
 }
 static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
@@ -1233,7 +1341,8 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "logs.get")              == 0) { cmd_logs_get(fd, id);                    return; }
     if (std::strcmp(cmd, "device.reinterview") == 0) { cmd_device_reinterview(fd, id, doc);  return; }
     if (std::strcmp(cmd, "device.configure")   == 0) { cmd_device_configure(fd, id, doc);    return; }
-    if (std::strcmp(cmd, "rule.list")          == 0) { cmd_rule_list(fd, id);                return; }
+    if (std::strcmp(cmd, "rule.list")          == 0) { cmd_rule_list(fd, id, doc);           return; }
+    if (std::strcmp(cmd, "rule.check")         == 0) { cmd_rule_check(fd, id, doc);          return; }
     if (std::strcmp(cmd, "rule.create")        == 0) { cmd_rule_create(fd, id, doc);         return; }
     if (std::strcmp(cmd, "rule.update")        == 0) { cmd_rule_update(fd, id, doc);         return; }
     if (std::strcmp(cmd, "rule.enable")        == 0) { cmd_rule_enable(fd, id, doc);         return; }
