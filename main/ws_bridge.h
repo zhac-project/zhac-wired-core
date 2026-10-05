@@ -3,6 +3,7 @@
 #pragma once
 
 #include <ArduinoJson.h>
+#include <cstddef>
 #include <cstdint>
 
 // Wire the WS rx dispatcher + outbound event_bus pushes. Must run
@@ -21,3 +22,7 @@ void ws_push(const char* event, JsonDocument& data);
 // hub.caps {caps, remote_scripts} to the open hub-page tabs and the cloud relay: what this firmware
 // supports for remote editing, and the script switch (spec 2026-10-05 §3.6). Sent when the switch changes.
 void ws_push_hub_caps();
+
+// script.added / script.updated {name, size, fp, mtime?} after a save by REST or WebSocket (spec
+// 2026-10-05 §3.6). `existed`: the name was taken before the save.
+void ws_push_script_saved(const char* name, const char* src, size_t len, bool existed);

@@ -62,6 +62,7 @@
 #include "zap_common.h"
 #include "lua_engine.h"
 #include "lua_engine_scripts.h"
+#include "lua_engine_err.h"
 #include "nvs.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
@@ -991,6 +992,22 @@ void ws_push_hub_caps() {
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
 }
 
+void ws_push_script_saved(const char* name, const char* src, size_t len, bool existed) {
+    if (!push_listeners()) return;
+    char fp[65] = "";
+    sha256_hex(src, len, fp);
+    JsonDocument p;
+    p["name"] = name;
+    p["size"] = len;
+    p["fp"]   = fp;   // char[]: copied
+    LuaScriptEntry list[LUA_SCRIPT_MAX];
+    const uint16_t n = lua_script_cache_list(list, LUA_SCRIPT_MAX);
+    for (uint16_t i = 0; i < n; i++) {
+        if (std::strcmp(list[i].name, name) == 0 && list[i].mtime >= 1600000000u) p["mtime"] = list[i].mtime;
+    }
+    ws_push(existed ? "script.updated" : "script.added", p);
+}
+
 // ── rule.* (SPA drives rules over WS; calls simple_rules + rule_store) ──
 // One rule as rule.list carries it: {id, enabled, trigger_type, rule_type, name, dsl}, escaped and
 // UTF-8-safe (a name strncpy-cut mid-character on the hub page would otherwise close every WebSocket that
@@ -1163,33 +1180,83 @@ static void cmd_rule_run(int fd, uint32_t id, JsonDocument& doc) {
     reply_ok_or_err(fd, id, simple_rules_run_now(rid), "rule not found");
 }
 
-// ── script.* (SPA drives scripts over WS; write stays REST) ────────────
+// ── script.* (the hub page and the cloud relay; spec 2026-10-05 §3.3-§3.6) ──
+// remote_xfer's idle clock: a monotonic 32-bit millisecond tick (it wraps after 49 days; remote_xfer
+// subtracts unsigned, so that is harmless).
+static uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+
+// script.list -> [{name, size, mtime?}]; mtime only when the clock was set at the save (>= 1.6e9).
 static void cmd_script_list(int fd, uint32_t id) {
     LuaScriptEntry list[LUA_SCRIPT_MAX];
-    uint16_t n = lua_script_cache_list(list, LUA_SCRIPT_MAX);
+    const uint16_t n = lua_script_cache_list(list, LUA_SCRIPT_MAX);
     JsonDocument d; d["id"] = id; d["ok"] = true;
     JsonArray arr = d["data"].to<JsonArray>();
     for (uint16_t i = 0; i < n; i++) {
         JsonObject o = arr.add<JsonObject>();
         o["name"] = list[i].name; o["size"] = list[i].size;
+        if (list[i].mtime >= 1600000000u) o["mtime"] = list[i].mtime;
     }
-    char buf[1024]; size_t bn = serializeJson(d, buf, sizeof(buf)); ws_server_reply(fd, buf, bn);
+    char buf[2048];   // 16 scripts with names, sizes and times (was 1 KB)
+    const size_t bn = serializeJson(d, buf, sizeof(buf));
+    if (bn == 0 || bn >= sizeof(buf)) { send_err(fd, id, "too large"); return; }
+    ws_server_reply(fd, buf, bn);
 }
+
+// A stored script in a PSRAM buffer of LUA_SCRIPT_SRC_MAX + 1 bytes (a full-size script fits) and its
+// length; nullptr when it is missing or memory is short. Free with heap_caps_free.
+static char* script_load(const char* name, int* len) {
+    char* src = static_cast<char*>(heap_caps_malloc(LUA_SCRIPT_SRC_MAX + 1, MALLOC_CAP_SPIRAM));
+    if (!src) return nullptr;
+    *len = lua_script_cache_read(name, src, LUA_SCRIPT_SRC_MAX + 1);
+    if (*len < 0) { heap_caps_free(src); return nullptr; }
+    return src;
+}
+
+// script.read {name, offset?}. With `offset` (§3.4): one page of at most 6,144 JSON-encoded bytes, whole
+// characters only, {src, offset, size, fp, next_offset?}; size and fp (the whole file) repeat on every
+// page, so a reader sees a change mid-read. Without: today's {src}, the whole file -- up to 16,384 bytes
+// now (it was 16,383: a full-size script answered "not found") and the reply sized with measureJson (a
+// fixed 20 KB buffer could cut heavily escaped text into invalid JSON) (§3.8).
 static void cmd_script_read(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | (const char*)nullptr;
     if (!name) { send_err(fd, id, "missing name"); return; }
-    char* src = (char*)heap_caps_malloc(16 * 1024, MALLOC_CAP_SPIRAM);
-    char* buf = (char*)heap_caps_malloc(20 * 1024, MALLOC_CAP_SPIRAM);
-    if (!src || !buf) { heap_caps_free(src); heap_caps_free(buf); send_err(fd, id, "oom"); return; }
-    int sn = lua_script_cache_read(name, src, 16 * 1024);
-    if (sn < 0) { heap_caps_free(src); heap_caps_free(buf); send_err(fd, id, "not found"); return; }
-    src[sn < 16 * 1024 ? sn : 16 * 1024 - 1] = '\0';
-    JsonDocument d; d["id"] = id; d["ok"] = true;
-    d["data"]["src"] = (const char*)src;   // const* → ArduinoJson references (no 16K copy)
-    size_t bn = serializeJson(d, buf, 20 * 1024);
-    ws_server_reply(fd, buf, bn);
-    heap_caps_free(src); heap_caps_free(buf);
+    char* src = static_cast<char*>(heap_caps_malloc(LUA_SCRIPT_SRC_MAX + 1, MALLOC_CAP_SPIRAM));
+    if (!src) { send_err(fd, id, "oom"); return; }
+    const int sn = lua_script_cache_read(name, src, LUA_SCRIPT_SRC_MAX + 1);
+    if (sn < 0) { heap_caps_free(src); send_err(fd, id, "not found"); return; }
+    JsonVariantConst off = doc["args"]["offset"];
+    if (off.isNull()) {
+        JsonDocument d; d["id"] = id; d["ok"] = true;
+        d["data"]["src"] = static_cast<const char*>(src);   // referenced, not copied
+        const size_t cap = measureJson(d) + 1;
+        char* buf = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+        if (buf) ws_server_reply(fd, buf, serializeJson(d, buf, cap));
+        else send_err(fd, id, "oom");
+        heap_caps_free(buf); heap_caps_free(src);
+        return;
+    }
+    const size_t offset = std::min<size_t>(off.as<unsigned>(), static_cast<size_t>(sn));
+    char fp[65] = "";
+    char* page = static_cast<char*>(heap_caps_malloc(kRemotePageBudget, MALLOC_CAP_SPIRAM));
+    char* buf  = static_cast<char*>(heap_caps_malloc(kRemotePageBudget + 256, MALLOC_CAP_SPIRAM));
+    if (!page || !buf || !sha256_hex(src, static_cast<size_t>(sn), fp)) {
+        heap_caps_free(page); heap_caps_free(buf); heap_caps_free(src);
+        send_err(fd, id, "oom");
+        return;
+    }
+    size_t next = 0;
+    const size_t pn = remote_xfer_page(src, static_cast<size_t>(sn), offset, kRemotePageBudget, page, &next);
+    JsonWriter w(buf, kRemotePageBudget + 256);
+    w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"src\":\"", id).raw(page, pn)
+     .fmt("\",\"offset\":%u,\"size\":%d,\"fp\":\"%s\"", static_cast<unsigned>(offset), sn, fp);
+    if (next < static_cast<size_t>(sn)) w.fmt(",\"next_offset\":%u", static_cast<unsigned>(next));
+    w.raw("}}");
+    const size_t n = w.finish();
+    if (n) ws_server_reply(fd, buf, n);
+    else send_err(fd, id, "oom");
+    heap_caps_free(page); heap_caps_free(buf); heap_caps_free(src);
 }
+
 static void cmd_script_delete(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | (const char*)nullptr;
     if (!name) { send_err(fd, id, "missing name"); return; }
@@ -1197,21 +1264,183 @@ static void cmd_script_delete(int fd, uint32_t id, JsonDocument& doc) {
     reply_ok_or_err(fd, id, ok, "not found");
     if (ok) { JsonDocument p; p["name"] = name; ws_push("script.deleted", p); }
 }
+
 static void cmd_script_run(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | (const char*)nullptr;
     if (!name) { send_err(fd, id, "missing name"); return; }
     reply_ok_or_err(fd, id, lua_engine_run_script(name), "queue saturated or missing");
 }
+
+// script.part {xfer, part, parts, src} (§3.4): one part of a long text into the staging slot; nothing
+// reaches flash before script.write. -> {xfer, received}.
+static void cmd_script_part(int fd, uint32_t id, JsonDocument& doc) {
+    JsonVariantConst a = doc["args"];
+    const char* xfer = a["xfer"] | "";
+    const char* src  = a["src"] | (const char*)nullptr;
+    size_t received = 0;
+    if (const char* err = remote_xfer_part(xfer, a["part"] | -1, a["parts"] | -1, src,
+                                           src ? std::strlen(src) : 0, now_ms(), &received)) {
+        send_err(fd, id, err);
+        return;
+    }
+    char buf[96];   // xfer is [A-Za-z0-9]{1,16}: remote_xfer_part checked it
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"xfer\":\"%s\",\"received\":%u}}",
+                           id, xfer, static_cast<unsigned>(received));
+    ws_server_reply(fd, buf, static_cast<size_t>(n));
+}
+
+// The staged text of `xfer` as a private copy (a PSRAM buffer, NUL-terminated, *len bytes; free with
+// heap_caps_free), or nullptr with *err = "no_xfer" (no complete text for it) or "oom". remote_xfer_use runs
+// its callback under the slot's lock, so the callback only copies; the syntax check, the flash write and the
+// replies run on the copy, outside the lock. The slot is kept and counts as used (script.check's way);
+// script.write frees it with staged_drop once the text is saved.
+static_assert(kRemoteXferMax <= LUA_SCRIPT_SRC_MAX, "a staged text must fit a script buffer");
+
+struct StagedCopy { char* buf; size_t len; };
+
+static void staged_copy(const char* text, size_t len, void* ctx) {
+    auto* c = static_cast<StagedCopy*>(ctx);
+    std::memcpy(c->buf, text, len + 1);   // remote_xfer NUL-terminated it
+    c->len = len;
+}
+
+static char* staged_take(const char* xfer, size_t* len, const char** err) {
+    char* buf = static_cast<char*>(heap_caps_malloc(LUA_SCRIPT_SRC_MAX + 1, MALLOC_CAP_SPIRAM));
+    if (!buf) { *err = "oom"; return nullptr; }
+    StagedCopy c{buf, 0};
+    if (!remote_xfer_use(xfer, now_ms(), false, staged_copy, &c)) {
+        heap_caps_free(buf);
+        *err = "no_xfer";
+        return nullptr;
+    }
+    *len = c.len;
+    return buf;
+}
+
+// Frees the staged text after a save (§3.3 step 6). With consume, remote_xfer_use drops the slot only while
+// it still holds `xfer`: a transfer another client began in the meantime is left alone.
+static void staged_drop(const char* xfer) {
+    remote_xfer_use(xfer, now_ms(), true, [](const char*, size_t, void*) {}, nullptr);
+}
+
+// script.write steps 4-6 (§3.3) for a text from `src` or the staging slot: the hub's own syntax check
+// (a failure writes nothing), the store's limits, the save, then script.added / script.updated.
+// True once the text is saved.
+static bool script_write_text(int fd, uint32_t id, const char* name, const char* text, size_t len) {
+    char err[128] = {0};
+    int line = 0;
+    if (!lua_engine_check_syntax(name, text, err, sizeof(err), &line)) {
+        LuaErrInfo e;
+        lua_err_parse(err, name, &e);
+        char code[160];
+        snprintf(code, sizeof(code), "check:%d:%s", e.line > 0 ? e.line : line, e.message);
+        send_err(fd, id, code);
+        return false;
+    }
+    const bool existed = lua_script_cache_exists(name);
+    if (len > LUA_SCRIPT_SRC_MAX) { send_err(fd, id, "too_large"); return false; }
+    if (!existed) {
+        LuaScriptEntry list[LUA_SCRIPT_MAX];
+        if (lua_script_cache_list(list, LUA_SCRIPT_MAX) >= LUA_SCRIPT_MAX) { send_err(fd, id, "too_many"); return false; }
+    }
+    if (!lua_script_cache_write(name, text)) { send_err(fd, id, "write_failed"); return false; }
+    char fp[65] = "";
+    sha256_hex(text, len, fp);
+    char buf[160];   // the name passed remote_script_name_ok: nothing to escape
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"name\":\"%s\",\"size\":%u,\"fp\":\"%s\"}}",
+                           id, name, static_cast<unsigned>(len), fp);
+    ws_server_reply(fd, buf, static_cast<size_t>(n));
+    ws_push_script_saved(name, text, len, existed);
+    return true;
+}
+
+// script.write {name, src | xfer + size + fp, base?} (§3.3, new on wired). base: absent = no conflict
+// check (the hub page); "" = the name must be free (exists); 64 hex = the stored file must still have that
+// fingerprint (changed) -- no silent overwrite (§4.5). The cloud relay passes it only while the hub's
+// switch is on (scripts_off otherwise, remote_client). The staged text is used up only by a save: a wrong
+// name, base, size or fingerprint, a syntax error or a full store leave it for 30 s.
+static void cmd_script_write(int fd, uint32_t id, JsonDocument& doc) {
+    JsonVariantConst a = doc["args"];
+    const char* name = a["name"] | "";
+    if (!remote_script_name_ok(name)) { send_err(fd, id, "bad_name"); return; }
+    if (const char* base = a["base"] | (const char*)nullptr) {
+        const bool exists = lua_script_cache_exists(name);
+        if (!base[0] && exists) { send_err(fd, id, "exists"); return; }
+        if (base[0]) {
+            char fp[65] = "";
+            int len = 0;
+            char* cur = exists ? script_load(name, &len) : nullptr;
+            const bool same = cur && sha256_hex(cur, static_cast<size_t>(len), fp) && std::strcmp(fp, base) == 0;
+            heap_caps_free(cur);
+            if (!same) { send_err(fd, id, "changed"); return; }
+        }
+    }
+    if (const char* xfer = a["xfer"] | (const char*)nullptr) {
+        const char* err = nullptr;
+        size_t len = 0;
+        char* text = staged_take(xfer, &len, &err);
+        if (!text) { send_err(fd, id, err); return; }
+        char fp[65] = "";
+        if (static_cast<long>(len) != (a["size"] | -1L) || !sha256_hex(text, len, fp) ||
+            std::strcmp(fp, a["fp"] | "") != 0) {
+            send_err(fd, id, "bad_part");   // the staged bytes are not the text the sender meant
+        } else if (script_write_text(fd, id, name, text, len)) {
+            staged_drop(xfer);
+        }
+        heap_caps_free(text);
+        return;
+    }
+    const char* src = a["src"] | (const char*)nullptr;
+    if (!src) { send_err(fd, id, "missing src"); return; }
+    script_write_text(fd, id, name, src, std::strlen(src));
+}
+
+// {ok, err, line} as today, built with JsonWriter: Lua's message quotes the source, and a 128-byte cut can
+// split a character.
+static void script_check_reply(int fd, uint32_t id, const char* name, const char* src) {
+    char err[128] = {0};
+    int line = 0;
+    const bool ok = lua_engine_check_syntax(name, src, err, sizeof(err), &line);
+    char buf[1024];   // 128 bytes of message escaped as \u00XX at worst
+    JsonWriter w(buf, sizeof(buf));
+    w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"ok\":%s,\"err\":\"", id, ok ? "true" : "false")
+     .str(err, sizeof(err)).fmt("\",\"line\":%d}}", line);
+    const size_t n = w.finish();
+    if (n) ws_server_reply(fd, buf, n);
+    else send_err(fd, id, "oom");
+}
+
+// script.check {name?, src | xfer}: a long text is checked from the staging slot, which stays (§3.4).
 static void cmd_script_check(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | "";
-    const char* src  = doc["args"]["src"]  | (const char*)nullptr;
+    if (const char* xfer = doc["args"]["xfer"] | (const char*)nullptr) {
+        const char* err = nullptr;
+        size_t len = 0;
+        char* text = staged_take(xfer, &len, &err);
+        if (!text) { send_err(fd, id, err); return; }
+        script_check_reply(fd, id, name, text);
+        heap_caps_free(text);
+        return;
+    }
+    const char* src = doc["args"]["src"] | (const char*)nullptr;
     if (!src) { send_err(fd, id, "missing src"); return; }
-    char err[128] = {0}; int line = 0;
-    bool ok = lua_engine_check_syntax(name, src, err, sizeof(err), &line);
-    JsonDocument d; d["id"] = id; d["ok"] = true;
-    JsonObject da = d["data"].to<JsonObject>();
-    da["ok"] = ok; da["err"] = err; da["line"] = line;
-    char buf[256]; size_t bn = serializeJson(d, buf, sizeof(buf)); ws_server_reply(fd, buf, bn);
+    script_check_reply(fd, id, name, src);
+}
+
+// script.reload (§3.5): the hub page's Apply. A fresh Lua state with every stored script, no reboot. Waits
+// up to 5 s for the pass: {loaded, total}, else {queued: true} (the pass still finishes). Runs on the
+// relay's or the httpd task, never TaskLua, and holds no lock while it waits: the pass may raise script.error,
+// whose push needs the WebSocket and relay queues.
+static void cmd_script_reload(int fd, uint32_t id) {
+    uint16_t loaded = 0, total = 0;
+    const LuaReloadResult r = lua_engine_reload(5000, &loaded, &total);
+    if (r == LUA_RELOAD_BUSY) { send_err(fd, id, "lua queue full"); return; }
+    char buf[112];
+    const int n = r == LUA_RELOAD_DONE
+        ? snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"loaded\":%u,\"total\":%u}}",
+                   id, static_cast<unsigned>(loaded), static_cast<unsigned>(total))
+        : snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"queued\":true}}", id);
+    ws_server_reply(fd, buf, static_cast<size_t>(n));
 }
 
 // ── alerts.get ────────────────────────────────────────────────────────
@@ -1354,6 +1583,9 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "script.delete")      == 0) { cmd_script_delete(fd, id, doc);       return; }
     if (std::strcmp(cmd, "script.run")         == 0) { cmd_script_run(fd, id, doc);          return; }
     if (std::strcmp(cmd, "script.check")       == 0) { cmd_script_check(fd, id, doc);        return; }
+    if (std::strcmp(cmd, "script.part")        == 0) { cmd_script_part(fd, id, doc);         return; }
+    if (std::strcmp(cmd, "script.write")       == 0) { cmd_script_write(fd, id, doc);        return; }
+    if (std::strcmp(cmd, "script.reload")      == 0) { cmd_script_reload(fd, id);            return; }
     if (std::strcmp(cmd, "zigbee.settings.set") == 0) { cmd_zigbee_settings_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "zigbee.reset")        == 0) { cmd_zigbee_reset(fd, id);             return; }
     if (std::strcmp(cmd, "system.storage_reset") == 0) { cmd_storage_reset(fd, id);           return; }
@@ -1495,6 +1727,20 @@ static void on_rule_changed(const Event& e) {
     delete s;
 }
 
+// script.error {name, line, message} (§3.6): lua_engine's error hook, on TaskLua, at most once per script
+// per 10 s. Built with JsonWriter: Lua's text can quote any byte, and one invalid UTF-8 byte in a
+// WebSocket text frame closes the socket (the hub page's and the cloud's). The name is not to be trusted
+// either: a script can forge the `[string "<name>"]:` prefix with error(msg, 0), so only a name the hub
+// could have stored is reported, else "".
+static void on_script_error(const char* name, int line, const char* message) {
+    if (!push_listeners()) return;
+    if (!remote_script_name_ok(name)) name = "";
+    char buf[1024];
+    JsonWriter w(buf, sizeof(buf));
+    w.raw("{\"name\":\"").str(name, 24).fmt("\",\"line\":%d,\"message\":\"", line).str(message, 120).raw("\"}");
+    if (const size_t n = w.finish()) push_event("script.error", buf, n);
+}
+
 void ws_bridge_install() {
     ws_server_set_rx_callback(ws_rx);
     event_bus_subscribe(EventType::ZCL_ATTR,    on_zcl_attr);
@@ -1505,6 +1751,7 @@ void ws_bridge_install() {
     event_bus_subscribe(EventType::DEVICE_JOIN, on_device_join);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
     event_bus_subscribe(EventType::RULE_CHANGED, on_rule_changed);
+    lua_engine_set_error_hook(on_script_error);
     ESP_LOGI(TAG, "WS rx (ping / status / device.{list,get,rename,delete,"
                    "attr.set,bind,reinterview,configure}) + "
                    "push (zcl_attr / device_join / device_leave) wired");
