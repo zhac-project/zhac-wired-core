@@ -184,10 +184,14 @@ jobs:
           cp zhac-wired-core/build.rcp/zhac-rcp-c6.bin "zhac-rcp-c6-${GITHUB_REF_NAME}.bin"
           # C6 radio installer: merged image (flash at 0x0, wipes NVS) and the
           # app-only image (flash at 0x20000 / ota_0, keeps NVS -- see its own README).
+          # The app-only one must NOT be named -ota.bin: the hub's Firmware page offers
+          # any -ota.bin that fits its chip, and the copies of that page already on hubs
+          # in the field would install this one-off installer (it fits "-p4-" just like
+          # zhac-wired-p4-rev1x-<tag>-ota.bin) in place of the hub firmware.
           cp zhac-wired-core/tools/c6-rcp-installer/build/c6-rcp-installer-merged.bin \
             "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin"
           cp zhac-wired-core/tools/c6-rcp-installer/build/c6_rcp_installer.bin \
-            "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}-ota.bin"
+            "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}-app.bin"
           # What the image was built from: this repo's commit, the IDF, and
           # every sibling's commit. Enough to rebuild it without this runner.
           cp zhac-wired-core/release-manifest.json "release-manifest-${GITHUB_REF_NAME}.json"
