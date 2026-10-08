@@ -35,3 +35,5 @@ idf_component_register(
                   device_shadow mqtt_gw tg_gw zigbee_mgr
                   simple_rules lua_cjson
 )
+# The Lua C-stack limits (LUAI_MAXCCALLS=16, MAXCCALLS=32), sized for the 32 KB TaskLua in sdkconfig.defaults.
+include(${LUA_ENGINE_SRC_DIR}/lua_limits.cmake)
