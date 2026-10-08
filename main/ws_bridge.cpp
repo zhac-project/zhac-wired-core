@@ -1269,6 +1269,7 @@ static void cmd_script_delete(int fd, uint32_t id, JsonDocument& doc) {
 static void cmd_script_run(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = doc["args"]["name"] | (const char*)nullptr;
     if (!name) { send_err(fd, id, "missing name"); return; }
+    if (lua_engine_scripts_held()) { send_err(fd, id, LUA_ENGINE_HELD_ERR); return; }   // TaskLua would skip it
     reply_ok_or_err(fd, id, lua_engine_run_script(name), "queue saturated or missing");
 }
 

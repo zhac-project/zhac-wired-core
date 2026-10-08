@@ -169,6 +169,10 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_POST && is_run) {
+        if (lua_engine_scripts_held()) {   // TaskLua would skip the run (the boot-loop guard)
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, LUA_ENGINE_HELD_ERR);
+            return ESP_FAIL;
+        }
         bool ok = lua_engine_run_script(name);
         httpd_resp_set_type(req, "application/json");
         if (ok) return httpd_resp_sendstr(req, "{\"ok\":true,\"queued\":true}");

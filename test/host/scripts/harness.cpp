@@ -130,6 +130,8 @@ extern "C" bool lua_script_cache_delete(const char* name) {
 static bool g_run_ok = true;
 static std::string g_run_name;
 extern "C" bool lua_engine_run_script(const char* name) { g_run_name = name; return g_run_ok; }
+static const char* g_held = nullptr;   // lua_engine's boot-loop guard: nullptr, or the script loading at the last crash
+extern "C" const char* lua_engine_scripts_held(void) { return g_held; }
 static LuaReloadResult g_reload_res = LUA_RELOAD_DONE;
 static uint16_t g_reload_loaded = 3, g_reload_total = 4;
 static uint32_t g_reload_wait = 0;
@@ -233,6 +235,7 @@ static void reset() {
     g_listeners = true;
     g_psa_fail = false;
     g_run_ok = true;
+    g_held = nullptr;
     g_reload_res = LUA_RELOAD_DONE; g_reload_loaded = 3; g_reload_total = 4; g_reload_wait = 0; g_reload_calls = 0;
     remote_xfer_reset();
     g_now_us = 100LL * 1000 * 1000;
@@ -824,6 +827,16 @@ static void test_delete_run() {
     g_run_ok = false;
     { Req q; q.s("name", "job"); h_run(1, 6, q.doc); CHECK(rep().err == "queue saturated or missing", "run: refused"); }
     { Req q; h_run(1, 6, q.doc); CHECK(rep().err == "missing name", "run: missing name"); }
+    // While the boot-loop guard holds the scripts TaskLua skips every named run, so script.run says why instead of ok.
+    g_run_ok = true;
+    g_held = "pump";
+    g_run_name.clear();
+    { Req q; q.s("name", "job"); h_run(1, 6, q.doc);
+      CHECK(rep().err == "scripts are held: the hub restarted twice while scripts were starting; Apply starts them again" &&
+            g_run_name.empty(), "run while held: an error that says why, nothing queued"); }
+    g_held = "";   // held after a crash outside a load (no script name): the same
+    { Req q; q.s("name", "job"); h_run(1, 6, q.doc); CHECK(!rep().ok && g_run_name.empty(), "run while held (no name)"); }
+    g_held = nullptr;
 }
 
 // ---- script.reload ------------------------------------------------------------------------------------------------
@@ -989,6 +1002,13 @@ static void test_rest() {
     // the rest of the surface
     r = rest_call(M_POST, "/api/scripts/job/run", "");
     CHECK(r.status == 200 && g_run_name == "job" && r.body == "{\"ok\":true,\"queued\":true}", "run");
+    g_held = "pump";
+    g_run_name.clear();
+    r = rest_call(M_POST, "/api/scripts/job/run", "");
+    CHECK(r.status == 500 && g_run_name.empty() &&
+          r.body == "scripts are held: the hub restarted twice while scripts were starting; Apply starts them again",
+          "run while held: refused with the reason (status %d '%s')", r.status, r.body.c_str());
+    g_held = nullptr;
     g_events.clear();
     r = rest_call(M_DELETE, "/api/scripts/foo", "");
     CHECK(r.status == 200 && !g_fs.count("foo") && g_events.size() == 1 && g_events[0].event == "script.deleted", "delete");
