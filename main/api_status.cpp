@@ -34,6 +34,7 @@
 #include "ws_server.h"
 #include "zigbee_pool.h"
 #include "log_ring.h"
+#include "lua_engine.h"   // lua_engine_scripts_held
 #include "remote_client.h"
 #include "remote_state.h"
 
@@ -173,6 +174,9 @@ void api_status_fill(JsonObject doc) {
     // The hub page shows its "Allow script changes from the cloud" switch only when this is present.
     doc["remote_scripts"] = sys_remote_scripts();
 #endif
+    // lua_engine's boot-loop guard held the scripts (two crashes in a row while they started): the Scripts
+    // page says so. The script that was loading at the last crash, "" when unknown. Only while it holds.
+    if (const char* held = lua_engine_scripts_held()) doc["scripts_held"] = held;   // static storage: no copy needed
 }
 
 static esp_err_t handle_get_status(httpd_req_t* req) {

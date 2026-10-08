@@ -63,8 +63,14 @@ static bool parse_name(const char* uri, char* out, size_t cap,
 // without writing, checking or pushing anything: 413 over kScriptCap (the hub used to keep the first 16,383
 // bytes of such a body and say ok), 500 out of memory, 408 when a receive timed out (10 s on this server) and
 // 400 when it failed or the client closed before the whole body arrived (the loop used to stop right there,
-// and the cut text was saved over the stored script, pushed, and answered ok).
+// and the cut text was saved over the stored script, pushed, and answered ok), and 411 for a chunked upload:
+// esp_http_server reports content_len 0 for it and cannot read the chunks, so the empty body blanked the stored
+// script and answered ok. An explicit Content-Length: 0 still means an empty script.
 static char* read_body(httpd_req_t* req) {
+    if (req->content_len == 0 && httpd_req_get_hdr_value_len(req, "Transfer-Encoding") > 0) {
+        httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "send the script with a Content-Length");
+        return nullptr;
+    }
     if (req->content_len > kScriptCap) {
         httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "a script is at most 16384 bytes");
         return nullptr;

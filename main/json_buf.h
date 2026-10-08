@@ -10,7 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include "utf8_seq.h"   // utf8_seq_len: the strict RFC 3629 validator (one copy, shared with remote_client)
+#include "utf8_seq.h"   // utf8_seq_len: the strict RFC 3629 validator (one copy, in ws_server, shared with remote_client)
 
 // Bounded copy of a user-supplied UTF-8 string into a fixed field (e.g.
 // GrpRecord::name[32]). Unlike strncpy, truncation lands on a code-point

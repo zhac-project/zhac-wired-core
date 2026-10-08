@@ -1009,9 +1009,10 @@ void ws_push_script_saved(const char* name, const char* src, size_t len, bool ex
 }
 
 // ── rule.* (SPA drives rules over WS; calls simple_rules + rule_store) ──
-// One rule as rule.list carries it: {id, enabled, trigger_type, rule_type, name, dsl}, escaped and
-// UTF-8-safe (a name strncpy-cut mid-character on the hub page would otherwise close every WebSocket that
-// lists it). 0 when it does not fit `cap`.
+// One rule as rule.list, rule.added and rule.updated carry it: {id, enabled, trigger_type, rule_type, name,
+// dsl}, escaped and UTF-8-safe (a name strncpy-cut mid-character on the hub page would otherwise close every
+// WebSocket that lists it). 0 when it does not fit `cap`.
+static constexpr size_t kRuleRowCap = 3400;   // a 23-byte name and a 499-byte text, all escaped as \u00XX
 static size_t rule_row_json(const RuleSlot& s, char* out, size_t cap) {
     JsonWriter w(out, cap);
     const size_t dn = s.src_len < sizeof(s.src) ? s.src_len : sizeof(s.src);
@@ -1029,7 +1030,7 @@ static size_t rule_row_json(const RuleSlot& s, char* out, size_t cap) {
 // are sorted by id, so a deleted rule never shifts the next page. Without a cursor: the bare array the
 // hub page and older clouds read, cut near 16 KB as it always was.
 static void cmd_rule_list(int fd, uint32_t id, JsonDocument& doc) {
-    constexpr size_t kRowCap  = 3400;        // a 23-byte name and a 499-byte text, all escaped as \u00XX
+    constexpr size_t kRowCap  = kRuleRowCap;
     constexpr size_t kListCap = 16 * 1024;
     auto* slots = (RuleSlot*)heap_caps_malloc(sizeof(RuleSlot) * ZAP_MAX_RULES, MALLOC_CAP_SPIRAM);
     char* row   = (char*)heap_caps_malloc(kRowCap, MALLOC_CAP_SPIRAM);
@@ -1364,6 +1365,9 @@ static void cmd_script_write(int fd, uint32_t id, JsonDocument& doc) {
     const char* name = a["name"] | "";
     if (!remote_script_name_ok(name)) { send_err(fd, id, "bad_name"); return; }
     if (const char* base = a["base"] | (const char*)nullptr) {
+        // ponytail: compare, then save, are two calls (this check, then script_write_text after the copy, the
+        // hash and the syntax check); a hub-page save landing in between is overwritten without `changed`.
+        // Hold one lock across both if that ever matters (rule.update has the same note).
         const bool exists = lua_script_cache_exists(name);
         if (!base[0] && exists) { send_err(fd, id, "exists"); return; }
         if (base[0]) {
@@ -1708,22 +1712,27 @@ static void on_device_leave(const Event& e) {
 
 // Rules changed by any door (WebSocket, REST, a backup restore) -> one push,
 // built here from the store so REST edits reach open tabs and the relay too.
+// rule.added / rule.updated carry the row rule.list carries (rule_row_json: escaped, UTF-8-safe, in a
+// PSRAM buffer): ArduinoJson wrote a name cut inside a character as raw bytes, and that one frame closed
+// the cloud link (Tomcat 1007) and every hub-page tab; a 1 KB stack buffer also dropped a long rule's push.
 static void on_rule_changed(const Event& e) {
     if (!push_listeners()) return;
     RuleChangedEvent c{};
     std::memcpy(&c, e.data, sizeof(c));
-    JsonDocument p;
-    p["id"] = c.rule_id;
-    if (c.change == RULE_CHANGE_DELETED) { ws_push("rule.deleted", p); return; }
-    auto* s = new (std::nothrow) RuleSlot{};
-    if (!s) return;
-    if (rule_store_load(c.rule_id, s)) {
-        char dsl[501];
-        const size_t dn = s->src_len < 500 ? s->src_len : 500;
-        std::memcpy(dsl, s->src, dn); dsl[dn] = '\0';
-        p["name"] = s->name; p["dsl"] = dsl; p["enabled"] = (bool)s->enabled;
-        ws_push(c.change == RULE_CHANGE_ADDED ? "rule.added" : "rule.updated", p);
+    if (c.change == RULE_CHANGE_DELETED) {
+        JsonDocument p;
+        p["id"] = c.rule_id;
+        ws_push("rule.deleted", p);
+        return;
     }
+    auto* s = new (std::nothrow) RuleSlot{};
+    char* row = static_cast<char*>(heap_caps_malloc(kRuleRowCap, MALLOC_CAP_SPIRAM));
+    if (s && row && rule_store_load(c.rule_id, s)) {
+        if (const size_t n = rule_row_json(*s, row, kRuleRowCap)) {
+            push_event(c.change == RULE_CHANGE_ADDED ? "rule.added" : "rule.updated", row, n);
+        }
+    }
+    heap_caps_free(row);
     delete s;
 }
 
