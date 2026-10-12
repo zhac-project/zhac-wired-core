@@ -232,7 +232,9 @@ void run_scan() {
             ezb_nwk_neighbor_info_t nb{};
             while (n_local < kLocalMax && ezb_nwk_get_next_neighbor(&it, &nb) == EZB_ERR_NONE) {
                 local[n_local++] = Neighbor{0, nb.ieee_addr.u64, nb.short_addr, nb.device_type,
-                                            nb.relationship, nb.depth, zhc_zb::lqi_from_rssi(nb.rssi)};
+                                            nb.relationship, nb.depth,
+                                            nb.rssi < 0 ? zhc_zb::lqi_from_rssi(nb.rssi) : uint8_t(0),
+                                            nb.rssi >= 0};   // rssi 0 = no reading
             }
         }
     }
@@ -328,7 +330,11 @@ char* esp_zb_netmap_get_json(size_t* len) {
     p["total"] = s_total;
     p["current"] = s_current;   // char[]: copied
     char prog[160];
-    const size_t pn = serializeJson(p, prog, sizeof(prog));
+    size_t pn = serializeJson(p, prog, sizeof(prog));
+    if (pn == 0 || pn >= sizeof(prog)) {   // truncated (long escaped name): drop the name, keep the counts
+        pn = static_cast<size_t>(std::snprintf(prog, sizeof(prog), "{\"done\":%u,\"total\":%u,\"current\":\"\"}",
+                                               unsigned(s_done), unsigned(s_total)));
+    }
     const size_t cap = 64 + pn + (s_map ? s_map_len : 4);
     char* buf = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
     if (buf) {

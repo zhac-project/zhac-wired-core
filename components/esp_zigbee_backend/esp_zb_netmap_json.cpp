@@ -75,7 +75,8 @@ void build_json(JsonDocument& doc, const Walk& w, uint32_t ts, uint32_t duration
         JsonObject o = links.add<JsonObject>();
         o["src"]   = ieee_str(l.src);
         o["dst"]   = ieee_str(l.dst);
-        o["lqi"]   = l.lqi;
+        if (l.no_lqi) o["lqi"] = nullptr;
+        else          o["lqi"] = l.lqi;
         o["rel"]   = rel_name(l.rel);
         o["depth"] = l.depth;
     }

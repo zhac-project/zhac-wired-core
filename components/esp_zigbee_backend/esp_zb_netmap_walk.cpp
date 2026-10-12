@@ -71,7 +71,7 @@ void Walk::add_record(uint64_t src, const Neighbor& r) {
     for (size_t i = 0; i < n_links_; ++i)
         if (links_[i].src == src && links_[i].dst == r.ieee) return;   // the same record on two pages
     if (n_links_ == kMaxLinks) { truncated_ = true; return; }
-    links_[n_links_++] = Link{src, r.ieee, r.lqi, rel_of(r.rel), r.depth};
+    links_[n_links_++] = Link{src, r.ieee, r.lqi, rel_of(r.rel), r.depth, r.no_lqi};
     if (t == NodeType::Router) enqueue(r.ieee, r.nwk);
 }
 

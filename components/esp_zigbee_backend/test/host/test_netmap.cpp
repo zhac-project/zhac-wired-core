@@ -259,6 +259,20 @@ static void test_json_shape() {
                                                       ns[0]["name"] == "Balcony temp" && ns[0]["last_seen"] == 1760000000);
 }
 
+static void test_no_lqi() {
+    Mesh m;
+    w.begin(C, kPan, nullptr, 0);
+    Neighbor n = nb(RA, 0xA, 1, 1, 0, 0);
+    n.no_lqi = true;
+    const Neighbor local[] = {n};
+    w.add_local(local, 1);
+    run(w, m);
+    expect("local record without a reading keeps no_lqi", w.link_count() >= 1 && w.links()[0].no_lqi);
+    JsonDocument back;
+    deserializeJson(back, to_json(w, 0, 1));
+    expect("no_lqi link serialises lqi null", back["links"][0]["lqi"].isNull() && !back["links"][0]["lqi"].is<int>());
+}
+
 static void test_json_empty_mesh() {
     w.begin(C, kPan, nullptr, 0);
     Mesh m;
@@ -279,6 +293,7 @@ int main() {
     test_caps();
     test_json_shape();
     test_json_empty_mesh();
+    test_no_lqi();
     if (g_fail) { std::printf("\n%d FAILURE(S)\n", g_fail); return 1; }
     std::printf("\nnetmap walk OK\n");
     return 0;

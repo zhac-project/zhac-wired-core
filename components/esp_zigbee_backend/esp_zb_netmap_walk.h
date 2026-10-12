@@ -45,6 +45,7 @@ struct Neighbor {
     uint8_t  rel;         // relationship 0..4 (dst is src's ...)
     uint8_t  depth;
     uint8_t  lqi;
+    bool     no_lqi = false;   // the radio gave no reading (local table, rssi 0): lqi is meaningless
 };
 
 struct Node {
@@ -60,6 +61,7 @@ struct Link {
     uint8_t  lqi;
     Rel      rel;
     uint8_t  depth;
+    bool     no_lqi = false;
 };
 
 struct Ask {
