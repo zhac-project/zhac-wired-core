@@ -28,5 +28,8 @@ add_test(NAME zcl_frame COMMAND zcl_frame_tests)
 add_executable(lqi_tests test_lqi.cpp)
 add_test(NAME lqi COMMAND lqi_tests)
 
-add_executable(netmap_tests test_netmap.cpp ../../esp_zb_netmap_walk.cpp)
+# ArduinoJson comes from the sibling zhac-components checkout (same as test/host/switch).
+add_executable(netmap_tests test_netmap.cpp ../../esp_zb_netmap_walk.cpp ../../esp_zb_netmap_json.cpp)
+target_include_directories(netmap_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components/components/arduinojson/src)
 add_test(NAME netmap COMMAND netmap_tests)

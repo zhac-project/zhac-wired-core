@@ -4,6 +4,7 @@
 // The network map walk (esp_zb_netmap_walk) against scripted meshes: paging,
 // discovery, retries, filters, the pool fallback, caps and loop guards.
 
+#include "../../esp_zb_netmap_json.h"
 #include "../../esp_zb_netmap_walk.h"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -203,6 +205,70 @@ static void test_caps() {
     expect("links never past the cap", w.link_count() <= kMaxLinks);
 }
 
+static std::string to_json(const Walk& walk, uint32_t ts, uint32_t dur) {
+    JsonDocument doc;
+    build_json(doc, walk, ts, dur);
+    std::string s;
+    serializeJson(doc, s);
+    return s;
+}
+
+static void test_json_shape() {
+    Mesh m;
+    m.tables[0xA] = {nb(C, 0, 0, 0, 198), nb(E2, 0x12, 2, 4, 92), nb(E3, 0x13, 3, 7, 70)};
+    m.dead = {0xD};
+    Known pool[] = {known(RA, 0xA, 1, "Kitchen \"x\" \\ Кухня"), known(EZ, 0x99, 2, "Balcony temp")};
+    std::snprintf(pool[0].model, sizeof(pool[0].model), "%s", "TS011F");
+    w.begin(C, kPan, pool, 2);
+    const Neighbor local[] = {nb(RA, 0xA, 1, 1, 212, 0), nb(RD, 0xD, 1, 1, 48, 0)};
+    w.add_local(local, 2);
+    run(w, m);
+
+    const std::string s = to_json(w, 1760300000, 8400);
+    JsonDocument back;
+    expect("map JSON parses", deserializeJson(back, s) == DeserializationError::Ok);
+    expect("ts / duration / truncated", back["ts"] == 1760300000 && back["duration_ms"] == 8400 &&
+                                        back["truncated"] == false);
+    JsonArray nodes = back["nodes"].as<JsonArray>();
+    expect("coordinator first, named Hub", nodes[0]["type"] == "coordinator" && nodes[0]["name"] == "Hub" &&
+                                           nodes[0]["ieee"] == "0x00124B0000000001" && nodes[0]["known"] == true);
+    bool name_ok = false, model_ok = false, failed_ok = false, unknown_ok = false;
+    for (JsonObject n : nodes) {
+        if (n["ieee"] == "0xA1A1A1A1A1A1A1A1") {
+            name_ok  = n["name"] == "Kitchen \"x\" \\ Кухня";
+            model_ok = n["model"] == "TS011F" && n["type"] == "router" && n["nwk"] == 0xA;
+        }
+        if (n["ieee"] == "0xD4D4D4D4D4D4D4D4") failed_ok = n["failed"] == true && n["known"] == false;
+        if (n["ieee"] == "0x0000000000003333") unknown_ok = n["type"] == "unknown";
+    }
+    expect("name with quote, backslash, Cyrillic round-trips", name_ok);
+    expect("model, type, nwk", model_ok);
+    expect("dead router failed, not known to the pool", failed_ok);
+    expect("device_type 3 -> unknown", unknown_ok);
+    bool prev_child = false, bad_rel_none = false, child = false;
+    for (JsonObject l : back["links"].as<JsonArray>()) {
+        if (l["src"] == "0x00124B0000000001" && l["dst"] == "0xA1A1A1A1A1A1A1A1") child = l["rel"] == "child" && l["lqi"] == 212;
+        if (l["dst"] == "0x0000000000002222") prev_child = l["rel"] == "prev_child";
+        if (l["dst"] == "0x0000000000003333") bad_rel_none = l["rel"] == "none";
+    }
+    expect("rel child + lqi", child);
+    expect("relationship 4 -> prev_child", prev_child);
+    expect("relationship 7 -> none", bad_rel_none);
+    JsonArray ns = back["not_seen"].as<JsonArray>();
+    expect("not_seen lists the unlisted pool device", ns.size() == 1 && ns[0]["ieee"] == "0x0000000000009999" &&
+                                                      ns[0]["name"] == "Balcony temp" && ns[0]["last_seen"] == 1760000000);
+}
+
+static void test_json_empty_mesh() {
+    w.begin(C, kPan, nullptr, 0);
+    Mesh m;
+    run(w, m);
+    JsonDocument back;
+    deserializeJson(back, to_json(w, 0, 3));
+    expect("coordinator alone: one node, no links, nothing unseen",
+           back["nodes"].size() == 1 && back["links"].size() == 0 && back["not_seen"].size() == 0 && back["ts"] == 0);
+}
+
 int main() {
     test_bfs_paging_dedupe();
     test_filters();
@@ -211,6 +277,8 @@ int main() {
     test_rejoin_takes_table_nwk();
     test_loop_guards();
     test_caps();
+    test_json_shape();
+    test_json_empty_mesh();
     if (g_fail) { std::printf("\n%d FAILURE(S)\n", g_fail); return 1; }
     std::printf("\nnetmap walk OK\n");
     return 0;
