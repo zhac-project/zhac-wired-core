@@ -13,6 +13,8 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **Zigbee network map.** `net.map.scan` asks every router for its neighbour table (Mgmt_Lqi_req, 5 s and one retry per page, one router at a time) and `net.map.get` returns the last map (nodes, links with LQI and relationship, devices not seen). Manual only, nothing stored in flash; progress goes to the hub page only, not to the cloud. Needs www-spa with the Map tab.
+
 - **Test builds as pre-releases** (`.github/workflows/release.yml`): a tag with a suffix, like `v2026100301-rc1`, is published as a GitHub pre-release with a "Test build, not a release" note, never marked latest. The hub's Firmware page lists it with a "pre-release" label; the browser flasher keeps offering the last real release.
 
 - **A raw `dp_<id>` row goes away once the device's definition decodes that datapoint** (zhac-components 7582b12, embedded-zhc 2f5655d): the hub saved unmapped Tuya datapoints as `dp_<id>`, and after a definition update the old raw value stayed on the States tab forever. It is now dropped (RAM at once, flash at the next save) the next time the device reports that datapoint; reload the device page to see it gone.
