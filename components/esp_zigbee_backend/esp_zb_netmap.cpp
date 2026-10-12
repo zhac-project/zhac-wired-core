@@ -9,6 +9,10 @@
 
 #include "esp_zb_netmap.h"
 
+#include "sdkconfig.h"
+
+#if CONFIG_ZHAC_ESP_ZIGBEE
+
 #include "esp_zb_lock.h"
 #include "esp_zb_lqi.h"
 #include "esp_zb_netmap_json.h"
@@ -169,6 +173,7 @@ void publish_progress(const Walk& w, const Ask& a) {
 void finish(bool ok, const char* err, char* map, size_t map_len) {
     lock();
     if (ok) {
+        s_done = s_total;
         heap_caps_free(s_map);
         s_map = map;
         s_map_len = map_len;
@@ -216,8 +221,10 @@ void run_scan() {
     ezb_extaddr_t me{};
     ezb_extpanid_t xpan{};
     size_t n_local = 0;
+    bool got = false;
     {
         zb_lock::Guard g;
+        got = static_cast<bool>(g);
         if (g) {
             ezb_nwk_get_extended_address(&me);
             ezb_nwk_get_extended_panid(&xpan);
@@ -229,14 +236,25 @@ void run_scan() {
             }
         }
     }
+    if (!got || xpan.u64 == 0) {   // no SDK lock / no network: keep the last map
+        w->~Walk();
+        heap_caps_free(wmem); heap_caps_free(local); heap_caps_free(known);
+        finish(false, "not_ready", nullptr, 0);
+        return;
+    }
     w->begin(me.u64, xpan.u64, known, n_known);
     w->add_local(local, n_local);
 
     Ask a{};
     while (w->next_ask(&a)) {
         publish_progress(*w, a);
-        if (ask_page(a)) w->on_page(a, s_page_total, s_page_start, s_page, s_page_n);
-        else             w->on_fail(a);
+        if (ask_page(a)) {
+            w->on_page(a, s_page_total, s_page_start, s_page, s_page_n);
+        } else {
+            ESP_LOGW(TAG, "no answer from 0x%016" PRIX64 " (nwk 0x%04x) page %u", a.ieee, unsigned(a.nwk),
+                     unsigned(a.start_index));
+            w->on_fail(a);
+        }
         vTaskDelay(pdMS_TO_TICKS(kGapMs));
     }
 
@@ -329,3 +347,22 @@ char* esp_zb_netmap_get_json(size_t* len) {
 void esp_zb_netmap_set_listener(NetmapListener fn) {
     s_listener = fn;
 }
+
+#else  // !CONFIG_ZHAC_ESP_ZIGBEE: stubs so callers still link
+
+#include "esp_heap_caps.h"
+
+#include <cstring>
+
+const char* esp_zb_netmap_start(void) { return "not_ready"; }
+
+char* esp_zb_netmap_get_json(size_t* len) {
+    static constexpr char kEmpty[] = "{\"scanning\":false,\"progress\":{\"done\":0,\"total\":0,\"current\":\"\"},\"map\":null}";
+    char* b = static_cast<char*>(heap_caps_malloc(sizeof(kEmpty), MALLOC_CAP_SPIRAM));
+    if (b) { std::memcpy(b, kEmpty, sizeof(kEmpty)); *len = sizeof(kEmpty) - 1; }
+    return b;
+}
+
+void esp_zb_netmap_set_listener(NetmapListener) {}
+
+#endif  // CONFIG_ZHAC_ESP_ZIGBEE

@@ -17,6 +17,7 @@ const char* esp_zb_netmap_start(void);
 char* esp_zb_netmap_get_json(size_t* len);
 
 // Called from the scan task with "net.map.progress" / "net.map.done" and the
-// event's data as JSON. One listener; nullptr removes it.
+// event's data as JSON. One listener; nullptr removes it. `data` points at a
+// buffer valid only during the call: copy it if it must outlive the call.
 typedef void (*NetmapListener)(const char* event, const char* data, size_t len);
 void esp_zb_netmap_set_listener(NetmapListener fn);
