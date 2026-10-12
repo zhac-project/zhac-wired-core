@@ -31,6 +31,7 @@
 #include "device_backend.h"
 #include "zap_clock.h"
 #include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
+#include "esp_zb_netmap.h"
 #include "sys_diag.h"
 #include "dgm_store.h"
 #include "zigbee_pool.h"
@@ -147,6 +148,43 @@ static void cmd_diag_tasks(int fd, uint32_t id) {
     if (len == 0 || len >= CAP) { heap_caps_free(buf); send_err(fd, id, "too large"); return; }
     ws_server_reply(fd, buf, len);
     heap_caps_free(buf);
+}
+
+// ── net.map.* ─────────────────────────────────────
+// Network map (spec 2026-10-12 §4): start a scan; read the scan state and the
+// last map. The map can be ~15 KB, so get's reply is sized to it, no fixed cap.
+static void cmd_net_map_scan(int fd, uint32_t id) {
+    if (const char* err = esp_zb_netmap_start()) { send_err(fd, id, err); return; }
+    char buf[80];
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"started\":true}}", id);
+    ws_server_reply(fd, buf, n);
+}
+
+static void cmd_net_map_get(int fd, uint32_t id) {
+    size_t n = 0;
+    char* data = esp_zb_netmap_get_json(&n);
+    if (!data) { send_err(fd, id, "oom"); return; }
+    const size_t cap = n + 48;
+    char* env = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+    if (!env) { heap_caps_free(data); send_err(fd, id, "oom"); return; }
+    const int h = snprintf(env, cap, "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":", id);
+    std::memcpy(env + h, data, n);
+    env[h + n] = '}';
+    ws_server_reply(fd, env, h + n + 1);
+    heap_caps_free(env);
+    heap_caps_free(data);
+}
+
+// Map events reach local browsers only: push_event() would also feed the cloud
+// relay, and v1 keeps the map off the cloud (spec §4.3). Runs on the scan task.
+static void on_netmap_event(const char* event, const char* data, size_t len) {
+    if (ws_server_client_count() == 0) return;
+    const size_t cap = len + std::strlen(event) + 32;   // {"event":"","data":} + NUL
+    char* env = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!env) return;
+    const size_t n = ws_event_envelope_build(env, cap, event, data, len);
+    if (n) ws_server_broadcast(env, n);
+    heap_caps_free(env);
 }
 
 static void cmd_status(int fd, uint32_t id) {
@@ -1191,6 +1229,8 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "status")             == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "status.get")         == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "diag.tasks")         == 0) { cmd_diag_tasks(fd, id); return; }
+    if (std::strcmp(cmd, "net.map.scan")       == 0) { cmd_net_map_scan(fd, id); return; }
+    if (std::strcmp(cmd, "net.map.get")        == 0) { cmd_net_map_get(fd, id);  return; }
     if (std::strcmp(cmd, "time.set")           == 0) { cmd_time_set(fd, id, doc); return; }
     if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id);              return; }
     if (std::strcmp(cmd, "device.get")         == 0) { cmd_device_get(fd, id, doc);          return; }
@@ -1367,6 +1407,7 @@ void ws_bridge_install() {
     event_bus_subscribe(EventType::DEVICE_JOIN, on_device_join);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
     event_bus_subscribe(EventType::RULE_CHANGED, on_rule_changed);
+    esp_zb_netmap_set_listener(on_netmap_event);
     ESP_LOGI(TAG, "WS rx (ping / status / device.{list,get,rename,delete,"
                    "attr.set,bind,reinterview,configure}) + "
                    "push (zcl_attr / device_join / device_leave) wired");
