@@ -57,13 +57,14 @@ void on_traffic(const Event&) { s_flash_until_ms = now_ms() + kFlashMs; }
 }  // namespace
 
 void status_led_start(void) {
-    led_strip_config_t sc = {
-        .strip_gpio_num         = CONFIG_ZHAC_STATUS_LED_GPIO,
-        .max_leds               = 1,
-        .led_model              = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags                  = { .invert_out = false },
-    };
+    // Zero-filled, then set: led_strip 3.1 added `timings` (custom models
+    // only), and a designated initializer that skips a member fails
+    // -Werror=missing-field-initializers on one version or the other.
+    led_strip_config_t sc = {};
+    sc.strip_gpio_num         = CONFIG_ZHAC_STATUS_LED_GPIO;
+    sc.max_leds               = 1;
+    sc.led_model              = LED_MODEL_WS2812;
+    sc.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
     led_strip_rmt_config_t rc = {
         .clk_src       = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = 10 * 1000 * 1000,   // 100 ns ticks: WS2812 timing
