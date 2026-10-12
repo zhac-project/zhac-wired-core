@@ -985,6 +985,10 @@ static bool zb_network_ready() {
     return pan != 0x0000 && pan != 0xffff;
 }
 
+bool esp_zigbee_backend_network_up(void) {
+    return s_running && zb_network_ready();
+}
+
 static bool zb_start_discovery(uint8_t duration_s) {
     if (!s_running) {
         ESP_LOGW(TAG, "permit_join refused: stack not running");

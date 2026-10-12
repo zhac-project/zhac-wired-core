@@ -24,6 +24,7 @@
 # Gating on IDF_TARGET is fine -- that IS available early (see tg_gw_stub).
 idf_component_register(
     SRCS "esp_zigbee_backend.cpp" "esp_zb_interview.cpp" "esp_zb_configure.cpp" "esp_zb_groups.cpp"
+         "esp_zb_netmap.cpp" "esp_zb_netmap_walk.cpp" "esp_zb_netmap_json.cpp"
     INCLUDE_DIRS "include"
     REQUIRES
         espressif__esp-zigbee-lib
@@ -34,6 +35,7 @@ idf_component_register(
         zigbee_mgr        # the local override: device pool + diagnostics
         event_bus
         device_shadow
+        arduinojson       # the network map's JSON (esp_zb_netmap_json)
         nvs_flash
         esp_timer
         freertos

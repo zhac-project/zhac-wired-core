@@ -28,6 +28,9 @@ bool esp_zigbee_backend_register(void);
 //   "radio_init_failed" the stack reported an error while starting
 const char* esp_zigbee_backend_last_error(void);
 
+// True once the stack runs and holds a network (formed, or restored at boot).
+bool esp_zigbee_backend_network_up(void);
+
 // Wall-clock seconds for ZapDevice::last_seen, which the web UI reads as Unix
 // time (the dual-chip build's zigbee_mgr does the same). 0 until SNTP has set
 // the clock, i.e. before 2020-01-01; callers keep the previous value then, and
