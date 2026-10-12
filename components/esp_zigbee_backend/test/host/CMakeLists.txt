@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Host tests for esp_zigbee_backend's pure ZCL frame builders and LQI mapping.
+# Host tests for esp_zigbee_backend's pure ZCL frame builders, LQI mapping and network map walk.
 #
 # Deliberately depends on nothing but the header under test -- no ESP-IDF, no
 # FreeRTOS, no radio. That is the point: the byte layouts can be verified on
@@ -27,3 +27,6 @@ add_test(NAME zcl_frame COMMAND zcl_frame_tests)
 
 add_executable(lqi_tests test_lqi.cpp)
 add_test(NAME lqi COMMAND lqi_tests)
+
+add_executable(netmap_tests test_netmap.cpp ../../esp_zb_netmap_walk.cpp)
+add_test(NAME netmap COMMAND netmap_tests)
