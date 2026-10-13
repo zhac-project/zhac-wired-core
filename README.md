@@ -108,7 +108,8 @@ describes that other board and does not apply here.
 ### Check your P4's silicon revision before flashing
 
 ESP32-P4 silicon comes in two families that cannot run each other's binaries: v0.x–v1.x
-and v3.x. This firmware is built for **v0.x–v1.x**. Check yours:
+and v3.x. Each release carries both: `-p4-rev1x-` and `-p4-rev3x-` files. The browser
+flasher and the hub's Firmware page pick the right one themselves; with esptool, check yours:
 
 ```sh
 esptool --port /dev/ttyACM0 flash-id      # esptool v4: esptool.py --port /dev/ttyACM0 flash_id
@@ -120,10 +121,12 @@ The chip line shows the revision:
 Chip type:          ESP32-P4 (revision v1.3)
 ```
 
-- **v0.x or v1.x** — go ahead.
-- **v3.x** — this build will not boot on your board, and the failure only shows up at
-  flash time. [Send a board report](https://github.com/zhac-project/zhac-platform/issues/new?template=board-report.yml)
-  so a v3.x build can be added.
+- **v0.x or v1.x** — the `-p4-rev1x-` files.
+- **v3.x** — the `-p4-rev3x-` files (hub and C6 radio installer). Built from the same
+  sources with `sdkconfig.defaults.p4rev3x` on top (`tools/build-p4-rev3x.sh`); runs a
+  Waveshare v3.2 board as a live hub since 2026-10-13.
+
+The wrong family does not boot, and the failure only shows up at flash time.
 
 #### How the build pins the revision
 
@@ -131,8 +134,8 @@ One Kconfig picks which family a binary targets:
 
 | `CONFIG_ESP32P4_SELECTS_REV_LESS_V3` | rev choices | `REV_MAX_FULL` |
 |---|---|---|
-| `y` ← **this repo**, matching `zhac-main-core` | v0.0 / v0.1 / v1.0 | 199 |
-| `n` (IDF default) | v3.0 / v3.1 | 399 |
+| `y` ← **the `rev1x` images**, matching `zhac-main-core` | v0.0 / v0.1 / v1.0 | 199 |
+| `n` (IDF default) ← **the `rev3x` images**, min v3.1, 400 MHz | v3.0 / v3.1 | 399 |
 
 The chip config here is taken wholesale from `zhac-main-core` — the one validated on ZHAC
 P4 hardware — and all eight settings resolve identically: revision family,
@@ -161,7 +164,7 @@ before the hub can use it.
 **Fresh Guition M3-DEV — two steps:**
 
 1. **Install the Zigbee radio (one time).** Flash
-   `zhac-c6-rcp-installer-p4-rev1x-<version>.bin` at `0x0` (or use the **1. Install the
+   `zhac-c6-rcp-installer-p4-rev1x-<version>.bin` (`-rev3x-` on v3.x silicon) at `0x0` (or use the **1. Install the
    Zigbee radio** button on the
    [browser flasher](https://zhac.org/flash/)). This is a one-off
    ESP32-P4 app: over the SDIO pins the P4 and C6 already share, it talks to the C6's
@@ -175,7 +178,7 @@ before the hub can use it.
    **This is one-way:** afterwards the C6 no longer runs ESP-Hosted, so this tool cannot
    be used again to update the radio later — see "Advanced" below. Running it again on an
    already-installed C6 is safe: it detects spinel and writes nothing.
-2. **Install the hub.** Flash the normal `zhac-wired-p4-rev1x-<version>.bin` image, as in
+2. **Install the hub.** Flash the normal `zhac-wired-p4-rev1x-<version>.bin` image (`-rev3x-` on v3.x), as in
    [Build from source](#build-from-source) / the browser flasher's **2. Install the hub**
    button.
 

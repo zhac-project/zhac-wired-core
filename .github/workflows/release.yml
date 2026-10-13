@@ -9,8 +9,9 @@
 # as build.yml does, so the tag alone rebuilds the same inputs; the manifest
 # and a sources list ship next to the image.
 #
-# Two app images: the ESP32-S31 (IDF v6.1, the ready-made board we recommend)
-# and the ESP32-P4 (IDF v6.0), plus the C6 radio image for the P4 boards.
+# App images: the ESP32-S31 (IDF v6.1, the ready-made board we recommend)
+# and the ESP32-P4 (IDF v6.0) for each silicon family (v0.x-v1.x and v3.x),
+# plus the C6 radio image and installer for the P4 boards.
 name: release
 on:
   push:
@@ -158,6 +159,23 @@ jobs:
           path: zhac-wired-core/tools/c6-rcp-installer
           command: idf.py build && idf.py merge-bin -o c6-rcp-installer-merged.bin
 
+      # The hub and the installer again for ESP32-P4 silicon v3.x: the two P4
+      # families cannot run each other's binaries. Same sources, plus
+      # sdkconfig.defaults.p4rev3x; the script also checks the resolved family.
+      # After the installer step above: it embeds the ot_rcp app built there.
+      - name: Build the ESP32-P4 silicon v3.x images (hub + C6 radio installer)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32p4
+          path: zhac-wired-core
+          command: tools/build-p4-rev3x.sh
+      - name: The v3.x image carries the web UI too
+        run: |
+          size=$(stat -c %s zhac-wired-core/build.p4rev3x/spa.pack)
+          test "$size" -gt 65536 || { echo "FAIL: build.p4rev3x/spa.pack is only $size bytes" >&2; exit 1; }
+          echo "OK: build.p4rev3x/spa.pack $size bytes"
+
       - name: Resolved chip config matches main-core
         working-directory: zhac-wired-core
         run: ./tools/check_resolved_config.sh
@@ -171,8 +189,12 @@ jobs:
           # The parts, so the flash page writes only their regions: NVS (devices, rules,
           # password, settings) lives between the partition table and otadata, and a
           # merged image pads that gap with 0xFF -- writing it at 0x0 wipes NVS.
-          for sku in s31 p4-rev1x; do
-            b=zhac-wired-core/build; [ "$sku" = s31 ] && b=zhac-wired-core/build.s31
+          for sku in s31 p4-rev1x p4-rev3x; do
+            case $sku in
+              s31)      b=zhac-wired-core/build.s31 ;;
+              p4-rev1x) b=zhac-wired-core/build ;;
+              p4-rev3x) b=zhac-wired-core/build.p4rev3x ;;
+            esac
             cp "$b/bootloader/bootloader.bin"           "zhac-wired-${sku}-${GITHUB_REF_NAME}-bootloader.bin"
             cp "$b/partition_table/partition-table.bin" "zhac-wired-${sku}-${GITHUB_REF_NAME}-partition-table.bin"
             cp "$b/ota_data_initial.bin"                "zhac-wired-${sku}-${GITHUB_REF_NAME}-otadata.bin"
@@ -181,6 +203,8 @@ jobs:
           # App partition only: what the OTA page downloads. The merged image
           # above would overwrite the bootloader and partition table.
           cp zhac-wired-core/build/zhac-wired-core.bin "zhac-wired-p4-rev1x-${GITHUB_REF_NAME}-ota.bin"
+          cp zhac-wired-core/build.p4rev3x/zhac-wired-p4-rev3x.bin "zhac-wired-p4-rev3x-${GITHUB_REF_NAME}.bin"
+          cp zhac-wired-core/build.p4rev3x/zhac-wired-core.bin "zhac-wired-p4-rev3x-${GITHUB_REF_NAME}-ota.bin"
           cp zhac-wired-core/build.rcp/zhac-rcp-c6.bin "zhac-rcp-c6-${GITHUB_REF_NAME}.bin"
           # C6 radio installer: merged image (flash at 0x0, wipes NVS) and the
           # app-only image (flash at 0x20000 / ota_0, keeps NVS -- see its own README).
@@ -192,6 +216,10 @@ jobs:
             "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin"
           cp zhac-wired-core/tools/c6-rcp-installer/build/c6_rcp_installer.bin \
             "zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}-app.bin"
+          cp zhac-wired-core/tools/c6-rcp-installer/build.rev3x/c6-rcp-installer-merged.bin \
+            "zhac-c6-rcp-installer-p4-rev3x-${GITHUB_REF_NAME}.bin"
+          cp zhac-wired-core/tools/c6-rcp-installer/build.rev3x/c6_rcp_installer.bin \
+            "zhac-c6-rcp-installer-p4-rev3x-${GITHUB_REF_NAME}-app.bin"
           # What the image was built from: this repo's commit, the IDF, and
           # every sibling's commit. Enough to rebuild it without this runner.
           cp zhac-wired-core/release-manifest.json "release-manifest-${GITHUB_REF_NAME}.json"
@@ -236,14 +264,18 @@ jobs:
           esptool --chip esp32p4 --port /dev/ttyACM0 write-flash 0x0 ${img}
           \`\`\`
 
-          This image targets ESP32-P4 silicon **v0.x–v1.x**. Check yours first with
-          \`esptool --port <PORT> flash-id\`; a v3.x chip will not boot it.
+          ESP32-P4 silicon comes in two families that cannot run each other's images.
+          Check yours with \`esptool --port <PORT> flash-id\` (the browser flasher picks
+          the right one by itself):
+          - **v0.x–v1.x**: the \`-p4-rev1x-\` files, as above.
+          - **v3.x**: the \`-p4-rev3x-\` files, \`zhac-wired-p4-rev3x-${GITHUB_REF_NAME}.bin\`
+            and \`zhac-c6-rcp-installer-p4-rev3x-${GITHUB_REF_NAME}.bin\`.
 
           Then plug in Ethernet and open http://zhac.local.
 
           The ESP32-C6 on the module is the Zigbee radio. On a fresh board it needs
           \`ot_rcp\` installed **once** first: flash
-          \`zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin\` at offset 0 (or the
+          \`zhac-c6-rcp-installer-p4-rev1x-${GITHUB_REF_NAME}.bin\` (\`-rev3x-\` on v3.x) at offset 0 (or the
           browser flasher's "1. Install the Zigbee radio" button), wait ~30 s, then flash
           the hub image above. Detail, and the JP1-wire fallback:
           https://github.com/zhac-project/zhac-wired-core#zigbee-radio-esp32-c6
@@ -273,8 +305,10 @@ jobs:
           files: |
             zhac-wired-s31-*.bin
             zhac-wired-p4-rev1x-*.bin
+            zhac-wired-p4-rev3x-*.bin
             zhac-rcp-c6-*.bin
             zhac-c6-rcp-installer-p4-rev1x-*.bin
+            zhac-c6-rcp-installer-p4-rev3x-*.bin
             SHA256SUMS
             release-manifest-*.json
             sources-*.txt

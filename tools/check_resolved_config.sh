@@ -21,9 +21,12 @@
 #
 # Expected values are taken from zhac-main-core, the config validated on ZHAC
 # P4 hardware. Run after configuring:  ./tools/check_resolved_config.sh
+# The P4 silicon v3.x build (sdkconfig.defaults.p4rev3x) passes its family:
+#   ./tools/check_resolved_config.sh build.p4rev3x/sdkconfig rev3x
 set -e
 
 SDKCONFIG="${1:-sdkconfig}"
+P4_FAMILY="${2:-rev1x}"
 if [ ! -f "$SDKCONFIG" ]; then
     echo "FAIL: $SDKCONFIG not found -- run idf.py reconfigure first" >&2
     exit 1
@@ -76,12 +79,21 @@ fi
 # ----------------------------------------------------------------- esp32p4 --
 # Silicon family. The pair must agree: the gate opens the v0/v1 choices, and
 # REV_MIN_0 selects the lowest. Either alone is wrong.
-expect CONFIG_ESP32P4_SELECTS_REV_LESS_V3 y \
-    "P4 has two incompatible revision families; this picks v0.x-v1.x, matching main-core and the v1.3 bench rig. A binary for one family will not boot on the other."
-expect CONFIG_ESP32P4_REV_MIN_FULL 0 \
-    "Silently becomes 301 if the LESS_V3 gate is off. That is the failure this script exists to catch."
-expect CONFIG_ESP32P4_REV_MAX_FULL 199 \
-    "Follows the family gate; 399 means the v3.x family got selected."
+if [ "$P4_FAMILY" = rev3x ]; then
+    expect CONFIG_ESP32P4_SELECTS_REV_LESS_V3 "" \
+        "The v3.x image needs the v0.x-v1.x gate OFF; sdkconfig.defaults.p4rev3x must load after sdkconfig.defaults.esp32p4."
+    expect CONFIG_ESP32P4_REV_MIN_FULL 301 "The v3.x family's lowest supported revision."
+    expect CONFIG_ESP32P4_REV_MAX_FULL 399 "Follows the family gate; 199 means the v1.x family got selected."
+    expect CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 400 "v3.x runs 400 MHz (sdkconfig.defaults.p4rev3x)."
+else
+    expect CONFIG_ESP32P4_SELECTS_REV_LESS_V3 y \
+        "P4 has two incompatible revision families; this picks v0.x-v1.x, matching main-core and the v1.3 bench rig. A binary for one family will not boot on the other."
+    expect CONFIG_ESP32P4_REV_MIN_FULL 0 \
+        "Silently becomes 301 if the LESS_V3 gate is off. That is the failure this script exists to catch."
+    expect CONFIG_ESP32P4_REV_MAX_FULL 199 \
+        "Follows the family gate; 399 means the v3.x family got selected."
+    expect CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 360        "IDF default is 400; main-core runs 360."
+fi
 
 # PSRAM. 32 MB on this part needs HEX mode; a wrong mode under-reports or
 # fails detection, and the firmware requires PSRAM to run at all.
@@ -91,7 +103,6 @@ expect CONFIG_SPIRAM_SPEED 200    "Matches main-core."
 
 # Clock and flash: main-core's validated values, not the IDF defaults
 # (400 MHz / DIO / 80 MHz) this project would otherwise land on.
-expect CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 360        "IDF default is 400; main-core runs 360."
 expect CONFIG_ESPTOOLPY_FLASHFREQ '"40m"'         "IDF default is 80m; main-core uses 40m."
 expect CONFIG_ESPTOOLPY_FLASHSIZE '"16MB"'        "Board has 16 MB."
 
