@@ -330,7 +330,7 @@ static esp_err_t handle_device_state(httpd_req_t* req) {
 // ── POST /api/device/options ─────────────────────────────────────────────
 //
 // Body: {"ieee":"0x..","occupancy_timeout"?,"debounce_ms"?,
-//        "flood_protection"?,"throttle_ms"?}. Per-device runtime options;
+//        "flood_protection"?,"throttle_ms"?,"no_occupancy_since"?}. Per-device runtime options;
 // applied to device_shadow directly (single chip — no DEVICE_OPTIONS_SET HAP
 // hop) and persisted to NVS so they survive reboot.
 static esp_err_t handle_device_options(httpd_req_t* req) {

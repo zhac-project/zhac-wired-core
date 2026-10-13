@@ -59,6 +59,13 @@ static bool apply_opts(uint64_t ieee, const JsonDocument& doc) {
         ok = device_shadow_set_throttle_ms(
                  ieee, (uint32_t)doc["throttle_ms"].as<int>()) && ok;
     }
+    if (doc["no_occupancy_since"].is<int>()) {
+        // Seconds of quiet after "no motion", 0 = off. Lives only here: the
+        // shadow keeps it in RAM, so this store is what survives a reboot.
+        const int s = doc["no_occupancy_since"].as<int>();
+        ok = s >= 0 && s <= 65535 &&
+             device_shadow_set_no_occupancy_since(ieee, static_cast<uint16_t>(s)) && ok;
+    }
     return ok;
 }
 
@@ -75,7 +82,18 @@ bool device_options_set(uint64_t ieee, const char* json, size_t len) {
         char key[16];
         key_for(ieee, key);
         char blob[192];
-        const size_t n = serializeJson(doc, blob, sizeof(blob));
+        // Merge into what is stored: the web UI sends one option per call,
+        // and the stored object is what device_options_restore_all() applies
+        // at boot -- replacing it would forget every other option.
+        JsonDocument stored;
+        size_t sz = sizeof(blob);
+        if (nvs_get_str(h, key, blob, &sz) != ESP_OK ||
+            deserializeJson(stored, blob, sz) || !stored.is<JsonObject>()) {
+            stored.to<JsonObject>();
+        }
+        for (JsonPairConst kv : doc.as<JsonObjectConst>()) stored[kv.key()] = kv.value();
+        stored.remove("ieee");   // the NVS key names the device
+        const size_t n = serializeJson(stored, blob, sizeof(blob));
         if (n > 0 && n < sizeof(blob)) {
             if (nvs_set_str(h, key, blob) != ESP_OK || nvs_commit(h) != ESP_OK) {
                 ESP_LOGW(TAG, "persist failed for %s", key);

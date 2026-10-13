@@ -619,6 +619,9 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
         D["occupancy_timeout"]         = device_shadow_occupancy_effective(cfg, occ_def);
         D["occupancy_timeout_default"] = occ_def;
     }
+    // "No motion since" (z2m option no_occupancy_since), any motion sensor;
+    // 0 = off. The web UI shows it for devices that report occupancy.
+    D["no_occupancy_since"] = device_shadow_get_no_occupancy_since(ieee_cp);
 
     char exposes_json[2048];
     size_t exp_n = zhac_adapter_build_exposes_json(
@@ -713,7 +716,8 @@ static void cmd_device_attr_set(int fd, uint32_t id, JsonDocument& doc) {
 // ── device.options.set ────────────────────────────────────────────────
 //
 // args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?,
-// throttle_ms?}. Applied directly to device_shadow + persisted to NVS.
+// throttle_ms?, no_occupancy_since?}. Applied directly to device_shadow +
+// merged into the device's stored options (NVS).
 // Mirrors net-core's `api_device_options_set` minus the HAP hop.
 static void cmd_device_options_set(int fd, uint32_t id, JsonDocument& doc) {
     const char* ieee_s = doc["args"]["ieee"] | (const char*)nullptr;

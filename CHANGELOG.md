@@ -13,6 +13,8 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **"No motion since" for every motion sensor** (zhac-components `device_shadow`, z2m option `no_occupancy_since` with one interval): `device.options.set {no_occupancy_since: N}` (0 = off, 0–65535 s). After a sensor reports no motion (its own report, or the hub's "no motion interval"), the hub publishes the device value `no_occupancy_since = N` once N seconds pass without motion, and `0` on the next motion, so a rule such as `ON hall#no_occupancy_since=300 DO light#state=0` fires once per quiet period, also for a sensor whose own hold tops out at 30–120 s (HOBEIAN ZG-204Z). `device.get` carries `no_occupancy_since`. Kept in the device options store and re-applied at boot; counting starts again at the next motion change after a restart. **Web UI** (www-spa): Device → Options "No motion since (s)".
+
 - **Zigbee network map.** `net.map.scan` asks every router for its neighbour table (Mgmt_Lqi_req, 5 s and one retry per page, one router at a time) and `net.map.get` returns the last map (nodes, links with LQI and relationship, devices not seen). Manual only, nothing stored in flash; progress goes to the hub page only, not to the cloud. Needs www-spa with the Map tab.
 
 - **Test builds as pre-releases** (`.github/workflows/release.yml`): a tag with a suffix, like `v2026100301-rc1`, is published as a GitHub pre-release with a "Test build, not a release" note, never marked latest. The hub's Firmware page lists it with a "pre-release" label; the browser flasher keeps offering the last real release.
@@ -54,6 +56,10 @@ contents become the release-tag annotation at `just release`.
 - **Weekly schedule for Saswell SEA801/SEA802 radiator valves** (and their white labels): the device page's States tab shows a Monday-to-Sunday editor, four periods a day (start time + °C), with "Copy Monday to Tue–Fri" and one Save for the changed days. The valve reports each day and takes a day per write (embedded-zhc codec; www-spa editor, pinned in `release-manifest.json`). Home Assistant gets the seven days as editable text entities. The valve runs the program on the clock the hub sends it, so set the hub's timezone.
 
 ### Fixed
+
+- **Saving one device option no longer forgets the others** (`main/device_options.cpp`): the web UI saves one option per call, and the store kept only the last call's JSON, so after a reboot only the last-saved option was re-applied from it (the shadow's own flash copy hid this for the older options). The call is now merged into the stored options.
+
+- **HOBEIAN ZG-204Z keep_time / sensitivity can be set** (embedded-zhc): written as UINT8 like zigbee2mqtt (was ENUM8, which the sensor refused), with a picker of 30/60/120 s and low/medium/high instead of a text box; the same for the Fantem ZB003-X. A written text value such as keep_time "60" now shows at once (zhac-components `device_cmd`), since a battery PIR never reports it by itself. The sensor sleeps: the hub sends the write again as soon as it next wakes, so wave at it after pressing Set.
 
 - **The hub page's Firmware (OTA) tab can list and install releases.** Two faults, both there since the page first offered releases (2026-09-20), so no S31 or P4 hub could update itself from GitHub:
   - The version list said "Could not reach GitHub from this browser (Failed to fetch)": the page's Content-Security-Policy (`main/spa_serve.cpp`) only let it connect to the hub, so the browser refused `https://api.github.com`. It is now allowed.
