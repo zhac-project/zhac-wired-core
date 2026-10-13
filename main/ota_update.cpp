@@ -133,6 +133,9 @@ void run(const char* url) {
     http.crt_bundle_attach = esp_crt_bundle_attach;   // verify the server
     http.keep_alive_enable = true;
     http.max_redirection_count = 5;                   // GitHub release assets redirect
+    // ...to a signed URL of ~950 chars; the request line must fit the TX buffer
+    // (default 512, "Out of buffer").
+    http.buffer_size_tx = 2048;
     esp_https_ota_config_t cfg{};
     cfg.http_config = &http;
 

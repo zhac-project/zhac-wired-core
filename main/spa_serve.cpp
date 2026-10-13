@@ -30,8 +30,9 @@ static uint32_t s_count = 0;
 
 // The CSP the web UI's README asks the firmware to send (a <meta> CSP cannot
 // cover the WebSocket). 'unsafe-inline' styles: CodeMirror injects them.
+// api.github.com: the OTA page lists the published releases from the browser.
 static constexpr char kCsp[] =
-    "default-src 'self'; connect-src 'self' ws: wss:; script-src 'self'; "
+    "default-src 'self'; connect-src 'self' ws: wss: https://api.github.com; script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; "
     "frame-ancestors 'none'";
 
