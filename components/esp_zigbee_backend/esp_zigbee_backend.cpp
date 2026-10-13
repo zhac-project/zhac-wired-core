@@ -597,6 +597,48 @@ static bool esp_zb_adapter_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t clus
     return esp_zb_af_send(nwk_addr, dst_ep, cluster_id, f, zcl_len);
 }
 
+// ── Coordinator address pin ──────────────────────────────────────────────
+//
+// Joined devices know the coordinator by its IEEE address: it is the trust
+// centre address, and their report bindings point at it. The stack takes it
+// from the radio's MAC, so the same network moved to another board (S31 ->
+// P4), or a P4 board with a replaced C6, would come up under a new address
+// and the devices' reports would go nowhere. The address the network first
+// ran with is therefore kept in NVS and set again before every start.
+static constexpr char kPinNs[]  = "zb_coord";
+static constexpr char kPinKey[] = "ieee";
+
+static void coordinator_address_apply() {
+    uint64_t pinned = 0;
+    nvs_handle_t h;
+    if (nvs_open(kPinNs, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u64(h, kPinKey, &pinned) != ESP_OK) pinned = 0;
+        nvs_close(h);
+    }
+    if (pinned) {
+        ezb_extaddr_t a{};
+        a.u64 = pinned;
+        ezb_nwk_set_extended_address(&a);
+    }
+    ezb_extaddr_t cur{};
+    ezb_nwk_get_extended_address(&cur);
+    ESP_LOGI(TAG, "coordinator ieee %016llx (%s)", (unsigned long long)cur.u64,
+             pinned ? "pinned" : "radio MAC");
+}
+
+// Once a network runs (formed or resumed): pin its address if none is yet.
+static void coordinator_address_remember() {
+    nvs_handle_t h;
+    if (nvs_open(kPinNs, NVS_READWRITE, &h) != ESP_OK) return;
+    uint64_t v = 0;
+    if (nvs_get_u64(h, kPinKey, &v) != ESP_OK) {
+        ezb_extaddr_t cur{};
+        ezb_nwk_get_extended_address(&cur);
+        if (nvs_set_u64(h, kPinKey, cur.u64) == ESP_OK) nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
 // ── Stack lifecycle signals ──────────────────────────────────────────────
 //
 // This handler is not optional decoration -- it DRIVES commissioning.
@@ -627,6 +669,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         // Dataset already held a network and the stack came back up on it.
         // No formation needed; joined devices keep their addresses.
         s_formed = true;
+        coordinator_address_remember();
         ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
                  (unsigned)ezb_nwk_get_current_channel());
@@ -634,6 +677,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
 
     case EZB_BDB_SIGNAL_FORMATION:
         s_formed = true;
+        coordinator_address_remember();
         spawn_group_join_task();   // first formation of this network
         ESP_LOGI(TAG, "network formed: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
@@ -854,6 +898,7 @@ static bool zb_init() {
     }
     zhac_adapter_register_send(esp_zb_adapter_send);
     zhac_adapter_register_sleepy(esp_zb_is_sleepy);
+    coordinator_address_apply();
     register_coordinator_endpoint();
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
 
