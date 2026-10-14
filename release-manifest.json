@@ -6,9 +6,9 @@
   },
   "siblings": {
     "zhac-components": "41e899ab639fcd13644e3282194fdfa4668701b8",
-    "zhac-net-core": "f2d7fd90ba6e0f717a9ebee0aa81680a5a85b58e",
+    "zhac-net-core": "ef9309a00b910f31aed98081437c6f7d12d29235",
     "embedded-zhc": "873af726618d91f6613046eccba58345661fbff2",
-    "zhac-main-core": "77f8e53586f9e525fcd0046bca78f6e2d4e1916f",
+    "zhac-main-core": "2e1a2f382ac3ced3a46556b866b323cd02999f49",
     "www-spa": "1d737f3e1e1c2d5f661bed4bdef062686239377f",
     "zhac-docs": "3ba15cb9ec9203af5187d851facfbf663433a1b0"
   }
