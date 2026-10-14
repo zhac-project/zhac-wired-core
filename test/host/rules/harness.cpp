@@ -10,8 +10,12 @@
 #include "event_bus.h"   // RULE_CHANGE_* (zhac-components)
 #include "expect.h"   // TXT_CYR and FP_CYR (its sha256sum), TXT_PLAIN and FP_PLAIN: written by run.sh
 
+#include <atomic>
+#include <chrono>
+#include <mutex>
 #include <openssl/sha.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 // wrappers around the static originals (slice_tu.cpp)
@@ -45,7 +49,13 @@ void* heap_caps_malloc(size_t size, uint32_t) {
 void heap_caps_free(void* p) { free(p); }
 
 static std::vector<std::string> g_replies;
-void ws_server_reply(int, const char* buf, size_t len) { g_replies.emplace_back(buf, len); }
+static std::vector<int> g_reply_fds;
+static std::mutex g_reply_mtx;   // two editors reply from two threads in test_concurrent_base
+void ws_server_reply(int fd, const char* buf, size_t len) {
+    std::lock_guard<std::mutex> l(g_reply_mtx);
+    g_replies.emplace_back(buf, len);
+    g_reply_fds.push_back(fd);
+}
 
 static std::vector<RuleSlot> g_store;   // in the order the NVS iteration would give them: arbitrary
 uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
@@ -56,10 +66,17 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     }
     return n;
 }
+// test_concurrent_base: the first editor reads the stored text, then waits here (up to 200 ms) for the
+// second editor to finish -- the window between a compare and its write.
+static std::atomic<int>  g_park_next_load{0};
+static std::atomic<bool> g_second_done{false};
 bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
+    bool found = false;
     for (const RuleSlot& s : g_store)
-        if (s.rule_id == rule_id) { *out = s; return true; }
-    return false;
+        if (s.rule_id == rule_id) { *out = s; found = true; break; }
+    if (g_park_next_load.exchange(0) == 1)
+        for (int i = 0; i < 40 && !g_second_done; i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return found;
 }
 
 static bool g_add_ok = true, g_upd_ok = true, g_check_ok = true;
@@ -673,9 +690,36 @@ static void test_rule_events() {
     CHECK(g_events.empty(), "no push without memory or without the rule (%zu)", g_events.size());
 }
 
+// review F22: two editors with the same base at the same time -- exactly one saves, the other gets
+// `changed`. The first is parked between reading the stored text and comparing it, for as long as the
+// second needs to finish (or 200 ms, when the lock makes the second wait for the first).
+static void test_concurrent_base() {
+    reset();
+    g_reply_fds.clear();
+    g_store.push_back(mk_rule(3, "porch", TXT_PLAIN));
+    JsonDocument qa = upd_req(3, "ON a#b=7 DO log first ENDON", FP_PLAIN);
+    JsonDocument qb = upd_req(3, "ON a#b=8 DO log second ENDON", FP_PLAIN);
+    g_second_done = false;
+    g_park_next_load = 1;
+    std::thread a([&] { h_rule_update(1, 11, qa); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));   // a is parked by now
+    std::thread b([&] { h_rule_update(2, 22, qb); g_second_done = true; });
+    a.join();
+    b.join();
+    int saved = 0, changed = 0;
+    for (const std::string& r : g_replies) {
+        if (r.find(R"("ok":true)") != std::string::npos) saved++;
+        if (r.find(R"("err":"changed")") != std::string::npos) changed++;
+    }
+    CHECK(saved == 1 && changed == 1 && g_upd.size() == 1,
+          "same base from two editors: %d saved, %d changed, %zu writes", saved, changed, g_upd.size());
+    g_replies.clear();
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // a mismatch is printed even if a later check crashes
     test_send_err();
+    test_concurrent_base();
     test_reply_ok_or_err();
     test_sha256_hex();
     test_rule_list_bare();

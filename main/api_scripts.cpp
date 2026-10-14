@@ -12,6 +12,7 @@
 //
 // Names are alphanum + `_-`, ≤24 chars; enforced by lua_script_cache.
 #include "auth.h"
+#include "edit_lock.h"
 #include "api_scripts.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -146,6 +147,7 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
         const bool existed = lua_script_cache_exists(name);
         char* src = read_body(req);
         if (!src) return ESP_FAIL;
+        EditLock lock(g_edit_mutex);   // as every script save (edit_lock.h)
         const bool ok = lua_script_cache_write(name, src);
         // size and fp of what is stored: the store keeps the text up to its first NUL
         if (ok) ws_push_script_saved(name, src, std::strlen(src), existed);
@@ -157,6 +159,7 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_DELETE) {
+        EditLock lock(g_edit_mutex);
         bool ok = lua_script_cache_delete(name);
         httpd_resp_set_type(req, "application/json");
         if (ok) {

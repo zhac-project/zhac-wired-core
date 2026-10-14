@@ -11,6 +11,10 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two editors saving the same rule or script at once: one wins, the other is told `changed`** (`main/edit_lock.h`, review F22): `rule.update` and `script.write` with a `base` fingerprint compared the stored text and wrote it in two steps, and a save from another task (hub page, REST, cloud relay) could land in between and be overwritten silently. Every rule and script save (WS, REST, relay) now takes one lock, and the compare and the write happen under it. Host check: `sh test/host/rules/run.sh` (two editors with one base; `MUTANT=no_lock` shows it failing without the lock).
+
 ### Added
 
 - **"Allow script changes from the cloud"** (spec 2026-10-05 §3.1): a hub setting, off by default, kept in NVS `sys_cfg/remote_scripts` (a storage reset turns it off), changed only by `settings.set {"remote_scripts": true|false}` from the hub's own page; the cloud relay answers that key `local_only`. While it is on, the relay passes `script.write`, `script.run`, `script.reload` and `system.restart`; while it is off it answers them `scripts_off`. `status` / `status.get` / `GET /api/status` report `remote_scripts`; a change pushes `hub.caps {caps, remote_scripts}`; `remote.auth` carries `"caps": ["rules.v1", "scripts.v1"]` and the switch (needs zhac-net-core `remote_client` with `remote_hello_extra`). The status buffer grew to 3,072 bytes. If the save to NVS fails, `settings.set` answers `bad settings` (REST 400) instead of OK: off still applies at once and is pushed in `hub.caps`, on applies only once it is saved.

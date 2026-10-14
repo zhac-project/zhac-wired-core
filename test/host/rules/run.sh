@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # Host check of the wired hub's rule ops: escaped error replies, paged rule.list, rule.create's id, rule.update's
-# base fingerprint, rule.check, and the rule.added / rule.updated pushes (spec 2026-10-05 §3.3, §3.4, §4.5).
+# base fingerprint (also two editors at once, review F22), rule.check, and the rule.added / rule.updated pushes (spec 2026-10-05 §3.3, §3.4, §4.5).
 #   sh run.sh                  build and run; exit code = number of mismatches (ASan/UBSan abort = non-zero too)
 #   MUTANT=<name> sh run.sh    same, after breaking ONE line in the work copy (never in the repo), to show the
 #                              harness can fail: splice_err no_escape_row no_escape_check no_sort cursor_lt
-#                              no_budget no_base no_clamp
+#                              no_budget no_base no_clamp no_lock
 #   WS_SRC=<file> sh run.sh    the same checks against another ws_bridge.cpp (a RED run: `git show <rev>:main/ws_bridge.cpp`)
 # The code under test is cut verbatim out of main/ws_bridge.cpp by sed (send_err, sha256_hex, reply_ok_or_err,
 # kRuleRowCap, rule_row_json, cmd_rule_list/create/update/check, on_rule_changed); JsonWriter, kRemotePageBudget,
@@ -72,6 +72,7 @@ case "${MUTANT:-}" in
     no_budget)        mutate ws_slice.inc 's/used + rn + 1 > kRemotePageBudget/used + rn + 1 > 1000000/' ;;
     no_base)          mutate ws_slice.inc 's/std::strcmp(fp, base) == 0;/true;/' ;;
     no_clamp)         mutate ws_slice.inc 's/cur->src_len <= sizeof(cur->src) ? cur->src_len : sizeof(cur->src)/cur->src_len/' ;;
+    no_lock)          mutate ws_slice.inc 's/^    EditLock lock(g_edit_mutex);.*$//' ;;
     *) echo "unknown MUTANT" >&2; exit 98 ;;
 esac
 

@@ -18,6 +18,7 @@
 // so SPA code that targets net-core sees identical wire formats.
 
 #include "ws_bridge.h"
+#include "edit_lock.h"
 #include "ws_server.h"
 #include "sys_state.h"
 #include "event_bus.h"
@@ -1086,6 +1087,7 @@ static void cmd_rule_list(int fd, uint32_t id, JsonDocument& doc) {
 // rule.create {name, dsl} -> data {"id": <new id>} (spec §3.3; it used to answer without the id, so the
 // cloud had to list the rules again to find it).
 static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
@@ -1099,13 +1101,12 @@ static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
 // rule.update {id, name, dsl, base?}. With `base` (spec §4.5, no silent overwrite): the stored text's
 // fingerprint must still be the one the editor opened, else `changed` and nothing is written.
 static void cmd_rule_update(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
     if (!rid || !dsl) { send_err(fd, id, "missing id/dsl"); return; }
     if (const char* base = doc["args"]["base"] | (const char*)nullptr) {
-        // ponytail: compare, then save, are two calls; a hub-page save landing in the microseconds between
-        // them is not caught. Move the compare under simple_rules' mutex if that ever matters.
         auto* cur = new (std::nothrow) RuleSlot{};
         char fp[65] = "";
         const bool same = cur && rule_store_load(rid, cur) &&
@@ -1141,6 +1142,7 @@ static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
     reply_ok_or_err(fd, id, ok, "rule not found");
 }
 static void cmd_rule_delete(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     if (!rid) { send_err(fd, id, "missing id"); return; }
     bool ok = simple_rules_delete(rid);
@@ -1259,6 +1261,7 @@ static void cmd_script_read(int fd, uint32_t id, JsonDocument& doc) {
 }
 
 static void cmd_script_delete(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     const char* name = doc["args"]["name"] | (const char*)nullptr;
     if (!name) { send_err(fd, id, "missing name"); return; }
     bool ok = lua_script_cache_delete(name);
@@ -1362,13 +1365,11 @@ static bool script_write_text(int fd, uint32_t id, const char* name, const char*
 // switch is on (scripts_off otherwise, remote_client). The staged text is used up only by a save: a wrong
 // name, base, size or fingerprint, a syntax error or a full store leave it for 30 s.
 static void cmd_script_write(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     JsonVariantConst a = doc["args"];
     const char* name = a["name"] | "";
     if (!remote_script_name_ok(name)) { send_err(fd, id, "bad_name"); return; }
     if (const char* base = a["base"] | (const char*)nullptr) {
-        // ponytail: compare, then save, are two calls (this check, then script_write_text after the copy, the
-        // hash and the syntax check); a hub-page save landing in between is overwritten without `changed`.
-        // Hold one lock across both if that ever matters (rule.update has the same note).
         const bool exists = lua_script_cache_exists(name);
         if (!base[0] && exists) { send_err(fd, id, "exists"); return; }
         if (base[0]) {

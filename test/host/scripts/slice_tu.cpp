@@ -7,6 +7,7 @@
 #include "stubs.h"
 #include "json_buf.h"    // the real JsonWriter (zhac-wired-core/main)
 #include "ws_bridge.h"   // the real header: ws_push_script_saved, ws_push
+#include "edit_lock.h"   // the real rule/script edit lock (zhac-wired-core/main)
 
 // ---- test doubles for the file's push plumbing (the real ones need the WebSocket server and the relay) ----
 bool g_listeners = true;
