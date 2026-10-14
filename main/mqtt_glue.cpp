@@ -166,6 +166,14 @@ void on_got_ip(void*, esp_event_base_t, int32_t, void*) {
     mqtt_gw_on_sta_up();   // starts the client ~5 s later if enabled + configured
 }
 
+// "<root>/#": commands, Home Assistant and MQTT-triggered rules. mqtt_gw keeps
+// one filter, drops the previous one and re-subscribes it on every reconnect.
+void subscribe_root() {
+    char sub[80];
+    snprintf(sub, sizeof(sub), "%s/#", mqtt_gw_get_root_topic());
+    mqtt_gw_subscribe(sub, 0);
+}
+
 }  // namespace
 
 void mqtt_glue_start() {
@@ -173,9 +181,7 @@ void mqtt_glue_start() {
     mqtt_gw_cfg_boot();   // shared with mono: NVS settings, root topic, client id, arm if enabled
 
     mqtt_gw_set_rx_callback(on_mqtt_rx);
-    char sub[48];
-    snprintf(sub, sizeof(sub), "%s/#", mqtt_gw_get_root_topic());
-    mqtt_gw_subscribe(sub, 0);
+    subscribe_root();
 
     ha_bridge_init(&kPlatform);
     event_bus_subscribe(EventType::ZCL_ATTR, on_attr);
@@ -198,7 +204,13 @@ void mqtt_glue_start() {
 }
 
 void mqtt_glue_apply_settings(JsonDocument& doc) {
+    char before[64];
+    snprintf(before, sizeof(before), "%s", mqtt_gw_get_root_topic());
     mqtt_gw_cfg_apply(doc);
+    // A new root must be listened to as well as published under: the old
+    // "<root>/#" stayed until reboot, so commands and MQTT rules on the new
+    // root never arrived (review F24).
+    if (strcmp(before, mqtt_gw_get_root_topic()) != 0) subscribe_root();
     if (doc["ha_discovery"].is<bool>() || doc["ha_prefix"].is<const char*>()) {
         const bool en = doc["ha_discovery"] | ha_bridge_enabled();
         ha_bridge_configure(en, doc["ha_prefix"] | ha_bridge_prefix());
