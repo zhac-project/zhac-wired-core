@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Host tests for esp_zigbee_backend's pure ZCL frame builders, LQI mapping and network map walk.
+# Host tests for esp_zigbee_backend's pure ZCL frame builders, LQI mapping, request matching, interview merge and network map walk.
 #
 # Deliberately depends on nothing but the header under test -- no ESP-IDF, no
 # FreeRTOS, no radio. That is the point: the byte layouts can be verified on
@@ -27,6 +27,14 @@ add_test(NAME zcl_frame COMMAND zcl_frame_tests)
 
 add_executable(lqi_tests test_lqi.cpp)
 add_test(NAME lqi COMMAND lqi_tests)
+
+add_executable(req_gen_tests test_req_gen.cpp)
+add_test(NAME req_gen COMMAND req_gen_tests)
+
+add_executable(interview_merge_tests test_interview_merge.cpp)
+target_include_directories(interview_merge_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components/components/zap_common/include)
+add_test(NAME interview_merge COMMAND interview_merge_tests)
 
 # ArduinoJson comes from the sibling zhac-components checkout (same as test/host/switch).
 add_executable(netmap_tests test_netmap.cpp ../../esp_zb_netmap_walk.cpp ../../esp_zb_netmap_json.cpp)

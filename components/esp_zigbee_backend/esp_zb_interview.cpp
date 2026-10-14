@@ -39,6 +39,8 @@
 #include "esp_zb_interview.h"
 #include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
 #include "esp_zb_lock.h"
+#include "esp_zb_interview_merge.h"
+#include "esp_zb_req_gen.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -74,6 +76,7 @@ struct JoinReq {
 
 QueueHandle_t     s_join_q   = nullptr;
 SemaphoreHandle_t s_step_sem = nullptr;
+ReqGen            s_step_gen;   // which request the slot belongs to (esp_zb_req_gen.h)
 
 // ── ZDO result slots ─────────────────────────────────────────────────────
 // Written by the stack's callback, read by the interview task after taking
@@ -136,22 +139,30 @@ void step_done(bool ok) {
     xSemaphoreGive(s_step_sem);
 }
 
+// Claim the slot for a new request: drop a stale post and start a new
+// generation. Call with the stack lock held (see esp_zb_req_gen.h).
+void* step_begin() {
+    xSemaphoreTake(s_step_sem, 0);
+    return s_step_gen.begin();
+}
+
 bool step_wait(uint32_t timeout_ms) {
     // Wait in slices so a newcomer's announce can cut a hopeless wait short.
     BaseType_t got = pdFALSE;
     for (uint32_t waited = 0; waited < timeout_ms && got != pdTRUE; waited += kSliceMs) {
         got = xSemaphoreTake(s_step_sem, pdMS_TO_TICKS(kSliceMs));
-        if (got != pdTRUE && s_preempt) return false;
+        if (got != pdTRUE && s_preempt) break;
     }
-    if (got != pdTRUE) {
-        return false;
-    }
-    return s_step_ok;
+    // Done with this request either way: a reply that turns up later must not
+    // complete the next one.
+    s_step_gen.expire();
+    return got == pdTRUE && s_step_ok;
 }
 
 // ── ZDO callbacks: copy into the slot, post, return ───────────────────────
 
-void on_node_desc(const ezb_zdo_node_desc_req_result_t* r, void*) {
+void on_node_desc(const ezb_zdo_node_desc_req_result_t* r, void* ctx) {
+    if (!s_step_gen.current(ctx)) return;   // its waiter gave up
     if (!r || r->error != 0 || !r->rsp || r->rsp->status != EZB_ZDP_STATUS_SUCCESS) {
         step_done(false);
         return;
@@ -163,7 +174,8 @@ void on_node_desc(const ezb_zdo_node_desc_req_result_t* r, void*) {
     step_done(true);
 }
 
-void on_active_ep(const ezb_zdo_active_ep_req_result_t* r, void*) {
+void on_active_ep(const ezb_zdo_active_ep_req_result_t* r, void* ctx) {
+    if (!s_step_gen.current(ctx)) return;   // its waiter gave up
     if (!r || r->error != 0 || !r->rsp || r->rsp->status != EZB_ZDP_STATUS_SUCCESS ||
         !r->rsp->active_ep_list) {
         step_done(false);
@@ -175,7 +187,8 @@ void on_active_ep(const ezb_zdo_active_ep_req_result_t* r, void*) {
     step_done(s_ep_count > 0);
 }
 
-void on_simple_desc(const ezb_zdo_simple_desc_req_result_t* r, void*) {
+void on_simple_desc(const ezb_zdo_simple_desc_req_result_t* r, void* ctx) {
+    if (!s_step_gen.current(ctx)) return;   // its waiter gave up
     if (!r || r->error != 0 || !r->rsp || r->rsp->status != EZB_ZDP_STATUS_SUCCESS) {
         step_done(false);
         return;
@@ -205,7 +218,6 @@ void on_simple_desc(const ezb_zdo_simple_desc_req_result_t* r, void*) {
 // ── ZDO request wrappers ──────────────────────────────────────────────────
 
 bool req_node_desc(uint16_t nwk) {
-    xSemaphoreTake(s_step_sem, 0);   // drain a stale post
     ezb_zdo_node_desc_req_t req{};
     req.dst_nwk_addr = nwk;
     req.field.nwk_addr_of_interest = nwk;
@@ -214,13 +226,14 @@ bool req_node_desc(uint16_t nwk) {
         // Lock only around the request; the result is posted by a callback on
         // the stack task, which needs the lock back before step_wait can end.
         zb_lock::Guard g;
-        if (!g || ezb_zdo_node_desc_req(&req) != 0) return false;
+        if (!g) return false;
+        req.user_ctx = step_begin();
+        if (ezb_zdo_node_desc_req(&req) != 0) { s_step_gen.expire(); return false; }
     }
     return step_wait(kZdoTimeoutMs);
 }
 
 bool req_active_ep(uint16_t nwk) {
-    xSemaphoreTake(s_step_sem, 0);
     ezb_zdo_active_ep_req_t req{};
     req.dst_nwk_addr = nwk;
     req.field.nwk_addr_of_interest = nwk;
@@ -229,13 +242,14 @@ bool req_active_ep(uint16_t nwk) {
         // Lock only around the request; the result is posted by a callback on
         // the stack task, which needs the lock back before step_wait can end.
         zb_lock::Guard g;
-        if (!g || ezb_zdo_active_ep_req(&req) != 0) return false;
+        if (!g) return false;
+        req.user_ctx = step_begin();
+        if (ezb_zdo_active_ep_req(&req) != 0) { s_step_gen.expire(); return false; }
     }
     return step_wait(kZdoTimeoutMs);
 }
 
 bool req_simple_desc(uint16_t nwk, uint8_t ep) {
-    xSemaphoreTake(s_step_sem, 0);
     ezb_zdo_simple_desc_req_t req{};
     req.dst_nwk_addr = nwk;
     req.field.nwk_addr_of_interest = nwk;
@@ -245,7 +259,9 @@ bool req_simple_desc(uint16_t nwk, uint8_t ep) {
         // Lock only around the request; the result is posted by a callback on
         // the stack task, which needs the lock back before step_wait can end.
         zb_lock::Guard g;
-        if (!g || ezb_zdo_simple_desc_req(&req) != 0) return false;
+        if (!g) return false;
+        req.user_ctx = step_begin();
+        if (ezb_zdo_simple_desc_req(&req) != 0) { s_step_gen.expire(); return false; }
     }
     return step_wait(kZdoTimeoutMs);
 }
@@ -364,7 +380,8 @@ bool read_basic(ZapDevice* work, uint16_t nwk) {
 
 // ── The interview ─────────────────────────────────────────────────────────
 
-// Copy the finished record back into the live pool slot under the lock.
+// Merge what the interview read into the live pool slot under the lock
+// (esp_zb_interview_merge.h).
 struct CommitCtx {
     const ZapDevice* src;
     bool             nwk_changed;
@@ -373,11 +390,7 @@ struct CommitCtx {
 void commit_fn(ZapDevice* live, void* ctx) {
     auto* c = static_cast<CommitCtx*>(ctx);
     const uint16_t old_nwk = live->nwk_addr;
-    // friendly_name is user-owned -- never clobber it from an interview.
-    char keep[sizeof(live->friendly_name)];
-    std::memcpy(keep, live->friendly_name, sizeof(keep));
-    *live = *c->src;
-    std::memcpy(live->friendly_name, keep, sizeof(keep));
+    interview_merge(live, *c->src);
     c->nwk_changed = (old_nwk != live->nwk_addr);
 }
 
@@ -472,6 +485,7 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
     CommitCtx c{&work, false};
     if (!zigbee_pool_with_device(ieee, commit_fn, &c)) return false;
     if (c.nwk_changed) zigbee_pool_mark_dirty();   // nwk index must be rebuilt
+    zigbee_pool_snapshot(ieee, &work);             // the merged record: log and persist that
 
     ESP_LOGI(TAG, "interview %016llx nwk 0x%04x: '%s' / '%s' eps=%u iv=%u sup=%u",
              (unsigned long long)ieee, nwk,

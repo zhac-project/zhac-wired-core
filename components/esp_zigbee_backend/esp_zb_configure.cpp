@@ -47,6 +47,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "zap_common.h"
+#include "esp_zb_req_gen.h"
 #include "zcl_seq.h"
 #include "zhc_adapter.h"
 #include "zigbee_mgr.h"      // zigbee_mgr_coordinator_ieee
@@ -67,6 +68,11 @@ constexpr size_t kZclMax = 128;
 constexpr uint32_t kBindTimeoutMs = 10000;
 
 SemaphoreHandle_t s_bind_sem = nullptr;
+// One bind/unbind at a time from start to answer: the configure worker, the
+// web UI and the cloud all bind, and they share the one result slot below
+// (review F06). Held across the wait, never together with the stack lock.
+SemaphoreHandle_t s_bind_op  = nullptr;
+ReqGen            s_bind_gen;          // a reply after its timeout is not the next bind's
 bool              s_bind_ok  = false;
 uint8_t           s_bind_status = 0xFF;   // ZDP status of the last response, 0xFF = none
 
@@ -79,17 +85,31 @@ bool nwk_of(uint64_t ieee, uint16_t* out) {
     return snap.nwk_addr != 0;
 }
 
-void on_bind_result(const ezb_zdp_bind_req_result_t* r, void*) {
+void on_bind_result(const ezb_zdp_bind_req_result_t* r, void* ctx) {
+    if (!s_bind_gen.current(ctx)) return;   // its waiter gave up
     s_bind_status = (r && r->error == 0 && r->rsp) ? static_cast<uint8_t>(r->rsp->status) : 0xFF;
     s_bind_ok = s_bind_status == static_cast<uint8_t>(EZB_ZDP_STATUS_SUCCESS);
     xSemaphoreGive(s_bind_sem);
 }
 
+bool do_bind_owned(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
+                   uint64_t dst_ieee, uint8_t dst_ep, bool unbind);
+
 // Shared by bind and unbind -- the request structs are the same type.
 bool do_bind(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
              uint64_t dst_ieee, uint8_t dst_ep, bool unbind) {
-    if (!s_bind_sem) return false;
+    if (!s_bind_sem || !s_bind_op) return false;
+    if (xSemaphoreTake(s_bind_op, pdMS_TO_TICKS(2 * kBindTimeoutMs)) != pdTRUE) {
+        ESP_LOGW(TAG, "%s 0x%04x: another bind did not finish", unbind ? "unbind" : "bind", nwk);
+        return false;
+    }
+    const bool ok = do_bind_owned(nwk, src_ieee, src_ep, cluster, dst_ieee, dst_ep, unbind);
+    xSemaphoreGive(s_bind_op);
+    return ok;
+}
 
+bool do_bind_owned(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
+                   uint64_t dst_ieee, uint8_t dst_ep, bool unbind) {
     ezb_zdo_bind_req_t req{};
     req.dst_nwk_addr           = nwk;
     req.field.src_addr.u64     = src_ieee;
@@ -100,23 +120,29 @@ bool do_bind(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
     req.field.dst_ep           = dst_ep;
     req.cb                     = on_bind_result;
 
-    xSemaphoreTake(s_bind_sem, 0);       // drain a stale post
-    s_bind_ok = false;
-    s_bind_status = 0xFF;
     int e = -1;
     {
         // Lock only around the request: the bind result arrives via a
-        // callback on the stack task, which needs the lock to run.
+        // callback on the stack task, which needs the lock to run. Claim the
+        // slot under it (esp_zb_req_gen.h).
         zb_lock::Guard g;
-        if (g) e = static_cast<int>(unbind ? ezb_zdo_unbind_req(&req)
-                                           : ezb_zdo_bind_req(&req));
+        if (g) {
+            xSemaphoreTake(s_bind_sem, 0);       // drain a stale post
+            s_bind_ok = false;
+            s_bind_status = 0xFF;
+            req.user_ctx = s_bind_gen.begin();
+            e = static_cast<int>(unbind ? ezb_zdo_unbind_req(&req)
+                                        : ezb_zdo_bind_req(&req));
+        }
     }
+    const bool got = e == 0 && xSemaphoreTake(s_bind_sem, pdMS_TO_TICKS(kBindTimeoutMs)) == pdTRUE;
+    s_bind_gen.expire();                     // a later reply is nobody's
     if (e != 0) {
         ESP_LOGW(TAG, "%s req failed to send (%d)", unbind ? "unbind" : "bind",
                  (int)e);
         return false;
     }
-    if (xSemaphoreTake(s_bind_sem, pdMS_TO_TICKS(kBindTimeoutMs)) != pdTRUE) {
+    if (!got) {
         ESP_LOGW(TAG, "%s 0x%04x ep %u cluster 0x%04x timed out",
                  unbind ? "unbind" : "bind", nwk, src_ep, cluster);
         return false;   // asleep or out of reach: worth another try when it wakes
@@ -226,7 +252,8 @@ void cfg_sleep(uint16_t wait_ms) {
 
 void esp_zb_configure_register() {
     if (!s_bind_sem) s_bind_sem = xSemaphoreCreateBinary();
-    if (!s_bind_sem) {
+    if (!s_bind_op)  s_bind_op  = xSemaphoreCreateMutex();
+    if (!s_bind_sem || !s_bind_op) {
         ESP_LOGE(TAG, "sem alloc failed -- bindings will not be created");
         return;
     }
