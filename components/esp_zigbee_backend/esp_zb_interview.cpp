@@ -39,6 +39,7 @@
 #include "esp_zb_interview.h"
 #include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
 #include "esp_zb_lock.h"
+#include "esp_zb_forget_log.h"
 #include "esp_zb_interview_merge.h"
 #include "esp_zb_req_gen.h"
 
@@ -62,6 +63,7 @@
 #include "zcl_seq.h"
 #include "zigbee_pool.h"
 
+#include <atomic>
 #include <cstring>
 
 static const char* TAG = "esp_zb_iv";
@@ -72,7 +74,21 @@ struct JoinReq {
     uint64_t ieee;
     uint16_t nwk;
     uint8_t  attempts_done;   // > 0 when re-queued after yielding to a peer
+    uint32_t seq;             // queue counter when first queued (esp_zb_forget_log.h)
 };
+
+// Queue counter and recent deletes: a delete cancels the requests queued
+// before it, not a new join after it (review F15).
+std::atomic<uint32_t> s_join_seq{0};
+ForgetLog             s_forgotten;
+portMUX_TYPE          s_forget_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool forgotten(const JoinReq& r) {
+    taskENTER_CRITICAL(&s_forget_mux);
+    const bool c = s_forgotten.cancelled(r.ieee, r.seq);
+    taskEXIT_CRITICAL(&s_forget_mux);
+    return c;
+}
 
 QueueHandle_t     s_join_q   = nullptr;
 SemaphoreHandle_t s_step_sem = nullptr;
@@ -546,6 +562,10 @@ void task_interview(void*) {
     for (;;) {
         if (xQueueReceive(s_join_q, &req, portMAX_DELAY) != pdTRUE) continue;
         if (req.ieee == 0) continue;
+        if (forgotten(req)) {
+            ESP_LOGI(TAG, "%016llx was deleted -- queued interview dropped", (unsigned long long)req.ieee);
+            continue;
+        }
 
         if (!pool_upsert(req.ieee, req.nwk)) continue;
         s_active_ieee = req.ieee;
@@ -554,6 +574,7 @@ void task_interview(void*) {
         bool ok = false;
         bool yielded = false;
         for (int attempt = req.attempts_done + 1; attempt <= kMaxAttempts && !ok; attempt++) {
+            if (forgotten(req)) break;   // deleted while we waited for it to wake
             ok = do_interview(req.ieee, req.nwk);
             if (ok) break;
 
@@ -574,7 +595,7 @@ void task_interview(void*) {
                 // the peer be interviewed first -- one sleepy remote must not
                 // block every other join for five minutes.
                 if (uxQueueMessagesWaiting(s_join_q) > 0) {
-                    const JoinReq back{req.ieee, req.nwk, static_cast<uint8_t>(attempt)};
+                    const JoinReq back{req.ieee, req.nwk, static_cast<uint8_t>(attempt), req.seq};
                     if (xQueueSend(s_join_q, &back, 0) == pdTRUE) {
                         ESP_LOGI(TAG, "%016llx yields to a queued peer after %d/%d%s -- "
                                       "back in the queue",
@@ -665,7 +686,7 @@ void zb_interview_enqueue(uint64_t ieee, uint16_t nwk) {
                  (unsigned long long)ieee);
         return;
     }
-    const JoinReq r{ieee, nwk, 0};
+    const JoinReq r{ieee, nwk, 0, ++s_join_seq};
     if (s_active_ieee != 0) s_preempt = true;   // someone else is awake now: stop waiting on the sleeper
     if (xQueueSend(s_join_q, &r, 0) != pdTRUE) {
         ESP_LOGW(TAG, "join queue full -- dropping announce for %016llx",
@@ -690,6 +711,14 @@ void rejoin_fn(ZapDevice* d, void* ctx) {
     auto* c = static_cast<RejoinCtx*>(ctx);
     c->nwk_changed = (d->nwk_addr != c->nwk);
     c->was_removed = zap_dev_is_removed(d);
+    if (c->was_removed) {
+        // Back after leaving: most likely factory-reset and paired again, so
+        // its bindings and reporting are gone. DONE kept it from being
+        // configured again (review F16). A plain power cycle does not leave,
+        // so it keeps DONE and is not rebound.
+        d->configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
+        d->configure_attempts = 0;
+    }
     d->flags      &= static_cast<uint8_t>(~ZAP_DEV_REMOVED);
     d->nwk_addr    = c->nwk;
     if (c->now) d->last_seen = c->now;
@@ -771,6 +800,9 @@ void zb_interview_on_leave(uint64_t ieee) {
 
 bool zb_interview_forget(uint64_t ieee) {
     if (ieee == 0) return false;
+    taskENTER_CRITICAL(&s_forget_mux);
+    s_forgotten.forget(ieee, s_join_seq.load());   // what is queued for it now is void
+    taskEXIT_CRITICAL(&s_forget_mux);
     const bool gone = zigbee_pool_remove(ieee);   // also invalidates the def cache
     zhac_adapter_fallback_clear(ieee);            // and the cluster fallback data
     zap_store_delete_device(ieee);
@@ -792,7 +824,7 @@ bool zb_interview_trigger(uint64_t ieee) {
         return false;
     }
     if (!s_join_q) return false;
-    const JoinReq r{ieee, snap.nwk_addr, 0};
+    const JoinReq r{ieee, snap.nwk_addr, 0, ++s_join_seq};
     return xQueueSend(s_join_q, &r, 0) == pdTRUE;
 }
 

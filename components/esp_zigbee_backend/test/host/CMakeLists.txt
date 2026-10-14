@@ -31,6 +31,9 @@ add_test(NAME lqi COMMAND lqi_tests)
 add_executable(req_gen_tests test_req_gen.cpp)
 add_test(NAME req_gen COMMAND req_gen_tests)
 
+add_executable(forget_log_tests test_forget_log.cpp)
+add_test(NAME forget_log COMMAND forget_log_tests)
+
 add_executable(interview_merge_tests test_interview_merge.cpp)
 target_include_directories(interview_merge_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components/components/zap_common/include)
