@@ -70,6 +70,7 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
         return ESP_FAIL;
     }
     httpd_resp_sendstr_chunk(req, "[");
+    bool first = true;
     for (uint16_t i = 0; i < n_snap; i++) {
         const ZapDevice& d = snap[i];
 
@@ -129,10 +130,16 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
             }
         }
 
-        char chunk[1024];
-        size_t len = serializeJson(doc, chunk, sizeof(chunk));
-        if (i > 0) httpd_resp_sendstr_chunk(req, ",");
+        // Sized to the row: up to 32 attributes with string values outgrow
+        // a fixed 1 KB, and the row went out cut off (review F30).
+        const size_t cap = measureJson(doc) + 1;
+        char* chunk = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+        if (!chunk) continue;   // skip the row rather than send half of it
+        const size_t len = serializeJson(doc, chunk, cap);
+        if (!first) httpd_resp_sendstr_chunk(req, ",");
+        first = false;
         httpd_resp_send_chunk(req, chunk, len);
+        heap_caps_free(chunk);
     }
     httpd_resp_sendstr_chunk(req, "]");
     httpd_resp_sendstr_chunk(req, nullptr);  // terminate chunked response

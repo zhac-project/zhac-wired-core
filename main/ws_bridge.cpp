@@ -46,6 +46,7 @@
 #include "api_system.h"
 #include "api_groups.h"
 #include "groups_store.h"
+#include "psram_json.h"
 #include "api_status.h"
 #include "auth.h"
 #include "ota_update.h"
@@ -233,23 +234,20 @@ static void cmd_token_rotate(int fd, uint32_t id) {
     ws_server_reply(fd, buf, n);
 }
 
+static void reply_data(int fd, uint32_t id, JsonVariantConst data);
+
 static void cmd_diagnostics_unhandled(int fd, uint32_t id) {
-    char tmp[1408];
-    size_t tn = system_diagnostics_json(tmp, sizeof(tmp));
     JsonDocument data;
-    if (tn == 0 || deserializeJson(data, tmp, tn)) { data.clear(); data["entries"].to<JsonArray>(); }
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = data;
-    char buf[1536];
-    size_t n = serializeJson(env, buf, sizeof(buf));
-    ws_server_reply(fd, buf, n);
+    system_diagnostics_fill(data.to<JsonObject>());
+    reply_data(fd, id, data);
 }
 
 // ── group.* ───────────────────────────────────────────────────────────
 // Payloads nest under "group"/"groups" so they don't collide with the
 // envelope's own "id"/"ok" keys (group records carry their own "id").
-// Envelope + data, sized to fit (review F10: a 16-member group outgrew the
-// old 640-byte reply and went out truncated).
-static void reply_group_data(int fd, uint32_t id, JsonVariantConst data) {
+// Envelope + data, sized to fit (review F10, F30: fixed reply buffers cut a
+// 16-member group and the diagnostics list off mid-JSON).
+static void reply_data(int fd, uint32_t id, JsonVariantConst data) {
     JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = data;
     const size_t cap = measureJson(env) + 1;
     char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
@@ -264,7 +262,7 @@ static void cmd_group_list(int fd, uint32_t id) {
     JsonDocument inner;
     if (!tn || deserializeJson(inner, tmp, tn)) { heap_caps_free(tmp); send_err(fd, id, "group list unavailable"); return; }
     heap_caps_free(tmp);
-    reply_group_data(fd, id, inner);
+    reply_data(fd, id, inner);
 }
 
 static void cmd_group_create(int fd, uint32_t id, JsonDocument& doc) {
@@ -272,7 +270,7 @@ static void cmd_group_create(int fd, uint32_t id, JsonDocument& doc) {
     char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_create(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "create failed"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    reply_group_data(fd, id, inner);
+    reply_data(fd, id, inner);
     ws_push("group.added", inner);
 }
 static void cmd_group_get(int fd, uint32_t id, JsonDocument& doc) {
@@ -280,14 +278,14 @@ static void cmd_group_get(int fd, uint32_t id, JsonDocument& doc) {
     char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_get(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "no such group"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    reply_group_data(fd, id, inner);
+    reply_data(fd, id, inner);
 }
 static void cmd_group_update(int fd, uint32_t id, JsonDocument& doc) {
     char args[1024]; size_t an = serializeJson(doc["args"], args, sizeof(args));
     char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_update(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "no such group"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    reply_group_data(fd, id, inner);
+    reply_data(fd, id, inner);
     ws_push("group.updated", inner);
 }
 static void cmd_group_delete(int fd, uint32_t id, JsonDocument& doc) {
@@ -462,17 +460,20 @@ static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
 
 // ── device.list ──────────────────────────────────────────────────────
 //
-// JSON array of device summaries — the main devices page. One small
-// JSON doc per row; ws_server_reply takes a single buffer so we batch
-// into one ~8 KB buffer rather than chunked. For 20-30 devices this
-// stays well under cap. Shadow attrs are skipped here — the SPA pulls
-// detail via device.get when the user opens a row.
+// JSON array of device summaries — the main devices page. Built as a document
+// in PSRAM and sent in one buffer sized to it: the old fixed 8 KB buffer
+// silently dropped every device past ~22 (the pool holds 200), and the
+// model / manufacturer strings straight from the radio were pasted in with
+// %s, so one quote or control byte broke the whole list (review F30). Shadow
+// attrs are skipped here — the SPA pulls detail via device.get.
 static void cmd_device_list(int fd, uint32_t id) {
-    char* buf = (char*)heap_caps_malloc(8 * 1024, MALLOC_CAP_SPIRAM);
-    if (!buf) { send_err(fd, id, "oom"); return; }
-    int pos = snprintf(buf, 8 * 1024,
-                        "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":[", id);
-    bool first = true;
+    // char* (not const char*) makes ArduinoJson copy a string; the pool rows
+    // and the label buffers below do not outlive this loop.
+    auto copy = [](const char* s) { return const_cast<char*>(s); };
+    JsonDocument env(psram_json());
+    env["id"] = id;
+    env["ok"] = true;
+    JsonArray rows = env["data"].to<JsonArray>();
 
     zigbee_pool_lock();
     ZapDevice* pool = pool_all();
@@ -482,42 +483,37 @@ static void cmd_device_list(int fd, uint32_t id) {
         if (zap_dev_is_removed(&d)) continue;
         // Friendly labels from the matched definition ("Tuya" / "TS0203"),
         // falling back to the device's own Basic strings when no def matches.
-        // The SPA's device table reads `vendor`, NOT `manufacturer` — omitting
-        // it left the Manufacturer column showing "—" for every device even
-        // though the raw string was right there in the row. `manufacturer`
-        // stays as the raw Basic 0x0004 value, which the detail tab reads.
-        // Same contract as hap_json's device_list encoder.
+        // The SPA's device table reads `vendor`, NOT `manufacturer`;
+        // `manufacturer` stays the raw Basic 0x0004 value, which the detail
+        // tab reads. Same contract as hap_json's device_list encoder.
         char vendor_buf[32] = {};
         char model_buf[32]  = {};
         zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
                                     vendor_buf, sizeof(vendor_buf),
                                     model_buf,  sizeof(model_buf));
-        const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
-        const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
-
-        char row[512];
-        int rn = snprintf(row, sizeof(row),
-            "%s{\"ieee\":\"0x%016" PRIX64 "\",\"nwk\":%u,"
-            "\"friendly\":\"%s\",\"name\":\"%s\","
-            "\"model\":\"%s\",\"manufacturer\":\"%s\","
-            "\"vendor\":\"%s\",\"model_id\":\"%s\",\"known\":%s,"
-            "\"last_seen\":%" PRId64 ",\"lqi\":%u,\"battery\":%d,"
-            "\"ep_count\":%u}",
-            first ? "" : ",",
-            d.ieee_addr, d.nwk_addr,
-            d.friendly_name, d.friendly_name, model_out, d.manufacturer_name,
-            vendor_out, d.model_id, model_buf[0] ? "true" : "false",
-            (int64_t)d.last_seen, d.link_quality, d.battery_pct,
-            d.endpoint_count);
-        if (rn <= 0 || pos + rn + 4 >= 8 * 1024) break;  // truncate gracefully
-        std::memcpy(buf + pos, row, rn);
-        pos += rn;
-        first = false;
+        char ieee[24];
+        snprintf(ieee, sizeof(ieee), "0x%016" PRIX64, d.ieee_addr);
+        JsonObject o = rows.add<JsonObject>();
+        o["ieee"]         = copy(ieee);
+        o["nwk"]          = d.nwk_addr;
+        o["friendly"]     = copy(d.friendly_name);
+        o["name"]         = copy(d.friendly_name);
+        o["model"]        = copy(model_buf[0] ? model_buf : d.model_id);
+        o["manufacturer"] = copy(d.manufacturer_name);
+        o["vendor"]       = copy(vendor_buf[0] ? vendor_buf : d.manufacturer_name);
+        o["model_id"]     = copy(d.model_id);
+        o["known"]        = model_buf[0] != '\0';
+        o["last_seen"]    = (int64_t)d.last_seen;
+        o["lqi"]          = d.link_quality;
+        o["battery"]      = d.battery_pct;
+        o["ep_count"]     = d.endpoint_count;
     }
     zigbee_pool_unlock();
 
-    if (pos + 3 < 8 * 1024) { buf[pos++] = ']'; buf[pos++] = '}'; }
-    ws_server_reply(fd, buf, pos);
+    const size_t cap = measureJson(env) + 1;
+    char* buf = env.overflowed() ? nullptr : (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    ws_server_reply(fd, buf, serializeJson(env, buf, cap));
     heap_caps_free(buf);
 }
 

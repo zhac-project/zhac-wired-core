@@ -73,12 +73,13 @@ bool system_rotate_token(char* out, size_t cap) {
     return sys_rotate_api_token(out, cap);
 }
 
-size_t system_diagnostics_json(char* out, size_t cap) {
+// Into the caller's document, which is sized to what it holds: a fixed
+// 1.5 KB buffer cut the 24-entry list off mid-JSON (review F30).
+void system_diagnostics_fill(JsonObject out) {
     ZbUnhandledFrame fr[24];
     uint16_t n = zb_diag_snapshot(fr, 24);
 
-    JsonDocument doc;
-    JsonArray arr = doc["entries"].to<JsonArray>();
+    JsonArray arr = out["entries"].to<JsonArray>();
     const uint32_t now = (uint32_t)time(nullptr);
     for (uint16_t i = 0; i < n; i++) {
         JsonObject o = arr.add<JsonObject>();
@@ -91,7 +92,6 @@ size_t system_diagnostics_json(char* out, size_t cap) {
         snprintf(ib, sizeof(ib), "0x%016" PRIx64, fr[i].last_ieee);
         o["ieee"] = ib;
     }
-    return serializeJson(doc, out, cap);
 }
 
 // ── REST wrappers ───────────────────────────────────────────────────────────
@@ -124,11 +124,15 @@ static esp_err_t handle_token_rotate(httpd_req_t* req) {
 }
 
 static esp_err_t handle_diagnostics_unhandled(httpd_req_t* req) {
-    char buf[1536];
-    size_t n = system_diagnostics_json(buf, sizeof(buf));
+    JsonDocument doc;
+    system_diagnostics_fill(doc.to<JsonObject>());
+    const size_t cap = measureJson(doc) + 1;
+    char* buf = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
     httpd_resp_set_type(req, "application/json");
-    if (n == 0) return httpd_resp_sendstr(req, "{\"entries\":[]}");
-    return httpd_resp_send(req, buf, n);
+    const esp_err_t e = httpd_resp_send(req, buf, serializeJson(doc, buf, cap));
+    heap_caps_free(buf);
+    return e;
 }
 
 static esp_err_t handle_logs_get(httpd_req_t* req) {

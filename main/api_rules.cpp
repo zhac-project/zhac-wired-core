@@ -47,6 +47,26 @@ static uint16_t parse_id_from_uri(const char* uri, const char* prefix) {
     return static_cast<uint16_t>(id);
 }
 
+// The parser's message quotes the rule text, which may hold quotes and
+// backslashes: built as a document, never pasted into a format (review F30).
+static JsonDocument dsl_error_doc() {
+    JsonDocument d;
+    d["ok"]  = false;
+    d["err"] = dsl_last_error();
+    return d;
+}
+
+static esp_err_t send_json(httpd_req_t* req, const char* status, const JsonDocument& doc) {
+    const size_t cap = measureJson(doc) + 1;
+    char* buf = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    const esp_err_t e = httpd_resp_send(req, buf, serializeJson(doc, buf, cap));
+    heap_caps_free(buf);
+    return e;
+}
+
 static bool uri_ends_with(const char* uri, const char* suffix) {
     size_t ul = std::strlen(uri), sl = std::strlen(suffix);
     return ul >= sl && std::strcmp(uri + ul - sl, suffix) == 0;
@@ -70,6 +90,7 @@ static esp_err_t handle_get_rules(httpd_req_t* req) {
     httpd_resp_sendstr_chunk(req, "[");
 
     uint16_t cnt = rule_store_load_all(slots, ZAP_MAX_RULES);
+    bool first = true;
     for (uint16_t i = 0; i < cnt; i++) {
         const RuleSlot& s = slots[i];
         JsonDocument doc;
@@ -85,10 +106,16 @@ static esp_err_t handle_get_rules(httpd_req_t* req) {
         dsl[n] = '\0';
         doc["dsl"] = dsl;
 
-        char buf[768];
-        size_t bn = serializeJson(doc, buf, sizeof(buf));
-        if (i > 0) httpd_resp_sendstr_chunk(req, ",");
+        // Sized to the row: a permitted name and DSL can outgrow a fixed
+        // 768 bytes once escaped, and the row went out cut off (review F30).
+        const size_t cap = measureJson(doc) + 1;
+        char* buf = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+        if (!buf) continue;
+        const size_t bn = serializeJson(doc, buf, cap);
+        if (!first) httpd_resp_sendstr_chunk(req, ",");
+        first = false;
         httpd_resp_send_chunk(req, buf, bn);
+        heap_caps_free(buf);
     }
     httpd_resp_sendstr_chunk(req, "]");
     httpd_resp_sendstr_chunk(req, nullptr);
@@ -122,12 +149,7 @@ static esp_err_t handle_post_rules(httpd_req_t* req) {
         int rl = snprintf(r, sizeof(r), "{\"ok\":true,\"id\":%u}", (unsigned)new_id);
         return httpd_resp_send(req, r, rl);
     }
-    char r[160];
-    int rl = snprintf(r, sizeof(r),
-                      "{\"ok\":false,\"err\":\"%s\"}",
-                      dsl_last_error());
-    httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_send(req, r, rl);
+    return send_json(req, "400 Bad Request", dsl_error_doc());
 }
 
 // ── /api/rules/<id> handlers (PUT/DELETE) and /api/rules/<id>/enable ───
@@ -173,12 +195,7 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
         bool ok = simple_rules_update(id, name, dsl);
         httpd_resp_set_type(req, "application/json");
         if (ok) return httpd_resp_sendstr(req, "{\"ok\":true}");
-        char r[160];
-        int rl = snprintf(r, sizeof(r),
-                          "{\"ok\":false,\"err\":\"%s\"}",
-                          dsl_last_error());
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, r, rl);
+        return send_json(req, "400 Bad Request", dsl_error_doc());
     }
 
     // DELETE /api/rules/<id>

@@ -25,6 +25,7 @@
 #include <cstring>
 
 #include "ArduinoJson.h"
+#include "psram_json.h"
 #include "api_status.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -48,17 +49,11 @@ constexpr size_t   kPayloadCap = 512;   // ~370 B at worst
 std::atomic<bool> s_started{false};
 
 // The stream may run every second: keep its JSON pool out of internal RAM.
-struct PsramAllocator : ArduinoJson::Allocator {
-    void* allocate(size_t n) override { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
-    void deallocate(void* p) override { heap_caps_free(p); }
-    void* reallocate(void* p, size_t n) override { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM); }
-};
-PsramAllocator s_psram;
 
 void publish_metrics() {
     char topic[64];
     if (mqtt_gw_format_topic(topic, sizeof(topic), "bridge/metrics") <= 0) return;
-    JsonDocument doc(&s_psram);
+    JsonDocument doc(psram_json());
     api_status_fill_metrics(doc.to<JsonObject>());
     char* buf = static_cast<char*>(heap_caps_malloc(kPayloadCap, MALLOC_CAP_SPIRAM));
     if (!buf) return;
