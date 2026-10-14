@@ -73,7 +73,7 @@ bool esp_zb_zdo_bind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
 
 // Fed every inbound ZCL frame; consumes only a Get Group Membership Response
 // that a zigbee_zcl_get_group_membership() call is actively waiting for.
-bool zb_groups_feed_zcl(uint16_t nwk, uint16_t cluster_id,
+bool zb_groups_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
                         const uint8_t* zcl, uint8_t zcl_len);
 
 // Defined in esp_zigbee_backend.cpp -- raw ZCL out over APS. Declared here so

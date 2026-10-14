@@ -185,6 +185,26 @@ int main() {
 
     size_t n = zone_enroll_response(b, sizeof(b), 0x40, 0x00);
     expect_bytes("zone_enroll_response success, zone 0", b, n, {0x01, 0x40, 0x00, 0x00, 0x00});
+    // ── Get Group Membership Response body: capacity | count | ids (LE)
+    {
+        uint16_t ids[4]; uint8_t cnt = 99;
+        const uint8_t two[] = {0x05, 0x02, 0x65, 0x00, 0xCA, 0x00};
+        expect_eq("membership: two groups", parse_group_membership(two, sizeof(two), ids, 4, &cnt), true);
+        expect_eq("  count", cnt, 2);
+        expect_eq("  ids", ids[0] == 101 && ids[1] == 202, true);
+        const uint8_t none[] = {0x05, 0x00};
+        expect_eq("membership: in no group is an answer", parse_group_membership(none, sizeof(none), ids, 4, &cnt), true);
+        expect_eq("  count 0", cnt, 0);
+        const uint8_t missing[] = {0x05, 0x01};
+        expect_eq("membership: an advertised id that is missing is malformed",
+                  parse_group_membership(missing, sizeof(missing), ids, 4, &cnt), false);
+        const uint8_t partial[] = {0x05, 0x02, 0x65, 0x00, 0xCA};
+        expect_eq("membership: half an id is malformed", parse_group_membership(partial, sizeof(partial), ids, 4, &cnt), false);
+        expect_eq("membership: no count is malformed", parse_group_membership(two, 1, ids, 4, &cnt), false);
+        expect_eq("membership: more than the caller holds keeps the first",
+                  parse_group_membership(two, sizeof(two), ids, 1, &cnt) && cnt == 1 && ids[0] == 101, true);
+    }
+
     n = write_cie_address(b, sizeof(b), 0x41, 0x30EDA0FFFEF43DD6ull);
     expect_bytes("write IAS_CIE_Address", b, n,
                  {0x00, 0x41, 0x02, 0x10, 0x00, 0xF0, 0xD6, 0x3D, 0xF4, 0xFE, 0xFF, 0xA0, 0xED, 0x30});

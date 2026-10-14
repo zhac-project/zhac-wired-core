@@ -197,4 +197,21 @@ inline size_t write_cie_address(uint8_t* buf, size_t cap, uint8_t tsn, uint64_t 
     return write_attribute(buf, cap, tsn, 0x0010, 0xF0, le, sizeof(le), 0);
 }
 
+// Get Group Membership Response body (past the ZCL header): capacity(1) |
+// count(1) | count group ids, LE. The whole advertised list must be there --
+// a frame that claims more ids than it carries is malformed, not "in fewer
+// groups", and must not replace what the hub knows (review F14). More ids
+// than the caller can hold is fine: the first `max` are kept.
+inline bool parse_group_membership(const uint8_t* body, size_t len,
+                                   uint16_t* out, uint8_t max, uint8_t* out_count) {
+    if (!body || len < 2) return false;
+    const uint8_t count = body[1];
+    if (len < 2u + 2u * count) return false;
+    uint8_t w = 0;
+    for (uint8_t i = 0; i < count && w < max; i++)
+        out[w++] = static_cast<uint16_t>(body[2 + 2 * i] | (body[3 + 2 * i] << 8));
+    *out_count = w;
+    return true;
+}
+
 }  // namespace zhc_zcl

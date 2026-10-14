@@ -481,7 +481,7 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     zb_interview_note_traffic(ieee);   // awake now: retry the interview at once
     zb_interview_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint,
                           ind->asdu, static_cast<uint8_t>(ind->asdu_length));
-    zb_groups_feed_zcl(nwk, ind->cluster_id, ind->asdu,
+    zb_groups_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint, ind->asdu,
                        static_cast<uint8_t>(ind->asdu_length));
     feed_late_identity(nwk, ind->cluster_id, ind->asdu, ind->asdu_length);
 

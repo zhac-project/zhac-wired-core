@@ -26,6 +26,7 @@
 
 #include "esp_zigbee_backend.h"
 #include "esp_zb_interview.h"   // esp_zb_af_send
+#include "esp_zb_lock.h"
 #include "esp_zb_zcl_frame.h"
 
 #include "esp_log.h"
@@ -47,16 +48,22 @@ constexpr uint8_t  kCmdRemoveGrp  = 0x03;
 
 constexpr uint32_t kMemberTimeoutMs = 5000;
 
-// Readback slot. Only one membership query runs at a time -- the WS handler that
-// issues it blocks until it completes, and there is one radio.
+// Readback slot. One membership query at a time, from request to answer:
+// local and cloud callers run on different tasks and used to take each
+// other's answers (review F13). The answer must come from the device and
+// endpoint asked, carry the request's TSN and travel server -> client.
 SemaphoreHandle_t s_member_sem = nullptr;
+SemaphoreHandle_t s_member_op  = nullptr;
 volatile uint16_t s_member_nwk = 0;      // 0 = not waiting
+uint8_t           s_member_ep  = 0;
+uint8_t           s_member_tsn = 0;
 uint8_t           s_member_buf[64];
 uint8_t           s_member_len = 0;
 
 SemaphoreHandle_t member_sem() {
     if (!s_member_sem) s_member_sem = xSemaphoreCreateBinary();
-    return s_member_sem;
+    if (!s_member_op)  s_member_op  = xSemaphoreCreateMutex();
+    return s_member_sem && s_member_op ? s_member_sem : nullptr;
 }
 
 }  // namespace
@@ -112,64 +119,65 @@ bool zigbee_zcl_get_group_membership(uint16_t nwk_addr, uint8_t ep,
                                      uint16_t* out_gids, uint8_t max,
                                      uint8_t* out_count) {
     if (out_count) *out_count = 0;
-    if (!out_gids || max == 0) return false;
+    if (!out_gids || max == 0 || !out_count) return false;
     SemaphoreHandle_t sem = member_sem();
     if (!sem) return false;
+    if (xSemaphoreTake(s_member_op, pdMS_TO_TICKS(2 * kMemberTimeoutMs)) != pdTRUE) {
+        ESP_LOGW(TAG, "membership query nwk 0x%04x: another query did not finish", nwk_addr);
+        return false;
+    }
 
+    const uint8_t tsn    = zcl_seq_next();
+    const uint8_t dst_ep = ep ? ep : 1;
     const uint8_t payload[1] = {0x00};   // group count 0 = all
     uint8_t f[32];
-    const size_t n = zhc_zcl::cluster_command(f, sizeof(f), zcl_seq_next(),
-                                              kCmdGetMember, payload,
-                                              sizeof(payload), /*flags=*/0);
-    if (n == 0) return false;
-
-    s_member_len = 0;
-    xSemaphoreTake(sem, 0);              // drain a stale post
-    s_member_nwk = nwk_addr;             // arm before sending
-
-    if (!esp_zb_af_send(nwk_addr, ep ? ep : 1, kGroupsCluster, f, n)) {
-        s_member_nwk = 0;
-        return false;
+    const size_t n = zhc_zcl::cluster_command(f, sizeof(f), tsn, kCmdGetMember,
+                                              payload, sizeof(payload), /*flags=*/0);
+    bool sent = false;
+    if (n) {
+        // Arm under the stack lock: answers are fed on the stack task with it
+        // held, so none can land between draining and arming.
+        zb_lock::Guard g;
+        if (g) {
+            xSemaphoreTake(sem, 0);          // drain a stale post
+            s_member_len = 0;
+            s_member_ep  = dst_ep;
+            s_member_tsn = tsn;
+            s_member_nwk = nwk_addr;
+            sent = esp_zb_af_send(nwk_addr, dst_ep, kGroupsCluster, f, n);
+            if (!sent) s_member_nwk = 0;
+        }
     }
-    const bool got = xSemaphoreTake(sem, pdMS_TO_TICKS(kMemberTimeoutMs)) == pdTRUE;
-    s_member_nwk = 0;
-    if (!got || s_member_len < 2) {
-        ESP_LOGW(TAG, "membership query nwk 0x%04x ep %u: no response",
-                 nwk_addr, ep);
-        return false;
-    }
+    const bool got = sent && xSemaphoreTake(sem, pdMS_TO_TICKS(kMemberTimeoutMs)) == pdTRUE;
+    { zb_lock::Guard g; s_member_nwk = 0; }   // a late answer is nobody's
 
-    // Response body (past the ZCL header): capacity(1) | count(1) | gids LE.
-    const uint8_t count = s_member_buf[1];
-    uint8_t w = 0;
-    for (uint8_t i = 0; i < count && w < max; i++) {
-        const size_t off = 2 + static_cast<size_t>(i) * 2;
-        if (off + 1 >= s_member_len) break;   // truncated frame; keep what parsed
-        out_gids[w++] = static_cast<uint16_t>(s_member_buf[off]) |
-                        static_cast<uint16_t>(s_member_buf[off + 1] << 8);
-    }
-    if (out_count) *out_count = w;
-    ESP_LOGI(TAG, "membership nwk 0x%04x ep %u: %u group(s)", nwk_addr, ep, w);
-    return true;
+    // A truncated answer is not "in fewer groups": it must leave the mirror
+    // as it is (review F14).
+    const bool ok = got && zhc_zcl::parse_group_membership(s_member_buf, s_member_len,
+                                                           out_gids, max, out_count);
+    xSemaphoreGive(s_member_op);
+    if (!got)     ESP_LOGW(TAG, "membership query nwk 0x%04x ep %u: no response", nwk_addr, dst_ep);
+    else if (!ok) ESP_LOGW(TAG, "membership query nwk 0x%04x ep %u: malformed response", nwk_addr, dst_ep);
+    else          ESP_LOGI(TAG, "membership nwk 0x%04x ep %u: %u group(s)", nwk_addr, dst_ep, *out_count);
+    return ok;
 }
 
 // Fed every inbound ZCL frame by the APS hook. Consumes only the Get Group
 // Membership Response we are actively waiting for.
-bool zb_groups_feed_zcl(uint16_t nwk, uint16_t cluster_id,
+bool zb_groups_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
                         const uint8_t* zcl, uint8_t zcl_len) {
-    if (cluster_id != kGroupsCluster || !zcl || zcl_len < 3) return false;
-    if (s_member_nwk == 0 || s_member_nwk != nwk) return false;
-    if ((zcl[0] & 0x01) == 0) return false;             // must be cluster-specific
-    const bool mfg = (zcl[0] & 0x04) != 0;
-    const uint8_t cmd_idx = mfg ? 4 : 2;
-    if (zcl_len <= cmd_idx || zcl[cmd_idx] != kCmdGetMember) return false;
+    if (cluster_id != kGroupsCluster || s_member_nwk == 0 || s_member_nwk != nwk ||
+        src_ep != s_member_ep) return false;
+    zhc_zcl::Header h;
+    if (!zhc_zcl::parse_header(zcl, zcl_len, &h) || !h.cluster_specific ||
+        !(h.fc & 0x08) ||                                   // server -> client
+        h.cmd != kCmdGetMember || h.tsn != s_member_tsn) return false;
 
-    // Copy the body only (past the header) so the parser above indexes from 0.
-    const uint8_t body = static_cast<uint8_t>(cmd_idx + 1);
-    if (zcl_len <= body) return false;
-    s_member_len = static_cast<uint8_t>(zcl_len - body);
+    // Copy the body only (past the header) so the parser indexes from 0.
+    s_member_len = static_cast<uint8_t>(zcl_len - h.hdr_len);
     if (s_member_len > sizeof(s_member_buf)) s_member_len = sizeof(s_member_buf);
-    std::memcpy(s_member_buf, zcl + body, s_member_len);
+    std::memcpy(s_member_buf, zcl + h.hdr_len, s_member_len);
+    s_member_nwk = 0;                    // answered: nothing may overwrite it now
     xSemaphoreGive(s_member_sem);
     return true;
 }
