@@ -39,6 +39,7 @@
 #include "event_bus.h"
 #include "esp_zb_lock.h"
 #include "esp_zb_lqi.h"
+#include "esp_zb_zcl_frame.h"
 #include "esp_zigbee.h"
 #include "ezbee/aps.h"
 #include "ezbee/app_signals.h"
@@ -124,12 +125,12 @@ static void feed_late_identity(uint16_t nwk, uint16_t cluster_id,
 // 2000 once the clock is synced, UNSUPPORTED_ATTRIBUTE for everything else
 // (and for the time itself before NTP) so the device stops probing.
 static void respond_gen_time(uint16_t nwk, uint8_t dst_ep, const uint8_t* zcl, uint16_t len) {
-    if (nwk == 0 || !zcl || len < 3) return;
-    const bool   mfg = (zcl[0] & 0x04) != 0;
-    const size_t hdr = mfg ? 5 : 3;
-    if (len < hdr || (zcl[0] & 0x03) != 0x00) return;   // profile-wide frames only
-    if (zcl[hdr - 1] != 0x00) return;                      // Read Attributes
-    const uint8_t tsn = zcl[hdr - 2];
+    zhc_zcl::Header h;
+    if (nwk == 0 || !zhc_zcl::parse_header(zcl, len, &h)) return;
+    if ((h.fc & 0x03) != 0x00) return;                        // profile-wide frames only
+    if (h.cmd != 0x00) return;                                 // Read Attributes
+    const size_t  hdr = h.hdr_len;
+    const uint8_t tsn = h.tsn;
     constexpr uint32_t kEpoch2000 = 946684800u;             // 1970 -> 2000 in seconds
     const uint32_t now_unix = static_cast<uint32_t>(time(nullptr));
     const bool     clock_ok = now_unix > kEpoch2000;
@@ -281,14 +282,13 @@ static bool global_cmd_wants_default_response(uint8_t cmd) {
 
 static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16_t cluster,
                                             const uint8_t* zcl, uint16_t len) {
-    if (nwk == 0 || !zcl || len < 3) return;
-    const uint8_t in_fc = zcl[0];
-    const bool    mfg   = (in_fc & 0x04) != 0;
-    const size_t  hdr   = mfg ? 5 : 3;
-    if (len < hdr) return;
-    const bool    is_cs = (in_fc & 0x03) == 0x01;
-    const uint8_t tsn   = zcl[hdr - 2];
-    const uint8_t cmd   = zcl[hdr - 1];
+    zhc_zcl::Header h;
+    if (nwk == 0 || !zhc_zcl::parse_header(zcl, len, &h)) return;
+    const uint8_t in_fc = h.fc;
+    const bool    mfg   = h.mfg;
+    const bool    is_cs = h.cluster_specific;
+    const uint8_t tsn   = h.tsn;
+    const uint8_t cmd   = h.cmd;
     if (in_fc & 0x10) return;                                   // opted out
     if (!is_cs && (cmd == 0x0B || !global_cmd_wants_default_response(cmd))) return;
     if (!is_cs && cmd == 0x00 && cluster == 0x000A) return;     // genTime read: answered in full
@@ -309,8 +309,9 @@ static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16
 // An identical cluster-specific command (same source, cluster, TSN) inside
 // 1.5 s is the device's retry, not a second press.
 static bool zcl_is_retry(uint16_t nwk, uint16_t cluster, const uint8_t* zcl, uint16_t len) {
-    if (len < 3 || (zcl[0] & 0x03) != 0x01) return false;       // commands only
-    const uint8_t tsn = (zcl[0] & 0x04) ? zcl[3] : zcl[1];
+    zhc_zcl::Header h;
+    if (!zhc_zcl::parse_header(zcl, len, &h) || !h.cluster_specific) return false;   // commands only
+    const uint8_t tsn = h.tsn;
     struct Seen { uint16_t nwk, cluster; uint8_t tsn; int64_t us; };
     static Seen s_seen[8];
     static uint8_t s_next = 0;

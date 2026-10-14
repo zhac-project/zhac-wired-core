@@ -146,4 +146,33 @@ inline size_t cluster_command(uint8_t* buf, size_t cap, uint8_t tsn,
     return p + payload_len;
 }
 
+// An incoming frame's ZCL header (§2.4.1). Radio input: every ingress helper
+// goes through this rather than indexing the frame itself, because the TSN and
+// command id move by two bytes when the manufacturer-specific bit is set and a
+// 3-byte frame with that bit has neither.
+struct Header {
+    uint8_t  fc;                // frame control
+    bool     cluster_specific;  // frame type 01; else profile-wide
+    bool     mfg;
+    uint16_t mfg_code;
+    uint8_t  tsn;
+    uint8_t  cmd;
+    uint8_t  hdr_len;           // 3, or 5 with a manufacturer code
+};
+
+inline bool parse_header(const uint8_t* zcl, size_t len, Header* out) {
+    if (!zcl || len < 3) return false;
+    const bool mfg = (zcl[0] & 0x04) != 0;
+    const uint8_t n = mfg ? 5 : 3;
+    if (len < n) return false;
+    out->fc               = zcl[0];
+    out->cluster_specific = (zcl[0] & 0x03) == 0x01;
+    out->mfg              = mfg;
+    out->mfg_code         = mfg ? static_cast<uint16_t>(zcl[1] | (zcl[2] << 8)) : 0;
+    out->tsn              = zcl[n - 2];
+    out->cmd              = zcl[n - 1];
+    out->hdr_len          = n;
+    return true;
+}
+
 }  // namespace zhc_zcl

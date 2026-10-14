@@ -148,6 +148,31 @@ int main() {
     expect_eq("read_attributes refuses a short buffer",
               (long)read_attributes(b, 4, 1, (const uint8_t*)"\x01\x00", 1, 0x115F), 0);
 
+    // ── parse_header: incoming frames, every length up to a full mfg header.
+    // A cluster-specific frame with the manufacturer bit needs 5 bytes; the
+    // 3-byte {0x05,0,0} once had its TSN read from zcl[3], past the frame.
+    Header h{};
+    const uint8_t mfg_cmd[] = {0x05, 0x34, 0x12, 0x07, 0x01};
+    for (uint16_t n = 0; n < 5; n++)
+        expect_eq("parse_header rejects a mfg frame shorter than 5", parse_header(mfg_cmd, n, &h), false);
+    expect_eq("parse_header mfg frame",        parse_header(mfg_cmd, 5, &h), true);
+    expect_eq("  mfg",        h.mfg, true);
+    expect_eq("  mfg code",   h.mfg_code, 0x1234);
+    expect_eq("  tsn",        h.tsn, 0x07);
+    expect_eq("  cmd",        h.cmd, 0x01);
+    expect_eq("  cluster cmd", h.cluster_specific, true);
+    expect_eq("  hdr_len",    h.hdr_len, 5);
+    const uint8_t plain[] = {0x18, 0x2A, 0x0A};
+    for (uint16_t n = 0; n < 3; n++)
+        expect_eq("parse_header rejects a frame shorter than 3", parse_header(plain, n, &h), false);
+    expect_eq("parse_header plain frame",      parse_header(plain, 3, &h), true);
+    expect_eq("  mfg",        h.mfg, false);
+    expect_eq("  tsn",        h.tsn, 0x2A);
+    expect_eq("  cmd",        h.cmd, 0x0A);
+    expect_eq("  profile-wide", h.cluster_specific, false);
+    expect_eq("  hdr_len",    h.hdr_len, 3);
+    expect_eq("parse_header rejects null",     parse_header(nullptr, 5, &h), false);
+
     if (g_fail) {
         std::printf("\n%d FAILURE(S)\n", g_fail);
         return 1;
