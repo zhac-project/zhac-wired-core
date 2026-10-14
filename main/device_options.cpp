@@ -150,9 +150,15 @@ size_t device_options_get_json(uint64_t ieee, char* out, size_t cap) {
 // once. The owner is found among the devices in the pool; a key two devices
 // shared cannot be told apart and is dropped, as is one of a device that is
 // gone (restoring it made up a phantom device).
-static void migrate_old_keys(nvs_handle_t h) {
+//
+// Runs on app_main, whose stack is 4 KB: every buffer here is static (one
+// boot-time pass, never re-entered) and the function is kept out of line so
+// its frame exists only while it runs. With the key list on the stack the
+// first boot that had something to move overflowed the main task.
+__attribute__((noinline)) static void migrate_old_keys(nvs_handle_t h) {
     constexpr int kMaxOld = 32;
-    char old_keys[kMaxOld][16];
+    static char old_keys[kMaxOld][16];
+    static char blob[192];
     int n_old = 0;
     nvs_iterator_t it = nullptr;
     esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, kNamespace, NVS_TYPE_STR, &it);
@@ -179,7 +185,6 @@ static void migrate_old_keys(nvs_handle_t h) {
         uint64_t owner = 0;
         const int found = opt_old_key_owner(old_keys[i], known, n_known, &owner);
         if (found < 0) continue;   // not an old options key: leave it alone
-        char blob[192];
         size_t sz = sizeof(blob);
         if (found == 1 && nvs_get_str(h, old_keys[i], blob, &sz) == ESP_OK) {
             char key[16];

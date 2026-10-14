@@ -369,7 +369,8 @@ extern "C" void app_main() {
     Event boot_ev{};
     boot_ev.type = EventType::CTRL_BOOT;
     event_bus_publish(boot_ev);
-    ESP_LOGI(TAG, "boot event sent");
+    ESP_LOGI(TAG, "boot event sent (main stack: %u B never used)",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 
     int tick = 0;
     while (true) {

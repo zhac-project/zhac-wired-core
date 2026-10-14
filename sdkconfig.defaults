@@ -39,7 +39,10 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_FREERTOS_ISR_STACKSIZE=4192
 # Renamed in IDF v6.0 (was CONFIG_MAIN_TASK_STACK_SIZE; kconfgen still
 # auto-replaces the old name, but only with an `info:` line nobody reads).
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=4192
+# app_main runs the whole boot (radio, stores, Lua, network) and then the
+# forever loop; 4192 B overflowed once the options restore grew by ~500 B,
+# with the radio up (2026-10-14). The boot log reports what is left.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
 # --- Memory -----------------------------------------------------------------
 # PSRAM is mandatory in this firmware -- the device pool, the log ring and the
