@@ -61,6 +61,14 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **Turning sign-in on signs out browsers that were let in without it** (`main/auth.cpp`, review F02): a WebSocket opened while sign-in was off kept full access (settings, devices, scripts, updates) after the owner turned sign-in on. Turning it on now signs every such socket out; the web UI shows the login. Saving "on" again changes nothing. Host check: `sh test/host/auth/run.sh`.
+
+- **`System#Boot` rules and `zhac.on_boot` scripts run** (`main/main.cpp`, review F23): nothing on the wired hub sent the boot event, so neither ever fired. It is sent once per boot, after the event pump starts and after the scripts' load pass is queued (same Lua queue, so `on_boot` handlers register first). The boot log shows `boot event sent`.
+
+- **A short manufacturer-specific frame is no longer read past its end** (`esp_zigbee_backend`, review F01): a 3-byte cluster command with the manufacturer bit had its TSN read from byte 4 by the retry filter. Every incoming-frame helper (retry filter, Default Response, genTime reply) now reads the header through one `zhc_zcl::parse_header()` that needs 5 bytes for a manufacturer frame; host-tested for every length 0–5.
+
+- **Lua attribute handlers get the right value types** (zhac-main-core `lua_engine`, review F03): `zhac.on_attr_change` handlers received a number as `true`, `false` as an empty string (which Lua treats as true) and a text value as a number. They now get numbers, booleans and strings; a decimal value stays the raw ×100 integer, as in rules.
+
 - **Saving one device option no longer forgets the others** (`main/device_options.cpp`): the web UI saves one option per call, and the store kept only the last call's JSON, so after a reboot only the last-saved option was re-applied from it (the shadow's own flash copy hid this for the older options). The call is now merged into the stored options.
 
 - **HOBEIAN ZG-204Z keep_time / sensitivity can be set** (embedded-zhc): written as UINT8 like zigbee2mqtt (was ENUM8, which the sensor refused), with a picker of 30/60/120 s and low/medium/high instead of a text box; the same for the Fantem ZB003-X. A written text value such as keep_time "60" now shows at once (zhac-components `device_cmd`), since a battery PIR never reports it by itself. The sensor sleeps: the hub sends the write again as soon as it next wakes, so wave at it after pressing Set.
