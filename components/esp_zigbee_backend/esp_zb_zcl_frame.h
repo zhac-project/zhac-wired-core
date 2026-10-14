@@ -175,4 +175,26 @@ inline bool parse_header(const uint8_t* zcl, size_t len, Header* out) {
     return true;
 }
 
+// IAS Zone (0x0500) enrollment, the ZNP path's handshake (zigbee_mgr.cpp
+// zcl_maybe_respond_ias_enroll): a sensor that is not enrolled sends Zone
+// Enroll Request (cluster command 0x01) and stays silent until it gets a Zone
+// Enroll Response; a few also want IAS_CIE_Address (0x0010) written first.
+inline bool is_zone_enroll_request(uint16_t cluster, const uint8_t* zcl, size_t len) {
+    Header h;
+    return cluster == 0x0500 && parse_header(zcl, len, &h) && h.cluster_specific && h.cmd == 0x01;
+}
+
+// Zone Enroll Response (cmd 0x00): [code 0x00 = success, zone id].
+inline size_t zone_enroll_response(uint8_t* buf, size_t cap, uint8_t tsn, uint8_t zone_id) {
+    const uint8_t payload[] = {0x00, zone_id};
+    return cluster_command(buf, cap, tsn, 0x00, payload, sizeof(payload), 0);
+}
+
+// Write IAS_CIE_Address (attr 0x0010, type 0xF0 IEEE address, little-endian).
+inline size_t write_cie_address(uint8_t* buf, size_t cap, uint8_t tsn, uint64_t ieee) {
+    uint8_t le[8];
+    for (int i = 0; i < 8; i++) le[i] = static_cast<uint8_t>(ieee >> (i * 8));
+    return write_attribute(buf, cap, tsn, 0x0010, 0xF0, le, sizeof(le), 0);
+}
+
 }  // namespace zhc_zcl

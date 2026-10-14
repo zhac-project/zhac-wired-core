@@ -306,6 +306,26 @@ static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16
     esp_zb_af_send(nwk, src_ep ? src_ep : 1, cluster, out, n);
 }
 
+// IAS Zone auto-enroll, as the ZNP path does (zigbee_mgr.cpp
+// zcl_maybe_respond_ias_enroll): a motion/contact/leak sensor that is not
+// enrolled sends Zone Enroll Request and reports nothing until it is answered.
+// IAS_CIE_Address goes first for the few (Develco, Heiman) that insist on it;
+// writing it again is harmless. True when the frame was such a request.
+static bool respond_ias_enroll(uint16_t nwk, uint8_t src_ep, uint16_t cluster,
+                               const uint8_t* zcl, uint16_t len) {
+    if (nwk == 0 || !zhc_zcl::is_zone_enroll_request(cluster, zcl, len)) return false;
+    const uint8_t ep = src_ep ? src_ep : 1;
+    uint8_t f[16];
+    if (const uint64_t coord = zigbee_mgr_coordinator_ieee()) {
+        const size_t n = zhc_zcl::write_cie_address(f, sizeof(f), zcl_seq_next(), coord);
+        esp_zb_af_send(nwk, ep, 0x0500, f, n);
+    }
+    const size_t n = zhc_zcl::zone_enroll_response(f, sizeof(f), zcl_seq_next(), 0x00);
+    const bool ok = esp_zb_af_send(nwk, ep, 0x0500, f, n);
+    ESP_LOGI(TAG, "ias_zone enroll: nwk=0x%04x ep=%u %s", nwk, ep, ok ? "responded" : "response NOT sent");
+    return true;
+}
+
 // An identical cluster-specific command (same source, cluster, TSN) inside
 // 1.5 s is the device's retry, not a second press.
 static bool zcl_is_retry(uint16_t nwk, uint16_t cluster, const uint8_t* zcl, uint16_t len) {
@@ -406,6 +426,10 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
         respond_gen_time(nwk, ind->src_endpoint, ind->asdu, ind->asdu_length);
     }
     if (group_id == 0) {
+        // An enroll request is answered by the Enroll Response, not a Default
+        // Response, and carries nothing to decode (ZNP path: same).
+        if (respond_ias_enroll(nwk, ind->src_endpoint, ind->cluster_id, ind->asdu, ind->asdu_length))
+            return false;
         send_default_response_if_needed(nwk, ind->src_endpoint, ind->cluster_id, ind->asdu, ind->asdu_length);
         if (zcl_is_retry(nwk, ind->cluster_id, ind->asdu, ind->asdu_length)) {
             ESP_LOGD(TAG, "retry of a command from nwk 0x%04x cluster 0x%04x dropped", nwk, ind->cluster_id);

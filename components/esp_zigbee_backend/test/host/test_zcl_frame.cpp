@@ -173,6 +173,22 @@ int main() {
     expect_eq("  hdr_len",    h.hdr_len, 3);
     expect_eq("parse_header rejects null",     parse_header(nullptr, 5, &h), false);
 
+    // ── IAS Zone enrollment (cluster 0x0500), as the ZNP path answers it
+    const uint8_t enroll_req[] = {0x09, 0x33, 0x01, 0x0D, 0x00, 0x00, 0x00};  // S->C, tsn 0x33, Zone Enroll Request
+    expect_eq("is_zone_enroll_request",          is_zone_enroll_request(0x0500, enroll_req, sizeof(enroll_req)), true);
+    expect_eq("  not on another cluster",        is_zone_enroll_request(0x0006, enroll_req, sizeof(enroll_req)), false);
+    const uint8_t status_note[] = {0x09, 0x34, 0x00, 0x01, 0x00};             // Zone Status Change Notification
+    expect_eq("  not a status notification",     is_zone_enroll_request(0x0500, status_note, sizeof(status_note)), false);
+    const uint8_t read_rsp[] = {0x18, 0x35, 0x01};                            // profile-wide cmd 0x01
+    expect_eq("  not a profile-wide command 1",  is_zone_enroll_request(0x0500, read_rsp, sizeof(read_rsp)), false);
+    expect_eq("  not a truncated frame",         is_zone_enroll_request(0x0500, enroll_req, 2), false);
+
+    size_t n = zone_enroll_response(b, sizeof(b), 0x40, 0x00);
+    expect_bytes("zone_enroll_response success, zone 0", b, n, {0x01, 0x40, 0x00, 0x00, 0x00});
+    n = write_cie_address(b, sizeof(b), 0x41, 0x30EDA0FFFEF43DD6ull);
+    expect_bytes("write IAS_CIE_Address", b, n,
+                 {0x00, 0x41, 0x02, 0x10, 0x00, 0xF0, 0xD6, 0x3D, 0xF4, 0xFE, 0xFF, 0xA0, 0xED, 0x30});
+
     if (g_fail) {
         std::printf("\n%d FAILURE(S)\n", g_fail);
         return 1;
