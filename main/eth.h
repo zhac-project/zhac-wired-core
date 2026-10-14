@@ -33,4 +33,8 @@ struct NetStatus {
 };
 void eth_get_status(NetStatus* out);
 
+// Restore the public fallback time server after a DHCP renewal dropped it
+// (review F36). Cheap; call every few minutes.
+void eth_ntp_reconcile();
+
 bool eth_link_up();

@@ -112,8 +112,10 @@ bool grp_save(const GrpRecord& r) {
     if (err == ESP_OK) {
         uint32_t bmp = grp_get_bmp(h);
         bmp |= (1u << (r.id - 1));
-        nvs_set_u32(h, "bmp", bmp);
-        err = nvs_commit(h);
+        // The bitmap is what lists and allocates groups: a record it does not
+        // mark is invisible and its id would be handed out again (review F25).
+        err = nvs_set_u32(h, "bmp", bmp);
+        if (err == ESP_OK) err = nvs_commit(h);
     }
     nvs_close(h);
     return err == ESP_OK;

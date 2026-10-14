@@ -84,7 +84,6 @@
 #include "zhc_adapter.h"
 #include "zigbee_diagnostics.h"
 
-extern "C" void lua_engine_rules_hook_install(void);
 extern "C" void metrics_mqtt_publisher_start();   // metrics_mqtt.cpp
 
 #include <cinttypes>
@@ -261,10 +260,12 @@ extern "C" void app_main() {
     });
     const bool lua_ok = lua_engine_init();
     heap_mark("lua");
+    // lua_engine_init() installs the rules' script.run hook itself when it
+    // succeeds. Installing it after a failure sent rule actions to a scheduler
+    // that does not exist (review F27).
     if (!lua_ok) {
         ESP_LOGW(TAG, "lua_engine_init returned false -- scripts disabled");
     }
-    lua_engine_rules_hook_install();
 
     // ── Network ──────────────────────────────────────────────────────
     eth_start();
@@ -373,6 +374,7 @@ extern "C" void app_main() {
     int tick = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
+        if (tick % 30 == 29) eth_ntp_reconcile();   // every 5 min
         NetStatus net{};
         eth_get_status(&net);
         ESP_LOGI(TAG,

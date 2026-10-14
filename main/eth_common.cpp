@@ -21,6 +21,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "ntp_cfg.h"
 #include "sdkconfig.h"
 
@@ -90,10 +91,19 @@ static void on_got_ip(void*, esp_event_base_t, int32_t, void* data) {
     // No RTC on these boards, so the clock starts at 1970 until SNTP sets it.
     // Device "last seen", cron rules and the timezone setting all need it.
     // ntp_cfg owns the server (the public default, or a local one from
-    // Settings for a network without internet access).
-    static bool s_sntp_started = false;
-    if (!s_sntp_started) {
-        s_sntp_started = true;
+    // Settings for a network without internet access). On EVERY address, as
+    // its contract says: each DHCP lease rewrites the server list and drops
+    // the public fallback, and a once-only start lost it for good (review
+    // F36). Renewals that keep the address raise no event: eth_ntp_reconcile().
+    ntp_cfg_start();
+}
+
+void eth_ntp_reconcile() {
+    // lwIP puts the router's time server at slot 0 and clears slot 1 -- the
+    // public fallback -- on every DHCP ACK, renewals included. Put it back.
+    char router[48];
+    if (s_has_ip && ntp_cfg_dhcp_server(router, sizeof(router)) && !esp_sntp_getservername(1)) {
+        ESP_LOGI(TAG, "DHCP renewal dropped the fallback time server -- restoring it");
         ntp_cfg_start();
     }
 }

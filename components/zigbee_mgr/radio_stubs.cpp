@@ -60,6 +60,21 @@ bool zigbee_interview_trigger(uint64_t /*ieee*/) { return no_radio("interview_tr
 
 bool zigbee_force_recommission() { return no_radio("force_recommission"); }
 
+// Native ZCL group membership (ws_bridge's device group ops call these
+// unconditionally; without them CONFIG_ZHAC_ESP_ZIGBEE=n did not link --
+// review F35).
+bool zigbee_zcl_group_add(uint16_t /*nwk_addr*/, uint8_t /*ep*/, uint16_t /*group_id*/) {
+    return no_radio("zcl_group_add");
+}
+bool zigbee_zcl_group_remove(uint16_t /*nwk_addr*/, uint8_t /*ep*/, uint16_t /*group_id*/) {
+    return no_radio("zcl_group_remove");
+}
+bool zigbee_zcl_get_group_membership(uint16_t /*nwk_addr*/, uint8_t /*ep*/, uint16_t* /*out_gids*/,
+                                     uint8_t /*max*/, uint8_t* out_count) {
+    if (out_count) *out_count = 0;
+    return no_radio("zcl_get_group_membership");
+}
+
 // Zero rather than a fabricated address: callers format this as the
 // coordinator's IEEE, and an invented value would look like a real device.
 uint64_t zigbee_mgr_coordinator_ieee() { return 0; }
