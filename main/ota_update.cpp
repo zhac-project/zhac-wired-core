@@ -4,10 +4,13 @@
 // ota_update.cpp — see ota_update.h. Mirrors net-core's task_ota (S3 side of
 // the dual-chip build), with target "self".
 #include "ota_update.h"
+#include "ota_redirect.h"
 
 #include <cstdio>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <strings.h>
 
 #include "ArduinoJson.h"
 #include "esp_crt_bundle.h"
@@ -95,9 +98,16 @@ void health_tick(void*) {
     s_health_ticks++;
     const char* why = health_problem();
     if (!why) {
-        if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
-            ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK",
-                     s_health_ticks * kHealthTickS);
+        // Only a saved verdict counts: if the boot metadata write fails the
+        // bootloader still rolls back at the next reboot, so stay "pending"
+        // and try again next tick (review F32).
+        const esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "could not mark the running image valid (%s) -- retrying", esp_err_to_name(e));
+            return;
+        }
+        ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK",
+                 s_health_ticks * kHealthTickS);
         s_state = "verified";
         nvs_put_str(kNvsRollback, nullptr);
         esp_timer_stop(s_health_timer);
@@ -127,21 +137,82 @@ void event(const char* name, bool has_ok, bool ok, int offset, int total, const 
     ws_push(name, d);
 }
 
+// One request, headers only, redirects off: the HTTP status, and for a 3xx
+// the absolute target (the client resolves a relative Location). Negative when
+// the server cannot be reached.
+int fetch_hop(const char* url, char* next, size_t cap) {
+    esp_http_client_config_t c{};
+    c.url = url;
+    c.crt_bundle_attach = esp_crt_bundle_attach;
+    c.disable_auto_redirect = true;
+    c.buffer_size_tx = 2048;   // a signed URL in the request line, as below
+    esp_http_client_handle_t cl = esp_http_client_init(&c);
+    if (!cl) return -1;
+    int status = -1;
+    if (esp_http_client_open(cl, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(cl);
+        status = esp_http_client_get_status_code(cl);
+        if (status <= 0) status = -1;
+        else if (ota_is_redirect(status) &&
+                 (esp_http_client_set_redirection(cl) != ESP_OK ||
+                  esp_http_client_get_url(cl, next, static_cast<int>(cap)) != ESP_OK))
+            status = -1;
+    }
+    esp_http_client_cleanup(cl);
+    return status;
+}
+
+// Set if the download itself meets a redirect after ota_resolve_redirects
+// found none: the image is then not taken.
+volatile bool s_late_redirect = false;
+esp_err_t on_http_event(esp_http_client_event_t* e) {
+    if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && strcasecmp(e->header_key, "Location") == 0)
+        s_late_redirect = true;
+    return ESP_OK;
+}
+
 void run(const char* url) {
+    event("ota.start", false, false, 0, 0, nullptr);
+    // Where the image really is: every redirect on https://, a bounded number
+    // of them (ota_redirect.h, review F09/F33). The download asks there directly.
+    constexpr size_t kUrlMax = 1536;
+    char* final_url = static_cast<char*>(malloc(2 * kUrlMax));
+    if (!final_url) {
+        event("ota.complete", true, false, 0, 0, "not enough memory to start the update");
+        return;
+    }
+    const OtaResolve r = ota_resolve_redirects(url, final_url, final_url + kUrlMax, kUrlMax, fetch_hop);
+    if (r != OtaResolve::OK) {
+        const char* why = r == OtaResolve::INSECURE ? "the update server redirected to an insecure http:// address"
+                        : r == OtaResolve::TOO_MANY ? "the update server redirected too many times"
+                        : "the update server could not be reached";
+        ESP_LOGE(TAG, "update refused: %s", why);
+        event("ota.complete", true, false, 0, 0, why);
+        free(final_url);
+        return;
+    }
+
     esp_http_client_config_t http{};
-    http.url = url;
+    http.url = final_url;
     http.crt_bundle_attach = esp_crt_bundle_attach;   // verify the server
     http.keep_alive_enable = true;
-    http.max_redirection_count = 5;                   // GitHub release assets redirect
-    // ...to a signed URL of ~950 chars; the request line must fit the TX buffer
-    // (default 512, "Out of buffer").
+    // The signed URL GitHub redirects to is ~950 chars; the request line must
+    // fit the TX buffer (default 512, "Out of buffer").
     http.buffer_size_tx = 2048;
+    http.event_handler = on_http_event;
     esp_https_ota_config_t cfg{};
     cfg.http_config = &http;
 
-    event("ota.start", false, false, 0, 0, nullptr);
+    s_late_redirect = false;
     esp_https_ota_handle_t h = nullptr;
     esp_err_t ret = esp_https_ota_begin(&cfg, &h);
+    free(final_url);                        // the client keeps its own copy
+    if (ret == ESP_OK && h && s_late_redirect) {
+        esp_https_ota_abort(h);
+        ESP_LOGE(TAG, "update refused: the download was redirected again");
+        event("ota.complete", true, false, 0, 0, "the update server redirected the download");
+        return;
+    }
     if (ret != ESP_OK || !h) {
         ESP_LOGE(TAG, "begin failed: %s", esp_err_to_name(ret));
         event("ota.complete", true, false, 0, 0, esp_err_to_name(ret));
