@@ -13,6 +13,7 @@
 // On parse error, the response includes the dsl_parser-formatted
 // message in `err` so the SPA can show what the user mistyped.
 #include "auth.h"
+#include "http_body.h"
 #include "api_rules.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -98,7 +99,7 @@ static esp_err_t handle_get_rules(httpd_req_t* req) {
 // ── POST /api/rules — create ────────────────────────────────────────────
 static esp_err_t handle_post_rules(httpd_req_t* req) {
     char body[640];
-    int n = httpd_req_recv(req, body, sizeof(body) - 1);
+    int n = http_read_body(req, body, sizeof(body));
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
     body[n] = '\0';
 
@@ -141,7 +142,7 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
     // /api/rules/<id>/enable  → POST {"enabled":bool}
     if (req->method == HTTP_POST && uri_ends_with(uri, "/enable")) {
         char body[64];
-        int n = httpd_req_recv(req, body, sizeof(body) - 1);
+        int n = http_read_body(req, body, sizeof(body));
         if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
         body[n] = '\0';
         JsonDocument doc;
@@ -159,7 +160,7 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
     // PUT /api/rules/<id>
     if (req->method == HTTP_PUT) {
         char body[640];
-        int n = httpd_req_recv(req, body, sizeof(body) - 1);
+        int n = http_read_body(req, body, sizeof(body));
         if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
         body[n] = '\0';
         JsonDocument doc;

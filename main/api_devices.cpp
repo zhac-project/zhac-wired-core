@@ -10,6 +10,7 @@
 // All direct in-process calls. No HAP, no roundtrip. JSON I/O via
 // ArduinoJson against bounded buffers.
 #include "auth.h"
+#include "http_body.h"
 #include "api_devices.h"
 #include "device_options.h"
 #include "esp_http_server.h"
@@ -153,7 +154,7 @@ static esp_err_t handle_get_devices(httpd_req_t* req) {
 // since they never re-join. The SPA "Reinterview" button hits this.
 static esp_err_t handle_device_reinterview(httpd_req_t* req) {
     char buf[64];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;
@@ -193,7 +194,7 @@ static esp_err_t handle_device_reinterview(httpd_req_t* req) {
 // must already be cached from the original join.
 static esp_err_t handle_device_configure(httpd_req_t* req) {
     char buf[64];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;
@@ -249,7 +250,7 @@ static esp_err_t handle_device_configure(httpd_req_t* req) {
 // Body: {"duration": 60}. Range checked against Zigbee spec (0–254).
 static esp_err_t handle_permit_join(httpd_req_t* req) {
     char buf[64];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;
@@ -288,7 +289,7 @@ static esp_err_t handle_permit_join(httpd_req_t* req) {
 // color_temp, …) accept their full range.
 static esp_err_t handle_device_state(httpd_req_t* req) {
     char buf[256];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;
@@ -335,7 +336,7 @@ static esp_err_t handle_device_state(httpd_req_t* req) {
 // hop) and persisted to NVS so they survive reboot.
 static esp_err_t handle_device_options(httpd_req_t* req) {
     char buf[256];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #include "auth.h"
+#include "http_body.h"
 #include "api_groups.h"
 
 #include <cstdio>
@@ -157,10 +158,7 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
 // ── REST wrappers ───────────────────────────────────────────────────────────
 
 static int recv_body(httpd_req_t* req, char* buf, size_t cap) {
-    int n = httpd_req_recv(req, buf, cap - 1);
-    if (n < 0) return -1;
-    buf[n] = '\0';
-    return n;
+    return http_read_body(req, buf, cap);   // the whole body or -1 (review F29)
 }
 
 static esp_err_t h_group_list(httpd_req_t* req) {

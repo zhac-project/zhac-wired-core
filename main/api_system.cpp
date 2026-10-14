@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #include "auth.h"
+#include "http_body.h"
 #include "api_system.h"
 
 #include <cinttypes>
@@ -97,7 +98,7 @@ size_t system_diagnostics_json(char* out, size_t cap) {
 
 static esp_err_t handle_settings_set(httpd_req_t* req) {
     char buf[512];
-    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    int n = http_read_body(req, buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_FAIL;

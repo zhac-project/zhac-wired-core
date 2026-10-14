@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #include "auth.h"
+#include "http_body.h"
 #include "api_remote.h"
 #include "sdkconfig.h"
 
@@ -72,7 +73,7 @@ static esp_err_t h_status(httpd_req_t* req) {
 
 static esp_err_t h_connect(httpd_req_t* req) {
     char body[512];   // room for an over-long value to reach the length checks
-    int n = httpd_req_recv(req, body, sizeof(body) - 1);
+    int n = http_read_body(req, body, sizeof(body));
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
     body[n] = '\0';
     httpd_resp_set_type(req, "application/json");
@@ -85,7 +86,7 @@ static esp_err_t h_connect(httpd_req_t* req) {
 
 static esp_err_t h_disconnect(httpd_req_t* req) {
     char body[64];
-    int n = httpd_req_recv(req, body, sizeof(body) - 1);
+    int n = http_read_body(req, body, sizeof(body));
     if (n < 0) n = 0;
     body[n] = '\0';
     bool forget = false;
