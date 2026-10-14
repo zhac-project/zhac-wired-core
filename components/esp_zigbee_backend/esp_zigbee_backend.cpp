@@ -673,6 +673,17 @@ static void coordinator_address_remember() {
 // there forever with no PAN, and ezb_bdb_open_network() fails with no log of
 // its own -- which is exactly how this surfaced: REST returned
 // "500 permit_join failed" while the boot log looked perfectly healthy.
+
+// BDB completion signals carry a status; only SUCCESS means there is a
+// network. Formation or a resume that failed used to count as formed, and the
+// readiness fast path then skipped the PAN check (review F12).
+static bool bdb_signal_ok(const ezb_app_signal_t* sig, const char* what) {
+    const auto* p = static_cast<const ezb_bdb_signal_simple_params_t*>(ezb_app_signal_get_params(sig));
+    if (p && p->status == EZB_BDB_STATUS_SUCCESS) return true;
+    ESP_LOGE(TAG, "%s failed: bdb status %u", what, p ? (unsigned)p->status : 0xFFu);
+    return false;
+}
+
 static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     if (!app_signal) return false;
     const ezb_app_signal_type_t sig = ezb_app_signal_get_type(app_signal);
@@ -693,6 +704,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     case EZB_BDB_SIGNAL_DEVICE_REBOOT:
         // Dataset already held a network and the stack came back up on it.
         // No formation needed; joined devices keep their addresses.
+        if (!bdb_signal_ok(app_signal, "resuming the network")) return true;
         s_formed = true;
         coordinator_address_remember();
         ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
@@ -701,6 +713,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         return true;
 
     case EZB_BDB_SIGNAL_FORMATION:
+        if (!bdb_signal_ok(app_signal, "network formation")) return true;
         s_formed = true;
         coordinator_address_remember();
         spawn_group_join_task();   // first formation of this network
@@ -724,13 +737,20 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         return true;
     }
 
-    case EZB_ZDO_SIGNAL_LEAVE:
+    case EZB_ZDO_SIGNAL_LEAVE: {
+        // This coordinator left the network. The payload is only the leave
+        // type -- reading it as a LEAVE_INDICATION took unrelated bytes for a
+        // device to remove (review F11). There is no PAN now: readiness must
+        // say so (permit join, OTA health) instead of trusting s_formed.
+        const auto* p = static_cast<const ezb_zdo_signal_leave_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        s_formed = false;
+        ESP_LOGE(TAG, "the coordinator left the network (leave type %u)", p ? (unsigned)p->leave_type : 0xFFu);
+        return true;
+    }
+
     case EZB_ZDO_SIGNAL_LEAVE_INDICATION: {
-        // Both carry the same params struct. LEAVE is this device being told
-        // to leave; LEAVE_INDICATION is a child/neighbour announcing it left.
-        // For a coordinator only the latter is expected, but handling both
-        // means a stack that reclassifies the event cannot silently strand a
-        // device in the pool as permanently present.
+        // A child or neighbour announced that it left.
         const auto* p = static_cast<const ezb_zdo_signal_leave_indication_params_t*>(
             ezb_app_signal_get_params(app_signal));
         if (p) {
@@ -936,13 +956,17 @@ static bool zb_init() {
         return false;
     }
 
+    // Running before the task exists: the task (higher priority) can run
+    // and, if the mainloop returns at once, clear s_running before this
+    // function resumes -- setting it afterwards reported a radio with no live
+    // task (review F12).
+    s_running = true;
     if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
                     nullptr, 5, nullptr) != pdPASS) {
+        s_running = false;
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
         return false;
     }
-
-    s_running = true;
 
     // Wait for autostart to produce a PAN, then form explicitly if it did not.
     //
