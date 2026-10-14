@@ -330,6 +330,7 @@ bool auth_storage_error() { return s_storage_error; }
 bool auth_password_is_set() { return s_pw_set; }
 
 void auth_set_enabled(bool en) {
+    const bool was = s_enabled;
     s_enabled = en;
     nvs_handle_t h;
     if (nvs_open("zhac_auth", NVS_READWRITE, &h) == ESP_OK) {
@@ -338,6 +339,9 @@ void auth_set_enabled(bool en) {
         nvs_close(h);
     }
     ws_server_set_api_token(en ? s_token : nullptr);
+    // Sockets opened while sign-in was off were let in without a token; the
+    // dispatcher trusts that flag, so they must sign in like everyone else.
+    if (en && !was) ws_server_fd_deauth_all();
     ESP_LOGW(TAG, "API auth %s", en ? "enabled" : "DISABLED -- anyone on the LAN has full access");
 }
 
