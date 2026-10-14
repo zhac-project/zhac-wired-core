@@ -1150,28 +1150,14 @@ static void cmd_alerts_get(int fd, uint32_t id) {
     ws_server_reply(fd, buf, (size_t)n);
 }
 
-// ── zigbee.* (config persist + factory reset) ─────────────────────────
-static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& doc) {
-    nvs_handle_t h;
-    if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) != ESP_OK) { send_err(fd, id, "nvs"); return; }
-    if (doc["args"]["channel"].is<int>())
-        nvs_set_u8(h, "channel", (uint8_t)doc["args"]["channel"].as<int>());
-    if (doc["args"]["regenerate"] | false) {
-        uint8_t k[16]; esp_fill_random(k, sizeof(k)); nvs_set_blob(h, "net_key", k, sizeof(k));
-    } else if (doc["args"]["net_key_hex"].is<const char*>()) {
-        const char* hx = doc["args"]["net_key_hex"];
-        if (std::strlen(hx) >= 32) {
-            uint8_t k[16];
-            for (int i = 0; i < 16; i++) {
-                char b[3] = {hx[i * 2], hx[i * 2 + 1], 0};
-                k[i] = (uint8_t)strtoul(b, nullptr, 16);
-            }
-            nvs_set_blob(h, "net_key", k, sizeof(k));
-        }
-    }
-    bool ok = (nvs_commit(h) == ESP_OK);
-    nvs_close(h);
-    reply_ok_or_err(fd, id, ok, "nvs commit");   // applies on next zigbee.reset
+// ── zigbee.* (network settings + factory reset) ───────────────────────
+// This backend keeps its network in the esp-zigbee dataset and a build-time
+// channel mask; it has no recommission yet. Saving channel/key settings
+// nobody reads, then answering "reset done" and rebooting with the network
+// untouched, told the owner something that did not happen (review F17). Both
+// are refused until they are implemented and checked on a board.
+static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) {
+    send_err(fd, id, "channel and network key settings are not available on this hub yet -- nothing was saved");
 }
 // Erase the hub's storage on the owner's explicit request -- the boot path
 // never does it by itself any more (see main.cpp). Gated like every command.
@@ -1185,7 +1171,10 @@ static void cmd_storage_reset(int fd, uint32_t id) {
 }
 
 static void cmd_zigbee_reset(int fd, uint32_t id) {
-    zigbee_force_recommission();   // wipe ZNP marker → fresh BDB network on reboot
+    if (!zigbee_force_recommission()) {
+        send_err(fd, id, "Zigbee network reset is not available on this hub yet -- nothing was changed");
+        return;
+    }
     reply_ok_or_err(fd, id, true, nullptr);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -1226,7 +1215,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     // own authentication.
     if (auth_enabled() && fd >= 0 && !ws_server_fd_is_authed(fd)) {
         const bool is_auth = std::strcmp(cmd, "auth") == 0;
-        if (is_auth && auth_check_token(doc["args"]["token"] | "")) {
+        if (is_auth && auth_check_token(doc["args"]["token"] | "", fd)) {
             ws_server_fd_set_authed(fd);
             reply_ok_or_err(fd, id, true, nullptr);
         } else {

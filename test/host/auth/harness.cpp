@@ -3,6 +3,7 @@
 //
 // Turning sign-in on must sign out every WebSocket that was let in while it was off (review F02):
 // those sockets never showed a token, and the dispatcher trusts the per-socket flag.
+// Wrong WebSocket tokens lock out the peer that sent them, not every new login (review F31).
 #include "auth.h"
 
 #include <cstring>
@@ -40,6 +41,14 @@ psa_status_t psa_crypto_init() { return PSA_SUCCESS; }
 psa_status_t psa_hash_compute(int, const uint8_t*, size_t, uint8_t*, size_t, size_t*) { return -1; }
 
 int httpd_req_to_sockfd(httpd_req_t*) { return -1; }
+// Socket fd -> peer IPv4, as getpeername() would report it (linked with --wrap=getpeername).
+extern "C" int __wrap_getpeername(int fd, struct sockaddr* sa, socklen_t* len) {
+    auto* in = reinterpret_cast<struct sockaddr_in*>(sa);
+    std::memset(sa, 0, *len);
+    in->sin_family = AF_INET;
+    in->sin_addr.s_addr = 0x0A000000u + static_cast<uint32_t>(fd);   // 10.0.0.<fd>
+    return 0;
+}
 esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, size_t) { return ESP_FAIL; }
 esp_err_t httpd_resp_set_status(httpd_req_t*, const char*) { return ESP_OK; }
 esp_err_t httpd_resp_set_type(httpd_req_t*, const char*) { return ESP_OK; }
@@ -67,11 +76,17 @@ int main() {
     auth_set_enabled(true);
     expect("turning sign-in on installs the token", g_ws_token.size() == 32);
     expect("turning sign-in on signs that socket out", !g_ws_socket_authed);
-    expect("a wrong token is still refused", !auth_check_token("00000000000000000000000000000000"));
+    expect("a wrong token is still refused", !auth_check_token("00000000000000000000000000000000", 5));
 
     g_ws_socket_authed = true;                    // it signed in with the token
     auth_set_enabled(true);                       // saving "on" again is no transition
     expect("saving on again keeps signed-in sockets", g_ws_socket_authed);
+
+    // One peer guessing must not lock out another peer's valid login.
+    const std::string good = g_ws_token;
+    for (int i = 0; i < 6; i++) auth_check_token("00000000000000000000000000000000", 7);
+    expect("the guessing peer is locked out", !auth_check_token(good.c_str(), 7));
+    expect("another peer still signs in", auth_check_token(good.c_str(), 8));
 
     auth_set_enabled(false);
     expect("turning sign-in off removes the token", g_ws_token.empty());

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Host check of main/auth.cpp: turning sign-in on signs out sockets that were let in while it was off.
+# Host check of main/auth.cpp: turning sign-in on signs out sockets that were let in while it was off
+# (review F02), and wrong WebSocket tokens lock out only the peer that sent them (F31).
 #   sh run.sh        build and run; exit code = number of mismatches
 # auth.cpp and auth.h are copied verbatim from main/; only their neighbours are stubs (stubs.h,
 # harness.cpp). Needs the sibling zhac-components checkout (ArduinoJson), g++ and PATH=/usr/bin first.
@@ -23,6 +24,6 @@ done
 cd "$W"
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++
 FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ"
-g++ $FLAGS auth.cpp harness.cpp -o harness
+g++ $FLAGS auth.cpp harness.cpp -Wl,--wrap=getpeername -o harness
 set +e
 ./harness

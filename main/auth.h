@@ -22,7 +22,7 @@ bool   auth_password_is_set();
 uint32_t auth_setup_secs_left();               // >0 only while setup is open (no password, hub booted < 10 min ago)
 size_t auth_token_copy(char* out, size_t cap);
 bool   auth_rotate_token(char* out, size_t cap); // out >= 33; deauths live WS clients
-bool   auth_check_token(const char* token);      // WS first-message auth
+bool   auth_check_token(const char* token, int fd);   // WS first-message auth; fd = the socket (failures lock out its peer)
 
 // Register a route that needs the API token while auth is on: answers 401
 // JSON instead of calling `u->handler`. Use for every route except the

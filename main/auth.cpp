@@ -46,8 +46,7 @@ SemaphoreHandle_t s_fail_mtx = nullptr;
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
-uint32_t peer_ipv4(httpd_req_t* req) {
-    const int fd = httpd_req_to_sockfd(req);
+uint32_t peer_ipv4_fd(int fd) {
     if (fd < 0) return 0;
     struct sockaddr_in6 sa;
     socklen_t sl = sizeof(sa);
@@ -57,6 +56,8 @@ uint32_t peer_ipv4(httpd_req_t* req) {
     memcpy(&k, &sa.sin6_addr.s6_addr[12], sizeof(k));
     return k;
 }
+
+uint32_t peer_ipv4(httpd_req_t* req) { return peer_ipv4_fd(httpd_req_to_sockfd(req)); }
 
 Bucket* bucket_find(uint32_t ip) {
     for (auto& b : s_buckets) if (b.last_use_ms != 0 && b.ip == ip) return &b;
@@ -366,10 +367,13 @@ bool auth_rotate_token(char* out, size_t cap) {
     return true;
 }
 
-bool auth_check_token(const char* token) {
+bool auth_check_token(const char* token, int fd) {
     if (!s_enabled) return true;
-    if (locked(0)) return false;   // WS path has no peer address: shared bucket
-    if (!token || strlen(token) != 32 || !token_matches(token)) { record_failure(0); return false; }
+    // Failures count against the socket's peer, as on REST: one shared bucket
+    // let any peer's five wrong guesses refuse everyone's valid token (review F31).
+    const uint32_t ip = peer_ipv4_fd(fd);
+    if (locked(ip)) return false;
+    if (!token || strlen(token) != 32 || !token_matches(token)) { record_failure(ip); return false; }
     return true;
 }
 
