@@ -362,6 +362,14 @@ extern "C" void app_main() {
         heap_mark("TaskEventBus");
     }
 
+    // Once per boot: System#Boot rules and zhac.on_boot scripts. After the
+    // pump starts and after the scripts' load pass is queued -- the Lua bridge
+    // feeds the same TaskLua queue, so scripts register before this arrives.
+    Event boot_ev{};
+    boot_ev.type = EventType::CTRL_BOOT;
+    event_bus_publish(boot_ev);
+    ESP_LOGI(TAG, "boot event sent");
+
     int tick = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
