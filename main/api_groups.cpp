@@ -9,10 +9,12 @@
 #include <cstring>
 
 #include "ArduinoJson.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "device_cmd.h"
 #include "device_cmd_json.h"
 #include "groups_store.h"
+#include "json_buf.h"
 #include "zhc_adapter.h"
 #include "zigbee_pool.h"
 
@@ -40,23 +42,30 @@ static void parse_members(const char* body, size_t len, GrpRecord& r) {
 
 // ── shared logic ────────────────────────────────────────────────────────────
 
+// 0 when the list does not fit `cap` (GRP_LIST_JSON_MAX always does): a
+// caller must never send a partial or overrun list (review F10).
 size_t group_list_json(char* out, size_t cap) {
     static GrpRecord all[GRP_MAX_GROUPS];
-    // Shared static buffer: hold the store lock across load + serialise so a
-    // concurrent group.list on another task cannot refill it mid-read.
+    static char row[GRP_JSON_MAX];
+    // Shared static buffers: hold the store lock across load + serialise so a
+    // concurrent group.list on another task cannot refill them mid-read.
     grp_store_lock();
-    uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
-    size_t pos = 0;
-    pos += snprintf(out + pos, cap - pos, "{\"groups\":[");
-    for (uint16_t i = 0; i < cnt && pos < cap; i++) {
-        if (i) out[pos++] = ',';
-        char tmp[256];
-        size_t n = grp_to_json(all[i], tmp, sizeof(tmp));
-        if (pos + n < cap) { memcpy(out + pos, tmp, n); pos += n; }
+    const uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
+    JsonWriter w(out, cap);
+    w.raw("{\"groups\":[");
+    bool first = true;
+    for (uint16_t i = 0; i < cnt; i++) {
+        const size_t n = grp_to_json(all[i], row, sizeof(row));
+        if (!n) continue;                  // cannot happen at GRP_JSON_MAX; never a bare comma
+        if (!first) w.ch(',');
+        w.raw(row, n);
+        first = false;
     }
-    pos += snprintf(out + pos, cap - pos, "]}");
+    w.raw("]}");
+    const size_t len = w.finish();
     grp_store_unlock();
-    return pos;
+    if (len < cap) out[len] = '\0';
+    return len;
 }
 
 bool group_create(const char* body, size_t len, char* out, size_t cap, size_t* n) {
@@ -66,9 +75,9 @@ bool group_create(const char* body, size_t len, char* out, size_t cap, size_t* n
     strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
     parse_members(body, len, r);
     if (!grp_create(r)) return false;   // id allocation + save under one lock
-    size_t w = grp_to_json(r, out, cap);
+    const size_t w = grp_to_json(r, out, cap);
     if (n) *n = w;
-    return true;
+    return w > 0;                       // out holds GRP_JSON_MAX: always fits
 }
 
 bool group_get(const char* body, size_t len, char* out, size_t cap, size_t* n) {
@@ -76,9 +85,9 @@ bool group_get(const char* body, size_t len, char* out, size_t cap, size_t* n) {
     if (len == 0 || deserializeJson(doc, body, len)) return false;
     GrpRecord r{};
     if (!grp_find(doc["id"] | (uint16_t)0, r)) return false;
-    size_t w = grp_to_json(r, out, cap);
+    const size_t w = grp_to_json(r, out, cap);
     if (n) *n = w;
-    return true;
+    return w > 0;
 }
 
 bool group_update(const char* body, size_t len, char* out, size_t cap, size_t* n) {
@@ -89,9 +98,9 @@ bool group_update(const char* body, size_t len, char* out, size_t cap, size_t* n
     if (!doc["name"].isNull())    strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
     if (!doc["members"].isNull()) parse_members(body, len, r);
     if (!grp_save(r)) return false;
-    size_t w = grp_to_json(r, out, cap);
+    const size_t w = grp_to_json(r, out, cap);
     if (n) *n = w;
-    return true;
+    return w > 0;
 }
 
 bool group_delete_req(const char* body, size_t len) {
@@ -108,12 +117,30 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
     if (!grp_find(doc["id"] | (uint16_t)0, r) || r.member_count == 0)
         return snprintf(out, cap, "{\"ok\":false,\"err\":\"not found\"}");
 
+    // The web UI's buttons send a ZCL command, {cluster, cmd}: On / Off /
+    // Toggle / Identify, as on the dual-chip hub (net-core api_group_cmd).
+    // Other callers send {key, val}. Both become the members' typed attribute
+    // set. A request with neither, or an unusable value, is refused: it used to
+    // become state = 0, so every button -- On included -- turned the group off
+    // (review F34).
     char key[24] = "state";
-    strncpy(key, doc["key"] | "state", sizeof(key) - 1);
-    // The collection's members get the same typed write as a single device
-    // (bool / integer / decimal / string), through the one attribute-set path.
     DevCmdValue val;
-    if (!device_cmd_value_from_json(doc["val"], &val)) val = device_cmd_int(0);
+    if (!doc["cmd"].isNull()) {
+        const uint16_t cluster = doc["cluster"] | (uint16_t)0;
+        const int      cmd     = doc["cmd"].is<int>() ? doc["cmd"].as<int>() : -1;
+        if (cluster == 0x0006 && cmd >= 0 && cmd <= 2) {
+            val = device_cmd_str(cmd == 1 ? "ON" : cmd == 0 ? "OFF" : "TOGGLE");
+        } else if (cluster == 0x0003 && cmd == 0) {
+            strcpy(key, "identify");
+            val = device_cmd_str("identify");
+        } else {
+            return snprintf(out, cap, "{\"ok\":false,\"err\":\"unsupported group command\"}");
+        }
+    } else {
+        strncpy(key, doc["key"] | "state", sizeof(key) - 1);
+        if (!device_cmd_value_from_json(doc["val"], &val))
+            return snprintf(out, cap, "{\"ok\":false,\"err\":\"val must be a boolean, number or string\"}");
+    }
 
     uint8_t sent = 0, failed = 0;
     for (uint8_t i = 0; i < r.member_count; i++) {
@@ -137,17 +164,24 @@ static int recv_body(httpd_req_t* req, char* buf, size_t cap) {
 }
 
 static esp_err_t h_group_list(httpd_req_t* req) {
-    char buf[4096];
-    size_t n = group_list_json(buf, sizeof(buf));
+    char* buf = static_cast<char*>(heap_caps_malloc(GRP_LIST_JSON_MAX, MALLOC_CAP_SPIRAM));
+    const size_t n = buf ? group_list_json(buf, GRP_LIST_JSON_MAX) : 0;
+    if (!n) {
+        heap_caps_free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "group list unavailable");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buf, n);
+    const esp_err_t e = httpd_resp_send(req, buf, n);
+    heap_caps_free(buf);
+    return e;
 }
 
 static esp_err_t h_group_create(httpd_req_t* req) {
     char buf[1024];
     int n = recv_body(req, buf, sizeof(buf));
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     httpd_resp_set_type(req, "application/json");
     if (!group_create(buf, n, rsp, sizeof(rsp), &rn)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "create failed");
@@ -160,7 +194,7 @@ static esp_err_t h_group_get(httpd_req_t* req) {
     char buf[256];
     int n = recv_body(req, buf, sizeof(buf));
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     httpd_resp_set_type(req, "application/json");
     if (!group_get(buf, n, rsp, sizeof(rsp), &rn)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such group");
@@ -173,7 +207,7 @@ static esp_err_t h_group_update(httpd_req_t* req) {
     char buf[1024];
     int n = recv_body(req, buf, sizeof(buf));
     if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_FAIL; }
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     httpd_resp_set_type(req, "application/json");
     if (!group_update(buf, n, rsp, sizeof(rsp), &rn)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such group");

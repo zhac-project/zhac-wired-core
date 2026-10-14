@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include "nvs.h"
 
@@ -10,6 +11,13 @@
 
 static constexpr uint8_t GRP_MAX_MEMBERS = 16;
 static constexpr uint8_t GRP_MAX_GROUPS  = 32;
+
+// Largest grp_to_json() output, NUL included: 16 members of
+// {"ieee":"0x0123456789ABCDEF","ep":255} (39 bytes with the comma), a 31-byte
+// name that is all \u00XX escapes (186), and the frame around them -- 850.
+// group_list_json() needs the lot for every group (review F10).
+static constexpr size_t GRP_JSON_MAX      = 1024;
+static constexpr size_t GRP_LIST_JSON_MAX = GRP_MAX_GROUPS * (GRP_JSON_MAX + 1) + 16;
 
 struct GrpMember { uint64_t ieee; uint8_t ep; };
 struct GrpRecord {

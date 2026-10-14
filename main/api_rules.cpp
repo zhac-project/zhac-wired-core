@@ -28,11 +28,22 @@
 static const char* TAG = "api_rules";
 
 // Pull a numeric id out of "/api/rules/<id>" or "/api/rules/<id>/enable".
-// Returns 0 on parse failure.
+// Exactly 1-5 digits worth 1-65535, then the end, '/' or a query; anything
+// else is 0 (not found). strtoul + a 16-bit cast let "65537" address rule 1
+// and accepted signs, spaces and trailing junk (review F34).
 static uint16_t parse_id_from_uri(const char* uri, const char* prefix) {
-    size_t pl = std::strlen(prefix);
+    const size_t pl = std::strlen(prefix);
     if (std::strncmp(uri, prefix, pl) != 0) return 0;
-    return (uint16_t)strtoul(uri + pl, nullptr, 10);
+    uint32_t id = 0;
+    const char* p = uri + pl;
+    int digits = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        if (++digits > 5) return 0;
+        id = id * 10 + static_cast<uint32_t>(*p - '0');
+    }
+    if (digits == 0 || id == 0 || id > 0xFFFF) return 0;
+    if (*p != '\0' && *p != '/' && *p != '?') return 0;
+    return static_cast<uint16_t>(id);
 }
 
 static bool uri_ends_with(const char* uri, const char* suffix) {

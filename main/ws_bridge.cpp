@@ -45,6 +45,7 @@
 #include "device_options.h"
 #include "api_system.h"
 #include "api_groups.h"
+#include "groups_store.h"
 #include "api_status.h"
 #include "auth.h"
 #include "ota_update.h"
@@ -246,43 +247,47 @@ static void cmd_diagnostics_unhandled(int fd, uint32_t id) {
 // ── group.* ───────────────────────────────────────────────────────────
 // Payloads nest under "group"/"groups" so they don't collide with the
 // envelope's own "id"/"ok" keys (group records carry their own "id").
+// Envelope + data, sized to fit (review F10: a 16-member group outgrew the
+// old 640-byte reply and went out truncated).
+static void reply_group_data(int fd, uint32_t id, JsonVariantConst data) {
+    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = data;
+    const size_t cap = measureJson(env) + 1;
+    char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (buf) ws_server_reply(fd, buf, serializeJson(env, buf, cap));
+    else send_err(fd, id, "oom");
+    heap_caps_free(buf);
+}
+
 static void cmd_group_list(int fd, uint32_t id) {
-    constexpr size_t CAP = 4096;            // PSRAM heap — keep off internal BSS
-    char* tmp = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
-    char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
-    if (!tmp || !buf) { heap_caps_free(tmp); heap_caps_free(buf); send_err(fd, id, "oom"); return; }
-    size_t tn = group_list_json(tmp, CAP);
-    JsonDocument inner; deserializeJson(inner, tmp, tn);
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = inner;
-    size_t n = serializeJson(env, buf, CAP);
-    ws_server_reply(fd, buf, n);
-    heap_caps_free(tmp); heap_caps_free(buf);
+    char* tmp = (char*)heap_caps_malloc(GRP_LIST_JSON_MAX, MALLOC_CAP_SPIRAM);   // PSRAM, not internal BSS
+    const size_t tn = tmp ? group_list_json(tmp, GRP_LIST_JSON_MAX) : 0;
+    JsonDocument inner;
+    if (!tn || deserializeJson(inner, tmp, tn)) { heap_caps_free(tmp); send_err(fd, id, "group list unavailable"); return; }
+    heap_caps_free(tmp);
+    reply_group_data(fd, id, inner);
 }
 
 static void cmd_group_create(int fd, uint32_t id, JsonDocument& doc) {
     char args[1024]; size_t an = serializeJson(doc["args"], args, sizeof(args));
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_create(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "create failed"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = inner;
-    char buf[640]; size_t n = serializeJson(env, buf, sizeof(buf)); ws_server_reply(fd, buf, n);
+    reply_group_data(fd, id, inner);
     ws_push("group.added", inner);
 }
 static void cmd_group_get(int fd, uint32_t id, JsonDocument& doc) {
     char args[256]; size_t an = serializeJson(doc["args"], args, sizeof(args));
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_get(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "no such group"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = inner;
-    char buf[640]; size_t n = serializeJson(env, buf, sizeof(buf)); ws_server_reply(fd, buf, n);
+    reply_group_data(fd, id, inner);
 }
 static void cmd_group_update(int fd, uint32_t id, JsonDocument& doc) {
     char args[1024]; size_t an = serializeJson(doc["args"], args, sizeof(args));
-    char rsp[512]; size_t rn = 0;
+    char rsp[GRP_JSON_MAX]; size_t rn = 0;
     if (!group_update(args, an, rsp, sizeof(rsp), &rn)) { send_err(fd, id, "no such group"); return; }
     JsonDocument inner; deserializeJson(inner, rsp, rn);
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = inner;
-    char buf[640]; size_t n = serializeJson(env, buf, sizeof(buf)); ws_server_reply(fd, buf, n);
+    reply_group_data(fd, id, inner);
     ws_push("group.updated", inner);
 }
 static void cmd_group_delete(int fd, uint32_t id, JsonDocument& doc) {
@@ -295,6 +300,7 @@ static void cmd_group_cmd(int fd, uint32_t id, JsonDocument& doc) {
     char args[512]; size_t an = serializeJson(doc["args"], args, sizeof(args));
     char rsp[128]; size_t rn = group_cmd(args, an, rsp, sizeof(rsp));
     JsonDocument inner; deserializeJson(inner, rsp, rn);
+    if (const char* err = inner["err"]) { send_err(fd, id, err); return; }   // refused, nothing sent
     JsonDocument env; env["id"] = id; env["ok"] = inner["ok"];
     env["sent"] = inner["sent"]; env["failed"] = inner["failed"];
     char buf[192]; size_t n = serializeJson(env, buf, sizeof(buf)); ws_server_reply(fd, buf, n);
