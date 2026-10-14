@@ -849,7 +849,7 @@ static void cmd_device_groups_add_remove(int fd, uint32_t id, JsonDocument& doc,
     if (!ok) { send_err(fd, id, "command failed"); return; }
     // Mirror only after the radio accepted it, so a failed send cannot leave
     // the UI claiming a membership the device never got.
-    if (remove) dgm_remove(ieee, gid); else dgm_add(ieee, gid);
+    if (remove) dgm_remove(ieee, ep, gid); else dgm_add(ieee, ep, gid);
     dgm_reply_list(fd, id, ieee);
 }
 
@@ -874,7 +874,7 @@ static void cmd_device_groups_refresh(int fd, uint32_t id, JsonDocument& doc) {
         send_err(fd, id, "device did not answer");
         return;
     }
-    dgm_set(ieee, gids, count);
+    dgm_set(ieee, ep, gids, count);   // that endpoint only: the others keep theirs (review F18)
     dgm_reply_list(fd, id, ieee);
 }
 
