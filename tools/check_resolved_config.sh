@@ -49,6 +49,8 @@ TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
 # built with another offset cannot find its partitions.
 expect CONFIG_PARTITION_TABLE_OFFSET 0xC000 \
     "Moved from 0x8000 to give the bootloader room (see sdkconfig.defaults). An old local sdkconfig keeps 0x8000: delete it or run idf.py reconfigure."
+expect CONFIG_LUA_ENGINE_TASK_STACK_BYTES 32768 \
+    "The Lua C-stack limits (zhac-main-core lua_engine/lua_limits.cmake, LUAI_MAXCCALLS=16) are sized for a 32 KB TaskLua. An old local sdkconfig keeps 8192: delete it (or run idf.py set-target) so sdkconfig.defaults applies."
 
 # ---------------------------------------------------------------- esp32s31 --
 if [ "$TARGET" = "esp32s31" ]; then

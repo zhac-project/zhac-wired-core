@@ -24,6 +24,7 @@
 #include "esp_psram.h"
 #include "esp_timer.h"
 #include "eth.h"
+#include "lua_engine.h"   // lua_engine_scripts_held
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mqtt_gw.h"
@@ -173,5 +174,8 @@ void sys_diag_push_tick() {
     JsonDocument doc;
     JsonObject d = doc.to<JsonObject>();
     sys_diag_fill(d, SYS_DIAG_CPU_TICK);
+    // In every tick while lua_engine holds the scripts: the hub page drops its banner on the first tick without it
+    // (www-spa mergeTick), as a cloud Apply that ends the hold tells the page nothing else. Static storage.
+    if (const char* held = lua_engine_scripts_held()) d["scripts_held"] = held;
     ws_push("status.tick", doc);
 }

@@ -5,14 +5,16 @@
 //
 //   GET    /api/scripts                  — list {name, size}
 //   GET    /api/scripts/<name>           — read source
-//   PUT    /api/scripts/<name>           — write source (raw body)
+//   PUT    /api/scripts/<name>           — write source (raw body, at most 16,384 bytes; more: 413)
 //   DELETE /api/scripts/<name>           — delete
 //   POST   /api/scripts/<name>/run       — enqueue invocation
 //   POST   /api/scripts/<name>/check     — body = source; returns {ok,err,line}
 //
 // Names are alphanum + `_-`, ≤24 chars; enforced by lua_script_cache.
 #include "auth.h"
+#include "edit_lock.h"
 #include "api_scripts.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "ArduinoJson.h"
@@ -24,9 +26,9 @@
 
 static const char* TAG = "api_scripts";
 
-// Lua source soft cap from lua_engine_scripts.h is 16 KB. We allocate
-// on the heap to avoid blowing the 8 KB httpd task stack.
-static constexpr size_t kScriptCap = 16 * 1024;
+// A script holds at most LUA_SCRIPT_SRC_MAX (16,384) bytes; buffers add one for the NUL, so a full-size
+// script reads, checks and saves (spec 2026-10-05 §3.8). Heap, not the httpd task stack.
+static constexpr size_t kScriptCap = LUA_SCRIPT_SRC_MAX;
 
 static const char* uri_after_prefix(const char* uri, const char* prefix) {
     size_t pl = std::strlen(prefix);
@@ -57,6 +59,43 @@ static bool parse_name(const char* uri, char* out, size_t cap,
     return true;
 }
 
+// The request body, all content_len bytes of it, in a PSRAM buffer of kScriptCap + 1 bytes (NUL-terminated).
+// On any failure the error response is sent here and nullptr returned, and the caller returns ESP_FAIL
+// without writing, checking or pushing anything: 413 over kScriptCap (the hub used to keep the first 16,383
+// bytes of such a body and say ok), 500 out of memory, 408 when a receive timed out (10 s on this server) and
+// 400 when it failed or the client closed before the whole body arrived (the loop used to stop right there,
+// and the cut text was saved over the stored script, pushed, and answered ok), and 411 for a chunked upload:
+// esp_http_server reports content_len 0 for it and cannot read the chunks, so the empty body blanked the stored
+// script and answered ok. An explicit Content-Length: 0 still means an empty script.
+static char* read_body(httpd_req_t* req) {
+    if (req->content_len == 0 && httpd_req_get_hdr_value_len(req, "Transfer-Encoding") > 0) {
+        httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "send the script with a Content-Length");
+        return nullptr;
+    }
+    if (req->content_len > kScriptCap) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "a script is at most 16384 bytes");
+        return nullptr;
+    }
+    char* buf = static_cast<char*>(heap_caps_malloc(kScriptCap + 1, MALLOC_CAP_SPIRAM));
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc");
+        return nullptr;
+    }
+    size_t n = 0;
+    while (n < req->content_len) {
+        const int got = httpd_req_recv(req, buf + n, req->content_len - n);
+        if (got <= 0) {
+            heap_caps_free(buf);
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "body timed out");
+            else httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body incomplete");
+            return nullptr;
+        }
+        n += got;
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
 // ── GET /api/scripts ────────────────────────────────────────────────────
 static esp_err_t handle_get_scripts(httpd_req_t* req) {
     LuaScriptEntry list[LUA_SCRIPT_MAX];
@@ -85,14 +124,12 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_GET) {
-        // Read source. Allocate on the heap — kScriptCap is too big for
-        // the httpd task stack.
-        char* src = (char*)heap_caps_malloc(kScriptCap, MALLOC_CAP_SPIRAM);
+        char* src = (char*)heap_caps_malloc(kScriptCap + 1, MALLOC_CAP_SPIRAM);
         if (!src) {
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc");
             return ESP_FAIL;
         }
-        int n = lua_script_cache_read(name, src, kScriptCap);
+        int n = lua_script_cache_read(name, src, kScriptCap + 1);
         if (n < 0) {
             heap_caps_free(src);
             httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
@@ -107,33 +144,22 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     // Save. The SPA and net-core use POST /api/scripts/<name> (body = source);
     // this port only took PUT and answered a bare POST with 405 "unsupported".
     if (req->method == HTTP_PUT || (req->method == HTTP_POST && !is_run && !is_check)) {
-        // Raw source body, up to kScriptCap-1 bytes.
-        bool existed = lua_script_cache_exists(name);
-        char* src = (char*)heap_caps_malloc(kScriptCap, MALLOC_CAP_SPIRAM);
-        if (!src) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc");
-            return ESP_FAIL;
-        }
-        int total = 0;
-        while (total < (int)kScriptCap - 1) {
-            int got = httpd_req_recv(req, src + total, kScriptCap - 1 - total);
-            if (got <= 0) break;
-            total += got;
-        }
-        src[total] = '\0';
-        bool ok = lua_script_cache_write(name, src);
+        const bool existed = lua_script_cache_exists(name);
+        char* src = read_body(req);
+        if (!src) return ESP_FAIL;
+        EditLock lock(g_edit_mutex);   // as every script save (edit_lock.h)
+        const bool ok = lua_script_cache_write(name, src);
+        // size and fp of what is stored: the store keeps the text up to its first NUL
+        if (ok) ws_push_script_saved(name, src, std::strlen(src), existed);
         heap_caps_free(src);
         httpd_resp_set_type(req, "application/json");
-        if (ok) {
-            JsonDocument p; p["name"] = name;
-            ws_push(existed ? "script.updated" : "script.added", p);
-            return httpd_resp_sendstr(req, "{\"ok\":true}");
-        }
+        if (ok) return httpd_resp_sendstr(req, "{\"ok\":true}");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write failed");
         return ESP_FAIL;
     }
 
     if (req->method == HTTP_DELETE) {
+        EditLock lock(g_edit_mutex);
         bool ok = lua_script_cache_delete(name);
         httpd_resp_set_type(req, "application/json");
         if (ok) {
@@ -146,6 +172,10 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_POST && is_run) {
+        if (lua_engine_scripts_held()) {   // TaskLua would skip the run (the boot-loop guard)
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, LUA_ENGINE_HELD_ERR);
+            return ESP_FAIL;
+        }
         bool ok = lua_engine_run_script(name);
         httpd_resp_set_type(req, "application/json");
         if (ok) return httpd_resp_sendstr(req, "{\"ok\":true,\"queued\":true}");
@@ -154,15 +184,8 @@ static esp_err_t handle_scripts_item(httpd_req_t* req) {
     }
 
     if (req->method == HTTP_POST && is_check) {
-        char* src = (char*)heap_caps_malloc(kScriptCap, MALLOC_CAP_SPIRAM);
-        if (!src) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc"); return ESP_FAIL; }
-        int total = 0;
-        while (total < (int)kScriptCap - 1) {
-            int got = httpd_req_recv(req, src + total, kScriptCap - 1 - total);
-            if (got <= 0) break;
-            total += got;
-        }
-        src[total] = '\0';
+        char* src = read_body(req);
+        if (!src) return ESP_FAIL;
         char err[128] = {0};
         int line = 0;
         bool ok = lua_engine_check_syntax(name, src, err, sizeof(err), &line);

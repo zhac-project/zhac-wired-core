@@ -14,6 +14,7 @@
 // message in `err` so the SPA can show what the user mistyped.
 #include "auth.h"
 #include "http_body.h"
+#include "edit_lock.h"
 #include "api_rules.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -142,6 +143,7 @@ static esp_err_t handle_post_rules(httpd_req_t* req) {
         return ESP_FAIL;
     }
     uint16_t new_id = 0;
+    EditLock lock(g_edit_mutex);   // as every rule save (edit_lock.h)
     bool ok = simple_rules_add(name, dsl, &new_id);
     httpd_resp_set_type(req, "application/json");
     if (ok) {
@@ -192,6 +194,7 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
         const char* name = doc["name"] | "";
         const char* dsl  = doc["dsl"]  | (const char*)nullptr;
         if (!dsl) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing dsl"); return ESP_FAIL; }
+        EditLock lock(g_edit_mutex);
         bool ok = simple_rules_update(id, name, dsl);
         httpd_resp_set_type(req, "application/json");
         if (ok) return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -200,6 +203,7 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
 
     // DELETE /api/rules/<id>
     if (req->method == HTTP_DELETE) {
+        EditLock lock(g_edit_mutex);
         bool ok = simple_rules_delete(id);
         httpd_resp_set_type(req, "application/json");
         return ok

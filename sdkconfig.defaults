@@ -137,3 +137,8 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 
 # diag.tasks shows which core a task is pinned to (TaskStatus_t::xCoreID).
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# TaskLua at 32 KB: the Lua C-stack limits (zhac-main-core components/lua_engine/lua_limits.cmake,
+# LUAI_MAXCCALLS=16) are sized for it. PSRAM on the S31 (zhac_task_create, XIP from PSRAM), internal RAM on
+# the P4. 8 KB let a few levels of pcall or gsub recursion overflow the stack.
+CONFIG_LUA_ENGINE_TASK_STACK_BYTES=32768

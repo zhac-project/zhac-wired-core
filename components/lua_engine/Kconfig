@@ -48,6 +48,9 @@ config LUA_ENGINE_TASK_STACK_BYTES
     depends on LUA_ENGINE_ENABLED
     default 8192
     range 4096 32768
+    help
+        Builds that include lua_limits.cmake (LUAI_MAXCCALLS=16) need 32768:
+        their sdkconfig.defaults set it. The limits are sized for 32 KB.
 
 config LUA_ENGINE_TASK_PRIORITY
     int "TaskLua FreeRTOS priority"
@@ -72,11 +75,8 @@ config LUA_ENGINE_WITH_MINIZ
     depends on LUA_ENGINE_ENABLED
     default n
 
-config LUA_ENGINE_CJSON_DECODE_MAX_DEPTH
-    int "cjson.decode max nesting depth"
-    depends on LUA_ENGINE_WITH_CJSON
-    default 64
-    range 4 1000
+# cjson's encode / decode nesting is fixed at 16 with the C-stack limits (src/lua_engine_limits.h); the
+# former LUA_ENGINE_CJSON_DECODE_MAX_DEPTH option is gone.
 
 endmenu
 
