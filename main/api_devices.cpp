@@ -331,6 +331,7 @@ static esp_err_t handle_device_state(httpd_req_t* req) {
     httpd_resp_set_type(req, "application/json");
     if (r == DEVCMD_OK) return httpd_resp_sendstr(req, "{\"ok\":true}");
     if (r == DEVCMD_NOT_FOUND) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, device_cmd_result_str(r)); return ESP_FAIL; }
+    if (r == DEVCMD_BAD_COLOUR || r == DEVCMD_BAD_VALUE || r == DEVCMD_BAD_ARGS) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, device_cmd_result_str(r)); return ESP_FAIL; }
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, device_cmd_result_str(r));
     return ESP_FAIL;
 }
