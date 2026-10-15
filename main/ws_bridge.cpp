@@ -61,6 +61,7 @@
 #include "api_remote.h"
 #include "remote_client.h"
 #include "remote_allow.h"
+#include "devlist_page.h"
 #include "simple_rules.h"
 #include "rule_store.h"
 #include "zap_common.h"
@@ -486,13 +487,94 @@ static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
 
 // ── device.list ──────────────────────────────────────────────────────
 //
-// JSON array of device summaries — the main devices page. Built as a document
-// in PSRAM and sent in one buffer sized to it: the old fixed 8 KB buffer
-// silently dropped every device past ~22 (the pool holds 200), and the
-// model / manufacturer strings straight from the radio were pasted in with
-// %s, so one quote or control byte broke the whole list (review F30). Shadow
-// attrs are skipped here — the SPA pulls detail via device.get.
-static void cmd_device_list(int fd, uint32_t id) {
+// Device summaries — metadata only; the SPA pulls attrs via device.get
+// when the user opens a row. Two reply shapes, identical rows:
+//   * local SPA: the whole list as one bare array in pool order, built as
+//     a document in PSRAM and sent in one buffer sized to it: the old fixed
+//     8 KB buffer silently dropped every device past ~22 (the pool holds
+//     200), and strings from the radio pasted in with %s let one quote or
+//     control byte break the whole list (review F30).
+//   * cloud (REMOTE_VIRTUAL_FD), or any caller that passes `cursor`: one
+//     page {"items":[...],"next_cursor":"0x…"} of at most 8 KB, in IEEE
+//     order (devlist_page.h). The cloud link carries 8 KB per frame
+//     (remote_client) and the cloud's reconcile follows next_cursor,
+//     which is left out on the last page.
+
+// One row. Friendly labels come from the matched definition ("Tuya" /
+// "TS0203"), falling back to the device's own Basic strings when no def
+// matches. The SPA's device table reads `vendor`, NOT `manufacturer` —
+// omitting it left the Manufacturer column showing "—" for every device
+// even though the raw string was right there in the row. `manufacturer`
+// stays as the raw Basic 0x0004 value, which the detail tab reads. Same
+// contract as hap_json's device_list encoder. Strings are JSON-escaped
+// (devlist_row): one `"` in a device name used to make the whole list
+// invalid, and the cloud's reconcile then stored no device at all.
+// Returns snprintf's length: <= 0 or >= cap means the row did not fit.
+static int format_device_row(const ZapDevice& d, bool first, char* row, size_t cap) {
+    char vendor_buf[32] = {};
+    char model_buf[32]  = {};
+    zhac_adapter_resolve_labels(d.model_id, d.manufacturer_name,
+                                vendor_buf, sizeof(vendor_buf),
+                                model_buf,  sizeof(model_buf));
+    const char* vendor_out = vendor_buf[0] ? vendor_buf : d.manufacturer_name;
+    const char* model_out   = model_buf[0]  ? model_buf  : d.model_id;
+    return devlist_row({d.ieee_addr, d.nwk_addr, d.friendly_name, model_out,
+                        d.manufacturer_name, vendor_out, d.model_id, model_buf[0] != 0,
+                        (int64_t)d.last_seen, d.link_quality, d.battery_pct,
+                        d.endpoint_count},
+                       first, row, cap);
+}
+
+// One cloud page: the devices after IEEE `after` (0 = the first page).
+static void cmd_device_list_page(int fd, uint32_t id, uint64_t after) {
+    constexpr size_t kCap  = 8 * 1024;   // remote_client's per-frame cap
+    constexpr size_t kTail = 48;         // `],"next_cursor":"0x0123456789ABCDEF"}}`
+    char* buf = (char*)heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM);
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    int pos = snprintf(buf, kCap,
+                       "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"items\":[", id);
+    bool first = true, more = false;
+    uint64_t last = after;
+    int skipped = 0;
+
+    zigbee_pool_lock();
+    ZapDevice* pool = pool_all();
+    const uint16_t cnt = pool_count();
+    for (;;) {
+        const int i = devlist_next(cnt, last,
+            [pool](size_t k) { return pool[k].ieee_addr; },
+            [pool](size_t k) { return !zap_dev_is_removed(&pool[k]); });
+        if (i < 0) break;
+        char row[kDevlistRowCap];
+        const int rn = format_device_row(pool[i], first, row, sizeof(row));
+        if (rn <= 0 || rn >= (int)sizeof(row)) {   // bounded fields make this unreachable;
+            skipped++;                             // step past it rather than re-send the
+            last = pool[i].ieee_addr;              // same cursor forever
+            continue;
+        }
+        if ((size_t)(pos + rn) + kTail >= kCap) { more = true; break; }
+        std::memcpy(buf + pos, row, rn);
+        pos += rn;
+        first = false;
+        last = pool[i].ieee_addr;
+    }
+    zigbee_pool_unlock();
+    if (skipped) ESP_LOGW(TAG, "device.list: %d row(s) did not fit and were skipped", skipped);
+
+    pos += more ? snprintf(buf + pos, kCap - pos,
+                           "],\"next_cursor\":\"0x%016" PRIX64 "\"}}", last)
+                : snprintf(buf + pos, kCap - pos, "]}}");
+    ws_server_reply(fd, buf, pos);
+    heap_caps_free(buf);
+}
+
+static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
+    const char* cursor = doc["args"]["cursor"] | (const char*)nullptr;
+    if (fd == REMOTE_VIRTUAL_FD || cursor) {
+        cmd_device_list_page(fd, id, cursor ? parse_ieee(cursor) : 0);
+        return;
+    }
+
     // char* (not const char*) makes ArduinoJson copy a string; the pool rows
     // and the label buffers below do not outlive this loop.
     auto copy = [](const char* s) { return const_cast<char*>(s); };
@@ -1584,7 +1666,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "net.map.scan")       == 0) { cmd_net_map_scan(fd, id); return; }
     if (std::strcmp(cmd, "net.map.get")        == 0) { cmd_net_map_get(fd, id);  return; }
     if (std::strcmp(cmd, "time.set")           == 0) { cmd_time_set(fd, id, doc); return; }
-    if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id);              return; }
+    if (std::strcmp(cmd, "device.list")        == 0) { cmd_device_list(fd, id, doc);         return; }
     if (std::strcmp(cmd, "device.get")         == 0) { cmd_device_get(fd, id, doc);          return; }
     if (std::strcmp(cmd, "device.rename")      == 0) { cmd_device_rename(fd, id, doc);       return; }
     if (std::strcmp(cmd, "device.delete")      == 0) { cmd_device_delete(fd, id, doc);       return; }
