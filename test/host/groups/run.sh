@@ -13,6 +13,7 @@ H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$H/../../../main" && pwd)
 AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
 DC=$(cd "$H/../../../../zhac-components/components/device_cmd" && pwd)
+WS=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # utf8_seq.h, for json_buf.h
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-groups.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
@@ -28,7 +29,7 @@ test "$(grep -c '^}' "$W/slice_tu.cpp")" -eq 3   # all three functions were foun
 
 cd "$W"
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++
-FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ"
+FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ -I$WS"
 g++ $FLAGS slice_tu.cpp device_cmd_json.cpp harness.cpp -o harness
 set +e
 ./harness
