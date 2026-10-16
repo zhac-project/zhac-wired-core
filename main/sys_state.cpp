@@ -22,6 +22,7 @@ static char s_tz[64]          = "";   // as applied; "" = UTC
 static bool s_metrics_mqtt    = false;
 static int  s_metrics_mqtt_s  = 60;
 static std::atomic<bool> s_remote_scripts{false};   // read on task_remote, written on the httpd task
+static std::atomic<uint8_t> s_log_cloud{0};      // read by the log hook on every task, written on the httpd task
 
 static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-5) == 1 &&
               sys_clamp_metrics_interval(1) == 1 && sys_clamp_metrics_interval(30) == 30 &&
@@ -72,6 +73,10 @@ void sys_state_init() {
     s_metrics_mqtt    = nvs_get_u8("sys_cfg", "metrics_mqtt", 0) != 0;
     s_metrics_mqtt_s  = sys_clamp_metrics_interval(nvs_get_u8("sys_cfg", "metrics_mqtt_s", 60));
     s_remote_scripts.store(nvs_get_u8("sys_cfg", "remote_scripts", 0) != 0);
+    {
+        const uint8_t lc = nvs_get_u8("sys_cfg", "log_cloud", 0);
+        s_log_cloud.store(lc <= 3 ? lc : 0);
+    }
     // API auth (enabled flag, token, admin password) lives in auth.cpp.
 
     nvs_handle_t h;
@@ -86,8 +91,9 @@ void sys_state_init() {
         nvs_close(h);
     }
 
-    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds remote_scripts=%d", s_metrics_enabled,
-             s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s, (int)s_remote_scripts.load());
+    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds remote_scripts=%d log_cloud=%u",
+             s_metrics_enabled, s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s,
+             (int)s_remote_scripts.load(), (unsigned)s_log_cloud.load());
 }
 
 bool sys_metrics_enabled() { return s_metrics_enabled; }
@@ -152,4 +158,17 @@ bool sys_set_remote_scripts(bool on) {
     if (e != ESP_OK) ESP_LOGE(TAG, "remote_scripts=%d not saved: %s", (int)on, esp_err_to_name(e));
     s_remote_scripts.store(sys_remote_scripts_after_save(on, e == ESP_OK));
     return e == ESP_OK;
+}
+
+uint8_t sys_log_cloud() { return s_log_cloud.load(std::memory_order_relaxed); }
+
+bool sys_set_log_cloud(uint8_t level) {
+    if (level > 3) return false;
+    const esp_err_t e = nvs_set_u8_commit("sys_cfg", "log_cloud", level);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "log_cloud=%u not saved: %s", (unsigned)level, esp_err_to_name(e));
+        return false;
+    }
+    s_log_cloud.store(level);
+    return true;
 }

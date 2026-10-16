@@ -28,6 +28,7 @@
 #include "sys_state.h"
 #include "rule_store.h"
 #include "ws_bridge.h"
+#include "log_cloud.h"
 #include "ws_server.h"
 #include "zap_store.h"
 
@@ -123,6 +124,7 @@ void health_tick(void*) {
     s_state = "rolling_back";
     nvs_put_str(kNvsRollback, why);
     esp_timer_stop(s_health_timer);
+    log_cloud_planned_restart(logcloud::Planned::Rollback);
     esp_ota_mark_app_invalid_rollback_and_reboot();
 }
 
@@ -248,6 +250,7 @@ void run(const char* url) {
     rule_store_flush_now();
     zap_store_flush_now();
     vTaskDelay(pdMS_TO_TICKS(2000));
+    log_cloud_planned_restart(logcloud::Planned::Update);
     esp_restart();
 }
 

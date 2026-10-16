@@ -63,6 +63,7 @@
 #include "zigbee_pool.h"
 #include "event_bus.h"
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "lua_engine.h"
 #include "mqtt_gw.h"
 #include "net_discovery.h"
@@ -169,6 +170,7 @@ extern "C" void app_main() {
     // Both NVS-backed: must follow nvs_flash_init.
     auth_init();
     sys_state_init();
+    log_cloud_boot();   // takes the previous run's restart tail out of no-init RAM before the hook writes it
     log_ring_init();   // PSRAM log ring + esp_log vprintf hook (capture early)
 
     log_chip_info();
@@ -331,6 +333,7 @@ extern "C" void app_main() {
 #endif
     remote_client_init();   // no-op stub when remote disabled; reads NVS
     heap_mark("remote_client");
+    log_cloud_start();  // the uploader: log.batch / log.tail once the cloud link is ready
 
     // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
     // inbound messages feed rules / Lua / Home Assistant. With no broker

@@ -58,6 +58,7 @@
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "api_remote.h"
 #include "remote_client.h"
 #include "remote_allow.h"
@@ -1602,6 +1603,7 @@ static void cmd_storage_reset(int fd, uint32_t id) {
     reply_ok_or_err(fd, id, e == ESP_OK, esp_err_to_name(e));
     if (e != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(500));
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     esp_restart();
 }
 
@@ -1612,8 +1614,26 @@ static void cmd_zigbee_reset(int fd, uint32_t id) {
     }
     reply_ok_or_err(fd, id, true, nullptr);
     vTaskDelay(pdMS_TO_TICKS(500));
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     esp_restart();
 }
+
+#ifdef CONFIG_ZHAC_TEST_CRASH_CMD
+// Test builds only (Kconfig ZHAC_TEST_CRASH_CMD; never in a release): a real store fault, so the cloud's crash
+// report (log.tail with the core dump summary) can be checked on a hub. The address is read through a volatile
+// so the compiler cannot turn the store into a trap instruction.
+static void crash_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    volatile uintptr_t bad = 0;
+    *reinterpret_cast<volatile uint32_t*>(bad) = 1;
+    vTaskDelete(nullptr);
+}
+static void cmd_debug_crash(int fd, uint32_t id) {
+    ESP_LOGW(TAG, "debug.crash: crashing on purpose in 0.5 s");
+    reply_ok_or_err(fd, id, true, nullptr);
+    xTaskCreate(crash_task, "crash", 2048, nullptr, 2, nullptr);
+}
+#endif
 
 // ── system.restart (plain reboot, nothing erased) ──────────────────────
 // Settings → "Restart hub". Unlike cmd_storage_reset/cmd_zigbee_reset above,
@@ -1630,6 +1650,7 @@ static void restart_task(void*) {
 }
 static void cmd_system_restart(int fd, uint32_t id) {
     ESP_LOGI(TAG, "restart requested from the web UI");
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     reply_ok_or_err(fd, id, true, nullptr);
     if (xTaskCreate(restart_task, "restart", 2048, nullptr, 2, nullptr) != pdPASS) {
         vTaskDelay(pdMS_TO_TICKS(500));   // task create (OOM) failed -- still honor the request
@@ -1713,6 +1734,9 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "zigbee.reset")        == 0) { cmd_zigbee_reset(fd, id);             return; }
     if (std::strcmp(cmd, "system.storage_reset") == 0) { cmd_storage_reset(fd, id);           return; }
     if (std::strcmp(cmd, "system.restart")       == 0) { cmd_system_restart(fd, id);          return; }
+#ifdef CONFIG_ZHAC_TEST_CRASH_CMD
+    if (std::strcmp(cmd, "debug.crash")          == 0) { cmd_debug_crash(fd, id);             return; }
+#endif
     if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
     if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
     if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }

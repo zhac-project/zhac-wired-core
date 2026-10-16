@@ -35,6 +35,8 @@ idf_component_register(
         "sys_state.cpp"
         "sys_diag.cpp"
         "log_ring.cpp"
+        "log_cloud.cpp"
+        "log_cloud_core.cpp"
         "device_options.cpp"
         "groups_store.cpp"
         "dgm_store.cpp"
