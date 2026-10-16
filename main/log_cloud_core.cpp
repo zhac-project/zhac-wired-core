@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "log_cloud_core.h"
 
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
+
+#include "json_buf.h"
 
 namespace logcloud {
 namespace {
@@ -211,6 +215,154 @@ bool Ring::pop_if(uint32_t seq) {
     h_->count--;
     seal();
     return true;
+}
+
+size_t line_json(char* out, size_t cap, const Line& l, bool with_seq) {
+    JsonWriter w(out, cap);
+    w.fmt("[%" PRIu64 ",\"%c\",\"", l.up_ms, l.level);
+    w.str(l.tag, kTagMax);
+    w.raw("\",\"");
+    w.str(l.msg, kMsgMax);
+    w.ch('"');
+    if (with_seq) w.fmt(",%" PRIu32, l.seq);
+    w.ch(']');
+    return w.finish();
+}
+
+BatchWriter::BatchWriter(char* buf, size_t cap) : buf_(buf), cap_(cap < kBudget ? cap : kBudget) {}
+
+void BatchWriter::begin(uint32_t boot, uint32_t first_seq, uint64_t up_ms, int64_t clock_ms, uint32_t dropped) {
+    n_ = 0;
+    const int w = std::snprintf(buf_, cap_,
+        "{\"boot\":%" PRIu32 ",\"seq\":%" PRIu32 ",\"up\":%" PRIu64 ",\"clock\":%" PRId64 ",\"dropped\":%" PRIu32 ",\"lines\":[",
+        boot, first_seq, up_ms, clock_ms, dropped);
+    ok_  = w > 0 && static_cast<size_t>(w) < cap_;
+    pos_ = ok_ ? static_cast<size_t>(w) : 0;
+}
+
+bool BatchWriter::add(const Line& l) {
+    if (!ok_) return false;
+    const size_t len = line_json(line_, sizeof(line_), l, false);
+    if (len == 0) return false;
+    const size_t need = (n_ ? 1 : 0) + len + 2;    // a comma, the line, and the closing "]}"
+    if (pos_ + need > cap_) return false;
+    if (n_) buf_[pos_++] = ',';
+    std::memcpy(buf_ + pos_, line_, len);
+    pos_ += len;
+    n_++;
+    return true;
+}
+
+size_t BatchWriter::finish() {
+    if (!ok_ || n_ == 0 || pos_ + 2 > cap_) return 0;
+    buf_[pos_++] = ']';
+    buf_[pos_++] = '}';
+    ok_ = false;                                    // one finish per begin
+    return pos_;
+}
+
+const char* reset_name(Reset r) {
+    switch (r) {
+    case Reset::PowerOn:  return "power_on";
+    case Reset::Panic:    return "panic";
+    case Reset::IntWdt:   return "int_wdt";
+    case Reset::TaskWdt:  return "task_wdt";
+    case Reset::Wdt:      return "wdt";
+    case Reset::Brownout: return "brownout";
+    case Reset::Sw:       return "sw";
+    case Reset::Ext:      return "ext";
+    default:              return "other";
+    }
+}
+
+const char* planned_name(uint32_t p) {
+    switch (static_cast<Planned>(p)) {
+    case Planned::Update:   return "update";
+    case Planned::Restart:  return "restart";
+    case Planned::Rollback: return "rollback";
+    default:                return nullptr;
+    }
+}
+
+const char* riscv_cause_name(uint32_t mcause) {
+    static const char* const kNames[] = {
+        "instruction address misaligned", "instruction access fault", "illegal instruction", "breakpoint",
+        "load address misaligned", "load access fault", "store address misaligned", "store access fault",
+        "environment call from U-mode", "environment call from S-mode", nullptr, "environment call from M-mode",
+        "instruction page fault", "load page fault", nullptr, "store page fault",
+    };
+    if (mcause & 0x80000000u) return "interrupt";
+    const uint32_t code = mcause & 0x7FFFFFFFu;
+    if (code < sizeof(kNames) / sizeof(kNames[0]) && kNames[code]) return kNames[code];
+    return "unknown cause";
+}
+
+size_t crash_json(char* out, size_t cap, const char* task, uint32_t pc, const char* cause, const char* elf) {
+    JsonWriter w(out, cap);
+    w.raw("{\"task\":\"");
+    w.str(task ? task : "", 16);
+    w.fmt("\",\"pc\":\"0x%08" PRIx32 "\",\"cause\":\"", pc);
+    w.str(cause ? cause : "", 96);
+    w.raw("\",\"elf\":\"");
+    w.str(elf ? elf : "", 16);
+    w.raw("\"}");
+    const size_t n = w.finish();
+    if (n == 0 || n >= cap) {                       // no room for the terminating NUL either
+        if (cap) out[0] = '\0';
+        return 0;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+size_t tail_json(char* out, size_t cap, const TailHead& h, const Ring* prev) {
+    const size_t budget = cap < BatchWriter::kBudget ? cap : BatchWriter::kBudget;
+    JsonWriter w(out, budget);
+    w.fmt("{\"boot\":%" PRIu32 ",\"prev_boot\":%" PRIu32 ",\"up\":%" PRIu64 ",\"clock\":%" PRId64 ",\"reason\":\"",
+          h.boot, h.prev_boot, h.up_ms, h.clock_ms);
+    w.str(h.reason ? h.reason : "other", 16);
+    w.raw("\",\"planned\":");
+    if (h.planned) { w.ch('"'); w.str(h.planned, 16); w.ch('"'); } else { w.raw("null"); }
+    w.fmt(",\"prev_clock_base\":%" PRId64 ",\"prev_sent\":%" PRIu32 ",\"crash\":", h.prev_clock_base_ms, h.prev_sent);
+    w.raw(h.crash_json ? h.crash_json : "null");
+    w.raw(",\"lines\":[");
+    if (!w.ok()) return 0;
+
+    // Pass 1: the encoded size of every line the cloud does not have yet.
+    constexpr size_t kMaxLines = 256;               // a 4 KB tail holds at most ~240 records
+    uint16_t sizes[kMaxLines];
+    size_t n = 0;
+    char line[1536];
+    auto unsent = [&](const Line& l) { return l.seq == 0 || l.seq > h.prev_sent; };
+    if (prev) {
+        prev->for_each([&](const Line& l) {
+            if (n < kMaxLines && unsent(l)) sizes[n++] = static_cast<uint16_t>(line_json(line, sizeof(line), l, true));
+        });
+    }
+    // The newest that fit: walk back from the end; k lines take their sizes plus k-1 commas.
+    const size_t room = budget - w.len() - 2;      // keep "]}"
+    size_t first = n, total = 0;
+    while (first > 0) {
+        const size_t add = sizes[first - 1] + (total ? 1 : 0);
+        if (sizes[first - 1] == 0 || total + add > room) break;
+        total += add;
+        first--;
+    }
+    // Pass 2: write lines [first, n).
+    size_t idx = 0;
+    bool any = false;
+    if (prev) {
+        prev->for_each([&](const Line& l) {
+            if (!unsent(l) || idx >= kMaxLines) return;
+            if (idx++ < first) return;
+            const size_t len = line_json(line, sizeof(line), l, true);
+            if (any) w.ch(',');
+            w.raw(line, len);
+            any = true;
+        });
+    }
+    w.raw("]}");
+    return w.finish();
 }
 
 }  // namespace logcloud

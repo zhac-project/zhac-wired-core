@@ -96,4 +96,58 @@ private:
     bool     sealed_;
 };
 
+// One line as JSON: [up_ms,"L","tag","msg"], plus ",seq" for the tail. Escaped, and UTF-8 safe: a byte that is
+// not part of a complete sequence (the hook cuts lines at 191 bytes) becomes �. 0 = it does not fit.
+size_t line_json(char* out, size_t cap, const Line& l, bool with_seq);
+
+// Builds one log.batch payload (spec 2026-10-06 §4.3) of at most kBudget bytes:
+// {"boot","seq","up","clock","dropped","lines":[...]}. begin(), add() lines until it says no, finish() once.
+class BatchWriter {
+public:
+    static constexpr size_t kBudget = 6144;   // one page of the cloud link (remote_xfer.h kRemotePageBudget)
+    BatchWriter(char* buf, size_t cap);
+    void   begin(uint32_t boot, uint32_t first_seq, uint64_t up_ms, int64_t clock_ms, uint32_t dropped);
+    bool   add(const Line& l);                // false = it would not fit; nothing was written
+    size_t lines() const { return n_; }
+    size_t finish();                          // the payload length; 0 when no line was added
+
+private:
+    char*  buf_;
+    size_t cap_;
+    size_t pos_ = 0;
+    size_t n_   = 0;
+    bool   ok_  = false;
+    char   line_[1536];                       // one encoded line; the worst case (all escapes) is ~1.4 KB
+};
+
+// Why the hub restarted, as log.tail names it.
+enum class Reset : uint8_t { Other = 0, PowerOn, Panic, IntWdt, TaskWdt, Wdt, Brownout, Sw, Ext };
+const char* reset_name(Reset r);              // "power_on" "panic" "int_wdt" "task_wdt" "wdt" "brownout" "sw" "ext" "other"
+
+// Written into the tail just before a planned esp_restart(), so the next run can tell why.
+enum class Planned : uint32_t { None = 0, Update = 1, Restart = 2, Rollback = 3 };
+const char* planned_name(uint32_t p);         // nullptr for None or an unknown value
+
+const char* riscv_cause_name(uint32_t mcause);   // "load access fault", …; "interrupt"; "unknown cause"
+
+// {"task":"…","pc":"0x…","cause":"…","elf":"…"}, NUL-terminated. 0 (and "") when it does not fit.
+size_t crash_json(char* out, size_t cap, const char* task, uint32_t pc, const char* cause, const char* elf);
+
+struct TailHead {
+    uint32_t    boot;                 // this run
+    uint32_t    prev_boot;            // 0 when the previous run left no tail
+    uint64_t    up_ms;
+    int64_t     clock_ms;             // 0 = the clock is not set
+    const char* reason;               // reset_name()
+    const char* planned;              // planned_name(), may be nullptr
+    int64_t     prev_clock_base_ms;
+    uint32_t    prev_sent;
+    const char* crash_json;           // a JSON object, or nullptr
+};
+
+// One log.tail payload (spec 2026-10-06 §4.4) of at most BatchWriter::kBudget bytes. `prev` may be nullptr.
+// Lines whose seq is 1..prev_sent are left out (the cloud has them); of the rest, the newest that fit are
+// kept, oldest first.
+size_t tail_json(char* out, size_t cap, const TailHead& h, const Ring* prev);
+
 }  // namespace logcloud

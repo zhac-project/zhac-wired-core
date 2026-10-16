@@ -188,6 +188,123 @@ void test_ring_unsealed() {
     CHECK(r.peek(&l) && l.seq == 2 && r.count() == 1);
     CHECK(lines_of(r).size() == 1);
 }
+
+std::string as_string(const char* buf, size_t n) { return std::string(buf, n); }
+
+void test_line_json() {
+    char out[512];
+    Line l{};
+    l.seq = 7; l.up_ms = 1500; l.level = 'W';
+    std::strcpy(l.tag, "event_bus");
+    std::strcpy(l.msg, "queue full");
+    CHECK(as_string(out, line_json(out, sizeof(out), l, false)) == "[1500,\"W\",\"event_bus\",\"queue full\"]");
+    CHECK(as_string(out, line_json(out, sizeof(out), l, true)) == "[1500,\"W\",\"event_bus\",\"queue full\",7]");
+    std::strcpy(l.msg, "say \"hi\"\tnow\\\x01");
+    CHECK(as_string(out, line_json(out, sizeof(out), l, false)) ==
+          "[1500,\"W\",\"event_bus\",\"say \\\"hi\\\"\\tnow\\\\\\u0001\"]");
+    CHECK(line_json(out, 10, l, false) == 0);              // no room: nothing usable
+}
+
+void batch_repairs_cut_utf8() {                            // Review Focus 1
+    char out[256];
+    Line l{};
+    l.seq = 1; l.up_ms = 1; l.level = 'I';
+    std::strcpy(l.tag, "lua");
+    std::strcpy(l.msg, "\xD0\x9F\xD1\x80\xD0");            // "Пр" then half of "и": the hook's 191-byte cut
+    CHECK(as_string(out, line_json(out, sizeof(out), l, false)) == "[1,\"I\",\"lua\",\"\xD0\x9F\xD1\x80\\ufffd\"]");
+}
+
+void test_batch_writer() {
+    char buf[BatchWriter::kBudget];
+    BatchWriter bw(buf, sizeof(buf));
+    CHECK(bw.finish() == 0);                               // never begun: nothing to send
+    bw.begin(7, 3, 9000, 0, 1);
+    Line a{}, b{};
+    a.seq = 3; a.up_ms = 1; a.level = 'I'; std::strcpy(a.tag, "a"); std::strcpy(a.msg, "x");
+    b.seq = 4; b.up_ms = 2; b.level = 'E'; std::strcpy(b.tag, "b"); std::strcpy(b.msg, "y");
+    CHECK(bw.add(a) && bw.add(b) && bw.lines() == 2);
+    const size_t n = bw.finish();
+    CHECK(as_string(buf, n) ==
+          "{\"boot\":7,\"seq\":3,\"up\":9000,\"clock\":0,\"dropped\":1,\"lines\":[[1,\"I\",\"a\",\"x\"],[2,\"E\",\"b\",\"y\"]]}");
+
+    bw.begin(7, 10, 9000, 1791300000000, 0);
+    Line big{};
+    big.level = 'W'; std::strcpy(big.tag, "zhc_adapter");
+    std::memset(big.msg, 'm', kMsgMax); big.msg[kMsgMax] = '\0';
+    size_t added = 0;
+    for (uint32_t i = 0; i < 100; i++) { big.seq = 10 + i; if (!bw.add(big)) break; added++; }
+    CHECK(added > 20 && added < 100);                      // about 28 lines of ~215 bytes fit in 6144
+    const size_t m = bw.finish();
+    CHECK(m > 0 && m <= BatchWriter::kBudget);
+    CHECK(as_string(buf, m).substr(m - 2) == "]}");
+    CHECK(bw.lines() == added);
+}
+
+void test_names() {
+    CHECK(std::strcmp(reset_name(Reset::PowerOn), "power_on") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Panic), "panic") == 0);
+    CHECK(std::strcmp(reset_name(Reset::IntWdt), "int_wdt") == 0);
+    CHECK(std::strcmp(reset_name(Reset::TaskWdt), "task_wdt") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Wdt), "wdt") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Brownout), "brownout") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Sw), "sw") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Ext), "ext") == 0);
+    CHECK(std::strcmp(reset_name(Reset::Other), "other") == 0);
+    CHECK(planned_name(0) == nullptr);
+    CHECK(std::strcmp(planned_name(1), "update") == 0);
+    CHECK(std::strcmp(planned_name(2), "restart") == 0);
+    CHECK(std::strcmp(planned_name(3), "rollback") == 0);
+    CHECK(planned_name(9) == nullptr);
+    CHECK(std::strcmp(riscv_cause_name(5), "load access fault") == 0);
+    CHECK(std::strcmp(riscv_cause_name(7), "store access fault") == 0);
+    CHECK(std::strcmp(riscv_cause_name(0x80000007u), "interrupt") == 0);
+    CHECK(std::strcmp(riscv_cause_name(20), "unknown cause") == 0);
+    char out[200];
+    const size_t n = crash_json(out, sizeof(out), "zigbee", 0x4200abcdu, "load access fault", "3f2a9c1b9");
+    CHECK(as_string(out, n) == "{\"task\":\"zigbee\",\"pc\":\"0x4200abcd\",\"cause\":\"load access fault\",\"elf\":\"3f2a9c1b9\"}");
+    CHECK(std::strlen(out) == n);                          // usable as a C string
+    CHECK(crash_json(out, 20, "zigbee", 1, "x", "y") == 0 && out[0] == '\0');
+}
+
+void test_tail_json() {
+    char out[BatchWriter::kBudget];
+    TailHead h{};
+    h.boot = 2345678; h.prev_boot = 0; h.up_ms = 9000; h.clock_ms = 0;
+    h.reason = "power_on"; h.planned = nullptr; h.prev_clock_base_ms = 0; h.prev_sent = 0; h.crash_json = nullptr;
+    CHECK(as_string(out, tail_json(out, sizeof(out), h, nullptr)) ==
+          "{\"boot\":2345678,\"prev_boot\":0,\"up\":9000,\"clock\":0,\"reason\":\"power_on\",\"planned\":null,"
+          "\"prev_clock_base\":0,\"prev_sent\":0,\"crash\":null,\"lines\":[]}");
+
+    // Lines the cloud already has (1..prev_sent) stay out; never-queued (0) and unsent ones go.
+    Block b;
+    Ring prev(b.bytes, sizeof(b.bytes));
+    prev.format(kMagic, 1234567);
+    prev.push(3, 100, 'I', "a", "sent before");
+    prev.push(4, 200, 'W', "b", "sent too");
+    prev.push(5, 300, 'E', "c", "still in the backlog");
+    prev.push(0, 400, 'I', "d", "below the level");
+    h.reason = "panic"; h.planned = "restart"; h.prev_boot = 1234567; h.prev_sent = 4; h.prev_clock_base_ms = 1791290000000;
+    h.crash_json = "{\"task\":\"zigbee\"}";
+    CHECK(as_string(out, tail_json(out, sizeof(out), h, &prev)) ==
+          "{\"boot\":2345678,\"prev_boot\":1234567,\"up\":9000,\"clock\":0,\"reason\":\"panic\",\"planned\":\"restart\","
+          "\"prev_clock_base\":1791290000000,\"prev_sent\":4,\"crash\":{\"task\":\"zigbee\"},"
+          "\"lines\":[[300,\"E\",\"c\",\"still in the backlog\",5],[400,\"I\",\"d\",\"below the level\",0]]}");
+
+    // More than fits: the newest lines win, the result stays within the budget.
+    Block b2;
+    Ring many(b2.bytes, sizeof(b2.bytes));
+    many.format(kMagic, 1);
+    const std::string ctrl(150, '\x01');                   // 900 bytes once escaped
+    for (uint32_t s = 101; s <= 115; s++) many.push(s, s, 'I', "t", ctrl.c_str());
+    h.prev_sent = 0; h.crash_json = nullptr;
+    const size_t n = tail_json(out, sizeof(out), h, &many);
+    const std::string got = as_string(out, n);
+    CHECK(n > 0 && n <= BatchWriter::kBudget);
+    CHECK(got.find(",115]") != std::string::npos);
+    CHECK(got.find(",101]") == std::string::npos);
+    CHECK(got.substr(n - 2) == "]}");
+}
+
 }  // namespace
 
 int main() {
@@ -201,6 +318,11 @@ int main() {
     test_ring_survives_a_copy_and_rejects_garbage();
     test_ring_clear_keeps_identity();
     test_ring_unsealed();
+    test_line_json();
+    batch_repairs_cut_utf8();
+    test_batch_writer();
+    test_names();
+    test_tail_json();
     if (g_fail) { std::fprintf(stderr, "log_cloud_core_tests: %d failed\n", g_fail); return 1; }
     std::printf("log_cloud_core_tests: ok\n");
     return 0;
