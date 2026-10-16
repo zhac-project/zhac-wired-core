@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Host tests for log_cloud_core: the line filter, the level names, crc32 and the record ring
-// (Task 2), the JSON builders and the names (Task 3).
+// (Task 2), the JSON builders and the names (Task 3), the image id and the previous-run decision (Task 4).
 #include "log_cloud_core.h"
 
 #include <cstdio>
@@ -161,6 +161,46 @@ void test_ring_survives_a_copy_and_rejects_garbage() {
     CHECK(!Ring(torn.bytes, sizeof(torn.bytes)).valid(kMagic));
 }
 
+void test_ring_knows_its_image() {
+    Block b;
+    Ring r(b.bytes, sizeof(b.bytes));
+    r.format(kMagic, 42, 0xA1B2C3D4);
+    r.push(5, 500, 'E', "zigbee", "about to update");
+    Block copy = b;                           // what an image finds at its own no-init address
+    Ring again(copy.bytes, sizeof(copy.bytes));
+    CHECK(again.valid(kMagic, 0xA1B2C3D4) && again.hdr().image == 0xA1B2C3D4);
+    CHECK(!again.valid(kMagic, 0x0BADF00D));  // another firmware's block: never this image's tail
+    CHECK(!again.valid(kMagic));              // nor one checked without the image
+    r.clear();
+    CHECK(r.valid(kMagic, 0xA1B2C3D4));       // clear keeps the image
+}
+
+void test_prev_run() {
+    const auto P  = [](Planned p) { return static_cast<uint32_t>(p); };
+    const auto is = [](PrevRun r, bool use, Planned p) {
+        return r.use_tail == use && r.planned == static_cast<uint32_t>(p);
+    };
+    // The same image restarted itself, or restarted unplanned, or crashed: its own tail, its own code.
+    CHECK(is(prev_run(true, P(Planned::Restart), false, Reset::Sw, false), true, Planned::Restart));
+    CHECK(is(prev_run(true, P(Planned::None), false, Reset::Sw, false), true, Planned::None));
+    CHECK(is(prev_run(true, P(Planned::None), false, Reset::Panic, false), true, Planned::None));
+    // ... also long after a rollback: the flag stays set until the next update, the tail explains the restart.
+    CHECK(is(prev_run(true, P(Planned::Restart), false, Reset::Sw, true), true, Planned::Restart));
+    CHECK(is(prev_run(true, P(Planned::None), false, Reset::Sw, true), true, Planned::None));
+    // The first boot of a new image: update, and no tail, even a valid-looking one from an earlier life.
+    CHECK(is(prev_run(false, 0, true, Reset::Sw, false), false, Planned::Update));
+    CHECK(is(prev_run(true, P(Planned::None), true, Reset::Sw, false), false, Planned::Update));
+    // The boot right after a rollback: the old image's block is gone, or is its own pre-update tail.
+    CHECK(is(prev_run(false, 0, false, Reset::Sw, true), false, Planned::Rollback));
+    CHECK(is(prev_run(true, P(Planned::Update), false, Reset::Sw, true), false, Planned::Rollback));
+    // A block that announced an image change is stale even without the flag.
+    CHECK(is(prev_run(true, P(Planned::Rollback), false, Reset::Sw, false), false, Planned::None));
+    CHECK(is(prev_run(true, P(Planned::Update), false, Reset::Sw, false), false, Planned::None));
+    // Power-on and crashes without a tail never read the flag.
+    CHECK(is(prev_run(false, 0, false, Reset::PowerOn, true), false, Planned::None));
+    CHECK(is(prev_run(false, 0, false, Reset::Panic, true), false, Planned::None));
+}
+
 void test_ring_clear_keeps_identity() {
     Block b;
     Ring r(b.bytes, sizeof(b.bytes));
@@ -316,6 +356,8 @@ int main() {
     test_ring_wraps();
     test_ring_truncates_and_ignores_other_levels();
     test_ring_survives_a_copy_and_rejects_garbage();
+    test_ring_knows_its_image();
+    test_prev_run();
     test_ring_clear_keeps_identity();
     test_ring_unsealed();
     test_line_json();

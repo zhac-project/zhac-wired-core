@@ -298,6 +298,15 @@ const char* ota_update_state() { return s_state; }
 
 const char* ota_update_rollback_reason() { return s_rollback_why[0] ? s_rollback_why : nullptr; }
 
+bool ota_update_rolled_back() {
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t n = 0;   // nvs_put_str erases the key for "", so present = set
+    const bool set = nvs_get_str(h, kNvsRollback, nullptr, &n) == ESP_OK && n > 1;
+    nvs_close(h);
+    return set;
+}
+
 bool ota_update_start(const char* url, const char** err) {
     if (!url || strncmp(url, "https://", 8) != 0) { *err = "https:// URL required"; return false; }
     if (strlen(url) >= sizeof(s_url)) { *err = "URL too long"; return false; }

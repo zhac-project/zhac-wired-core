@@ -47,6 +47,7 @@ public:
         uint32_t sent;            // last backlog sequence number handed to the cloud link
         int64_t  clock_base_ms;   // wall clock minus uptime; 0 = the clock was never set
         uint32_t planned;         // Planned code, written just before a planned restart
+        uint32_t image;           // the firmware that writes this ring (the first bytes of its ELF SHA-256)
         uint32_t head;            // offset of the next write in the data area
         uint32_t tail;            // offset of the oldest record
         uint32_t used;            // bytes in use
@@ -54,18 +55,21 @@ public:
         uint32_t dropped;         // records dropped to make room since take_dropped()
         uint32_t crc;             // crc32 of every field above
     };
-    static constexpr uint32_t kVersion = 1;
+    static constexpr uint32_t kVersion = 2;
 
     // sealed (the restart tail): the header crc is kept current and valid() can vouch for the block. Unsealed
     // (the PSRAM backlog, which never survives a restart): the crc is never computed, so push/pop stay cheap;
     // valid() is not meaningful there.
     Ring(void* block, size_t bytes, bool sealed = true);
-    void     format(uint32_t magic, uint32_t run_id);   // empty ring, every header field reset
-    bool     valid(uint32_t magic) const;              // header crc, bounds and every record's frame
+    // image: the firmware's id (0 when the ring never outlives the run). The restart tail sits after the image's
+    // own code and data, so another image finds garbage there, or a block it must not read: valid() wants the
+    // same image.
+    void     format(uint32_t magic, uint32_t run_id, uint32_t image = 0);   // empty ring, every header field reset
+    bool     valid(uint32_t magic, uint32_t image = 0) const;   // magic, image, header crc, bounds, every frame
     void     push(uint32_t seq, uint64_t up_ms, char level, const char* tag, const char* msg);
     bool     peek(Line* out) const;                    // the oldest record
     bool     pop_if(uint32_t seq);                     // drops the oldest record if it carries seq
-    void     clear();                                  // empty; keeps run_id, sent, planned, clock_base_ms
+    void     clear();                                  // empty; keeps run_id, image, sent, planned, clock_base_ms
     uint32_t take_dropped();
     uint32_t count() const { return h_->count; }
     uint32_t used() const { return h_->used; }
@@ -127,6 +131,17 @@ const char* reset_name(Reset r);              // "power_on" "panic" "int_wdt" "t
 // Written into the tail just before a planned esp_restart(), so the next run can tell why.
 enum class Planned : uint32_t { None = 0, Update = 1, Restart = 2, Rollback = 3 };
 const char* planned_name(uint32_t p);         // nullptr for None or an unknown value
+
+// What a boot makes of the previous run (spec §4.4 Limits). The tail block does not survive an image change
+// (it moves with the image), so update and rollback come from state that does:
+//   tail_valid    the block passed valid() for this image; tail_planned is its Planned code
+//   new_image     the first boot of an OTA image (still on trial: the bootloader undoes it if it restarts)
+//   rolled_back   the hub's rollback flag (NVS), which stays set until the next update
+struct PrevRun {
+    bool     use_tail;   // the block is this image's previous run: its lines and header can be read
+    uint32_t planned;    // Planned code for log.tail
+};
+PrevRun prev_run(bool tail_valid, uint32_t tail_planned, bool new_image, Reset reason, bool rolled_back);
 
 const char* riscv_cause_name(uint32_t mcause);   // "load access fault", …; "interrupt"; "unknown cause"
 

@@ -82,11 +82,12 @@ Ring::Ring(void* block, size_t bytes, bool sealed)
 
 void Ring::seal() { if (sealed_) h_->crc = crc32(h_, offsetof(Header, crc)); }
 
-void Ring::format(uint32_t magic, uint32_t run_id) {
+void Ring::format(uint32_t magic, uint32_t run_id, uint32_t image) {
     std::memset(h_, 0, sizeof(Header));
     h_->magic   = magic;
     h_->version = kVersion;
     h_->run_id  = run_id;
+    h_->image   = image;
     seal();
 }
 
@@ -137,9 +138,9 @@ bool Ring::decode_at(uint32_t off, Line* out, uint32_t* len_out) const {
     return true;
 }
 
-bool Ring::valid(uint32_t magic) const {
+bool Ring::valid(uint32_t magic, uint32_t image) const {
     if (cap_ < kRecHead) return false;
-    if (h_->magic != magic || h_->version != kVersion) return false;
+    if (h_->magic != magic || h_->version != kVersion || h_->image != image) return false;
     if (h_->crc != crc32(h_, offsetof(Header, crc))) return false;
     if (h_->head >= cap_ || h_->tail >= cap_ || h_->used > cap_ || h_->count > cap_ / kRecHead) return false;
     uint32_t off = h_->tail, total = 0;
@@ -282,6 +283,20 @@ const char* planned_name(uint32_t p) {
     case Planned::Rollback: return "rollback";
     default:                return nullptr;
     }
+}
+
+PrevRun prev_run(bool tail_valid, uint32_t tail_planned, bool new_image, Reset reason, bool rolled_back) {
+    constexpr auto code = [](Planned p) { return static_cast<uint32_t>(p); };
+    // On trial, the previous run was always another image: whatever sits at this address is not ours to read.
+    if (new_image) return {false, code(Planned::Update)};
+    // A block that announced an image change was left before another image ran: this image's tail from an
+    // earlier life (update, then rollback), not its previous run.
+    const bool left = tail_planned == code(Planned::Update) || tail_planned == code(Planned::Rollback);
+    if (tail_valid && !left) return {true, tail_planned};
+    // The flag outlives the boot after the rollback, so it counts only when no tail of this image's own runs
+    // explains a software restart: that is the boot right after the rollback.
+    if (reason == Reset::Sw && rolled_back) return {false, code(Planned::Rollback)};
+    return {false, code(Planned::None)};
 }
 
 const char* riscv_cause_name(uint32_t mcause) {

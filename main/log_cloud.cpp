@@ -5,8 +5,8 @@
 //
 // The log hook calls log_cloud_capture() for every line. It copies the line into the PSRAM backlog when the
 // hub's level lets it through, and always into the restart tail: a 4 KB ring in no-init RAM that the next run
-// reads. A low-priority task sends the backlog as log.batch events. Once per run it sends log.tail: the reset
-// reason, a fresh crash's summary, and the previous run's lines the cloud never got.
+// of the same firmware reads. A low-priority task sends the backlog as log.batch events. Once per run it sends
+// log.tail: the reset reason, a fresh crash's summary, and the previous run's lines the cloud never got.
 //
 // Rules this file keeps:
 // - The capture only copies under a spinlock: it never sends, logs, allocates or blocks.
@@ -21,9 +21,11 @@
 #include <cstring>
 #include <sys/time.h>
 
+#include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -35,7 +37,11 @@
 #include "esp_flash.h"
 #define LOG_CLOUD_CRASH_SUMMARY 1
 #endif
+#if !CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+#error "log_cloud_boot() tells an update's first boot by the OTA trial state (ESP_OTA_IMG_PENDING_VERIFY)"
+#endif
 
+#include "ota_update.h"
 #include "remote_client.h"
 #include "remote_state.h"
 #include "sys_state.h"
@@ -241,17 +247,29 @@ void uploader(void*) {
 
 void log_cloud_boot() {
     s_reason = map_reset(esp_reset_reason());
-    if (s_tail.valid(kTailMagic)) {
+    // The tail block sits after this image's own code and data, so another image puts it elsewhere (spec §4.4
+    // Limits). The header's image id keeps a block another image left from being read as ours, and update /
+    // rollback come from the OTA trial state and the hub's rollback flag (prev_run).
+    uint32_t image = 0;
+    std::memcpy(&image, esp_app_get_description()->app_elf_sha256, sizeof(image));
+    esp_ota_img_states_t ota = ESP_OTA_IMG_UNDEFINED;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const bool on_trial =
+        running && esp_ota_get_state_partition(running, &ota) == ESP_OK && ota == ESP_OTA_IMG_PENDING_VERIFY;
+    const bool valid = s_tail.valid(kTailMagic, image);
+    const PrevRun prev =
+        prev_run(valid, valid ? s_tail.hdr().planned : 0, on_trial, s_reason, ota_update_rolled_back());
+    if (prev.use_tail) {
         const Ring::Header& ph = s_tail.hdr();
         s_prev.prev_boot          = ph.run_id;
         s_prev.prev_sent          = ph.sent;
         s_prev.prev_clock_base_ms = ph.clock_base_ms;
-        s_prev.planned            = planned_name(ph.planned);
         s_prev_block = static_cast<uint8_t*>(
             heap_caps_aligned_alloc(8, kTailBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (s_prev_block) std::memcpy(s_prev_block, s_tail_block, kTailBytes);
     }
-    s_tail.format(kTailMagic, remote_client_boot_epoch());
+    s_prev.planned = planned_name(prev.planned);
+    s_tail.format(kTailMagic, remote_client_boot_epoch(), image);
 #ifdef LOG_CLOUD_CRASH_SUMMARY
     read_crash();
 #endif
