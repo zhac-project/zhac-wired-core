@@ -16,20 +16,24 @@
 #include "remote_client.h"
 #include "remote_nvs.h"
 #include "remote_state.h"
+#include "log_cloud.h"
 
 static const char* TAG = "api_remote";
 
 size_t remote_status_json(char* out, size_t cap) {
     RemoteStatusSnap s{};
     remote_client_get_status(&s);
+    uint32_t log_sent = 0, log_dropped = 0;
+    log_cloud_stats(&log_sent, &log_dropped);   // the Remote card's "Log to cloud" counters (spec 2026-10-06 §3.1)
     // State by name, as net-core sends it: the web UI's badge maps "READY" to
     // "Connected" and showed nothing for a bare number.
     return (size_t)snprintf(out, cap,
         "{\"enabled\":%s,\"state\":\"%s\",\"connected_since\":%u,\"last_event_at\":%u,"
-        "\"rtt_ms\":%u,\"tx_drops\":%u,\"auth_fails\":%u}",
+        "\"rtt_ms\":%u,\"tx_drops\":%u,\"auth_fails\":%u,\"log_sent\":%u,\"log_dropped\":%u}",
         s.enabled ? "true" : "false", remote_state_name((RemoteState)s.state),
         (unsigned)s.connected_since, (unsigned)s.last_event_at,
-        (unsigned)s.rtt_ms, (unsigned)s.tx_drops, (unsigned)s.auth_fails);
+        (unsigned)s.rtt_ms, (unsigned)s.tx_drops, (unsigned)s.auth_fails,
+        (unsigned)log_sent, (unsigned)log_dropped);
 }
 
 const char* remote_connect_req(const char* body, size_t len) {

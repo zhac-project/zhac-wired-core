@@ -56,6 +56,13 @@ bool sys_remote_scripts();
 bool sys_set_remote_scripts(bool on);
 constexpr bool sys_remote_scripts_after_save(bool on, bool saved) { return on && saved; }
 
+// "Log to cloud" (spec 2026-10-06 cloud logs §4.1): 0 off, 1 errors, 2 warnings, 3 everything (logcloud::Level).
+// NVS sys_cfg/log_cloud, missing = off, so a storage reset turns it off.
+uint8_t sys_log_cloud();
+// Saves to NVS first; RAM takes the new level only once it is saved. A failed save refuses and leaves the
+// running level unchanged (spec §4.1). false = the save failed (or the level is not 0..3).
+bool sys_set_log_cloud(uint8_t level);
+
 // Copy the current API token into out (33 bytes incl NUL). Returns length.
 size_t sys_get_api_token(char* out, size_t cap);
 

@@ -58,6 +58,7 @@
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "api_remote.h"
 #include "remote_client.h"
 #include "remote_allow.h"
@@ -1109,13 +1110,23 @@ void ws_push(const char* event, JsonDocument& data) {
 // What this firmware supports for remote editing (spec 2026-10-05 §3.6): rules.v1 = paged rule.list,
 // rule.create answers its id, rule.update takes base, rule.check; scripts.v1 = the script ops and events
 // and the switch. Sent in remote.auth and in hub.caps.
-static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\"]";
+// logs.v1: this firmware sends log.batch / log.tail and reports its "Log to cloud" level (spec 2026-10-06).
+static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\",\"logs.v1\"]";
+
+static const char* log_level_now() { return logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())); }
+
+// Worst cases (longest level "everything", remote_scripts false), checked at build time (spec §8): the
+// hub.caps payload must fit ws_push_hub_caps' buffer, the remote.auth extra remote_client.cpp's extra[160].
+static_assert(sizeof("{\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+                     "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
+static_assert(sizeof(",\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+                     "\"log_to_cloud\":\"everything\"") <= 160, "remote_hello_extra outgrew remote_client's extra[160]");
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
-    char buf[96];
-    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s}", kRemoteCapsJson,
-                           sys_remote_scripts() ? "true" : "false");
+    char buf[160];   // 95 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
+    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"}",
+                           kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now());
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
 }
 
@@ -1602,6 +1613,7 @@ static void cmd_storage_reset(int fd, uint32_t id) {
     reply_ok_or_err(fd, id, e == ESP_OK, esp_err_to_name(e));
     if (e != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(500));
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     esp_restart();
 }
 
@@ -1612,8 +1624,26 @@ static void cmd_zigbee_reset(int fd, uint32_t id) {
     }
     reply_ok_or_err(fd, id, true, nullptr);
     vTaskDelay(pdMS_TO_TICKS(500));
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     esp_restart();
 }
+
+#ifdef CONFIG_ZHAC_TEST_CRASH_CMD
+// Test builds only (Kconfig ZHAC_TEST_CRASH_CMD; never in a release): a real store fault, so the cloud's crash
+// report (log.tail with the core dump summary) can be checked on a hub. The address is read through a volatile
+// so the compiler cannot turn the store into a trap instruction.
+static void crash_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    volatile uintptr_t bad = 0;
+    *reinterpret_cast<volatile uint32_t*>(bad) = 1;
+    vTaskDelete(nullptr);
+}
+static void cmd_debug_crash(int fd, uint32_t id) {
+    ESP_LOGW(TAG, "debug.crash: crashing on purpose in 0.5 s");
+    reply_ok_or_err(fd, id, true, nullptr);
+    xTaskCreate(crash_task, "crash", 2048, nullptr, 2, nullptr);
+}
+#endif
 
 // ── system.restart (plain reboot, nothing erased) ──────────────────────
 // Settings → "Restart hub". Unlike cmd_storage_reset/cmd_zigbee_reset above,
@@ -1630,6 +1660,7 @@ static void restart_task(void*) {
 }
 static void cmd_system_restart(int fd, uint32_t id) {
     ESP_LOGI(TAG, "restart requested from the web UI");
+    log_cloud_planned_restart(logcloud::Planned::Restart);
     reply_ok_or_err(fd, id, true, nullptr);
     if (xTaskCreate(restart_task, "restart", 2048, nullptr, 2, nullptr) != pdPASS) {
         vTaskDelay(pdMS_TO_TICKS(500));   // task create (OOM) failed -- still honor the request
@@ -1713,6 +1744,9 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "zigbee.reset")        == 0) { cmd_zigbee_reset(fd, id);             return; }
     if (std::strcmp(cmd, "system.storage_reset") == 0) { cmd_storage_reset(fd, id);           return; }
     if (std::strcmp(cmd, "system.restart")       == 0) { cmd_system_restart(fd, id);          return; }
+#ifdef CONFIG_ZHAC_TEST_CRASH_CMD
+    if (std::strcmp(cmd, "debug.crash")          == 0) { cmd_debug_crash(fd, id);             return; }
+#endif
     if (std::strcmp(cmd, "zigbee.permit_join")  == 0) { cmd_zigbee_permit_join(fd, id, doc);  return; }
     if (std::strcmp(cmd, "zigbee.permit_join.status") == 0) { cmd_zigbee_permit_join_status(fd, id); return; }
     if (std::strcmp(cmd, "uplink.get")          == 0) { cmd_uplink_get(fd, id);              return; }
@@ -1753,8 +1787,8 @@ extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
 // remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default
 // (none), which dual-chip and mono keep, so the cloud treats those as read-only.
 extern "C" size_t remote_hello_extra(char* out, size_t cap) {
-    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s", kRemoteCapsJson,
-                           sys_remote_scripts() ? "true" : "false");
+    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"", kRemoteCapsJson,
+                           sys_remote_scripts() ? "true" : "false", log_level_now());
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 #endif

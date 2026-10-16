@@ -18,6 +18,11 @@ const char* ota_update_state();
 // Why the previous update was undone, or nullptr. Cleared when an update starts.
 const char* ota_update_rollback_reason();
 
+// The same flag read straight from NVS, for boot code that runs before ota_update_init() (cloud logs). Set
+// when the health deadline undid an update; it stays set until the next update starts or an image is kept.
+// Reads NVS: main task only.
+bool ota_update_rolled_back();
+
 // False (and `*err` set) when an update is already running or the URL is
 // not https://.
 bool ota_update_start(const char* url, const char** err);

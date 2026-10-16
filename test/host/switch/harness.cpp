@@ -7,6 +7,7 @@
 // Exit code = number of mismatches. See run.sh.
 #include "stubs.h"
 #include "sys_state.h"
+#include "log_cloud.h"
 
 #include <map>
 #include <string>
@@ -37,6 +38,9 @@ const char* esp_err_to_name(esp_err_t code) {
         default: return "ESP_ERR_UNKNOWN";
     }
 }
+
+static int g_lc_setting = 0;   // log_cloud_on_setting() calls
+void log_cloud_on_setting() { g_lc_setting++; }
 
 void ws_push_hub_caps() { g_pushes.push_back(sys_remote_scripts()); }
 
@@ -281,6 +285,62 @@ int main() {
         printf("%-44s | ret=%s, RAM flags applied, NVS untouched, no log line | %s\n",
                "other flags, NVS failing (unchanged)", r ? "true" : "false", ok ? "ok" : "MISMATCH");
         if (!ok) g_mismatches++;
+    }
+
+    // "Log to cloud" (spec 2026-10-06 §4.1): same fake NVS, key sys_cfg/log_cloud.
+    {
+        const char* kLc = "sys_cfg/log_cloud";
+        auto lc_row = [&](const char* name, bool ok) {
+            printf("%-44s | %s\n", name, ok ? "ok" : "MISMATCH");
+            if (!ok) g_mismatches++;
+        };
+        auto lc_nv = [&]() { auto it = g_flash.find(kLc); return it == g_flash.end() ? -1 : (int)it->second; };
+        printf("\nlog_to_cloud\n");
+        world(-1);
+        lc_row("missing key = off", sys_log_cloud() == 0);
+        for (const char* bad : {"{\"log_to_cloud\":\"loud\"}", "{\"log_to_cloud\":2}", "{\"log_to_cloud\":true}",
+                                "{\"log_to_cloud\":\"\"}", "{\"log_to_cloud\":\"Errors\"}"}) {
+            world(-1);
+            g_flash[kLc] = 1;
+            sys_state_init();
+            g_lc_setting = 0;
+            const bool r = apply(bad);
+            lc_row(bad, !r && sys_log_cloud() == 1 && lc_nv() == 1 && g_lc_setting == 0 && g_pushes.empty());
+        }
+        world(-1);
+        bool r = apply("{\"log_to_cloud\":null}");
+        lc_row("null counts as absent", r && sys_log_cloud() == 0 && g_opens_rw == 0 && g_lc_setting == 0);
+        world(-1);
+        r = apply("{\"log_to_cloud\":\"warnings\"}");
+        lc_row("good value: saved, applied, backlog hook, caps push",
+               r && sys_log_cloud() == 2 && lc_nv() == 2 && g_lc_setting == 1 && g_pushes.size() == 1);
+        r = apply("{\"log_to_cloud\":\"off\"}");
+        lc_row("then off: saved, applied, hook called again",
+               r && sys_log_cloud() == 0 && lc_nv() == 0 && g_lc_setting == 2 && g_pushes.size() == 2);
+        world(-1);
+        g_flash[kLc] = 3;
+        sys_state_init();
+        g_lc_setting = 0;
+        g_pushes.clear();
+        r = apply("{\"log_to_cloud\":\"everything\"}");
+        lc_row("same level again: saved (repair), no hook, no push",
+               r && sys_log_cloud() == 3 && g_lc_setting == 0 && g_pushes.empty() && g_opens_rw == 1);
+        for (const Fail& f : {f_open, f_set, f_commit}) {
+            world(-1);
+            g_flash[kLc] = 3;
+            sys_state_init();
+            g_lc_setting = 0;
+            g_fail = f;
+            r = apply("{\"log_to_cloud\":\"off\"}");
+            lc_row("save FAILS, off: refused, level unchanged", !r && sys_log_cloud() == 3 && lc_nv() == 3 &&
+                   g_lc_setting == 0 && g_pushes.empty() && logged("not saved"));
+            g_fail = none;
+        }
+        world(-1);
+        g_fail = f_set;
+        r = apply("{\"log_to_cloud\":\"errors\"}");
+        lc_row("save FAILS, on: refused, stays off", !r && sys_log_cloud() == 0 && lc_nv() == -1 && g_lc_setting == 0);
+        g_fail = none;
     }
 
     printf("\n%s (%d mismatch%s)\n", g_mismatches ? "FAILED" : "ALL OK", g_mismatches, g_mismatches == 1 ? "" : "es");

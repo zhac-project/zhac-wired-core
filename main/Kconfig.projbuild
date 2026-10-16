@@ -176,6 +176,15 @@ menu "ZHAC wired-core board"
             Green blink while the join window is open, blue flash on Zigbee
             traffic, off otherwise. The S31 dev board has one on GPIO 60.
 
+    config ZHAC_TEST_CRASH_CMD
+        bool "Test builds only: the debug.crash command"
+        default n
+        help
+            Adds the local WebSocket command debug.crash: the hub answers, then
+            crashes on purpose half a second later (a store to address 0), so the
+            cloud's crash report can be checked on a real hub. The cloud relay
+            never passes it. Never enable this in a release build.
+
 endmenu
 
 # The cloud link (remote_client, pulled from zhac-net-core by path). That

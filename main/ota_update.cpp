@@ -28,6 +28,7 @@
 #include "sys_state.h"
 #include "rule_store.h"
 #include "ws_bridge.h"
+#include "log_cloud.h"
 #include "ws_server.h"
 #include "zap_store.h"
 
@@ -123,6 +124,7 @@ void health_tick(void*) {
     s_state = "rolling_back";
     nvs_put_str(kNvsRollback, why);
     esp_timer_stop(s_health_timer);
+    log_cloud_planned_restart(logcloud::Planned::Rollback);
     esp_ota_mark_app_invalid_rollback_and_reboot();
 }
 
@@ -248,6 +250,7 @@ void run(const char* url) {
     rule_store_flush_now();
     zap_store_flush_now();
     vTaskDelay(pdMS_TO_TICKS(2000));
+    log_cloud_planned_restart(logcloud::Planned::Update);
     esp_restart();
 }
 
@@ -294,6 +297,15 @@ void ota_update_init() {
 const char* ota_update_state() { return s_state; }
 
 const char* ota_update_rollback_reason() { return s_rollback_why[0] ? s_rollback_why : nullptr; }
+
+bool ota_update_rolled_back() {
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t n = 0;   // nvs_put_str erases the key for "", so present = set
+    const bool set = nvs_get_str(h, kNvsRollback, nullptr, &n) == ESP_OK && n > 1;
+    nvs_close(h);
+    return set;
+}
 
 bool ota_update_start(const char* url, const char** err) {
     if (!url || strncmp(url, "https://", 8) != 0) { *err = "https:// URL required"; return false; }

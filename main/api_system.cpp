@@ -17,6 +17,7 @@
 #include "sys_state.h"
 #include "zigbee_diagnostics.h"
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "esp_heap_caps.h"
 #include "ws_bridge.h"
 
@@ -80,6 +81,30 @@ bool system_apply_settings(const char* json, size_t len) {
                          on ? "it stays off" : "it is off now but may be on again after a reboot");
                 return false;
             }
+        }
+    }
+
+    // "Log to cloud" (spec 2026-10-06 cloud logs §4.1). Only this hub's own page gets here with the key: the
+    // cloud relay answers settings.set carrying it with local_only. A string naming a level sets it; any
+    // other non-null value is refused ("bad settings"); null counts as absent, as for the relay. The level is
+    // always saved, even when RAM already holds it: after a failed save NVS may differ, and saving again
+    // repairs that (NVS skips a write of the same value). A change empties the backlog when it turns logging
+    // off, and pushes hub.caps so the cloud knows at once.
+    if (!doc["log_to_cloud"].isNull()) {
+        logcloud::Level want{};
+        if (!doc["log_to_cloud"].is<const char*>() ||
+            !logcloud::parse_level(doc["log_to_cloud"].as<const char*>(), &want))
+            return false;
+        const uint8_t was = sys_log_cloud();
+        const bool saved = sys_set_log_cloud(static_cast<uint8_t>(want));
+        if (sys_log_cloud() != was) {
+            ESP_LOGW(TAG, "log to cloud: %s", logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())));
+            log_cloud_on_setting();
+            ws_push_hub_caps();
+        }
+        if (!saved) {
+            ESP_LOGE(TAG, "log to cloud: %s not saved", logcloud::level_name(want));
+            return false;
         }
     }
 

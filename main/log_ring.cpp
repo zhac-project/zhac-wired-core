@@ -9,6 +9,7 @@
 //   - WS    (frame {type:"log", entry:{…}})
 
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -266,9 +267,10 @@ int log_vprintf(const char* fmt, va_list args) {
             }
             clean[ci] = '\0';
 
+            const int64_t now_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_mux);
             LogEntry& e = s_ring[s_head];
-            e.ts_us = esp_timer_get_time();
+            e.ts_us = now_us;
             memcpy(e.line, clean, ci + 1);
             s_head = (s_head + 1) % LOG_RING_SIZE;
             if (s_count < LOG_RING_SIZE) s_count++;
@@ -281,7 +283,10 @@ int log_vprintf(const char* fmt, va_list args) {
             char tag[32];
             const char* msg = nullptr;
             parse_line(clean, &lvl, tag, sizeof(tag), &msg);
-            if (msg) dispatch_to_sinks("s3", lvl, tag, msg);
+            if (msg) {
+                log_cloud_capture(lvl, tag, msg, now_us);   // copies only: never sends, logs or allocates
+                dispatch_to_sinks("s3", lvl, tag, msg);
+            }
         }
     }
     va_end(args2);
