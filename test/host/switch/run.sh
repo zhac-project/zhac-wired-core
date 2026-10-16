@@ -14,10 +14,11 @@ set -e
 H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$H/../../../main" && pwd)
 AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
+NC=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # utf8_seq.h
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-switch.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
-cp "$R/sys_state.cpp" "$R/sys_state.h" "$R/ws_bridge.h" "$H/stubs.h" "$H/slice_tu.cpp" "$H/harness.cpp" "$W/"
+cp "$R/sys_state.cpp" "$R/sys_state.h" "$R/ws_bridge.h" "$R/log_cloud.h" "$R/log_cloud_core.h" "$R/log_cloud_core.cpp" "$R/json_buf.h" "$H/stubs.h" "$H/slice_tu.cpp" "$H/harness.cpp" "$W/"
 for h in nvs.h esp_log.h esp_random.h auth.h; do echo '#include "stubs.h"' > "$W/$h"; done
 sed -n '/^bool system_apply_settings/,/^}/p' "$R/api_system.cpp" > "$W/system_apply_settings.inc"
 test "$(wc -l < "$W/system_apply_settings.inc")" -gt 40   # the slice found the whole function
@@ -40,11 +41,12 @@ esac
 
 cd "$W"
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++
-FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ"
+FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ -I$NC"
 g++ $FLAGS -c sys_state.cpp -o sys_state.o
+g++ $FLAGS -c log_cloud_core.cpp -o log_cloud_core.o
 g++ $FLAGS -c slice_tu.cpp -o slice_tu.o
 g++ $FLAGS -c harness.cpp -o harness.o
-g++ $FLAGS sys_state.o slice_tu.o harness.o -o harness
+g++ $FLAGS sys_state.o log_cloud_core.o slice_tu.o harness.o -o harness
 set +e
 ./harness
 rc=$?

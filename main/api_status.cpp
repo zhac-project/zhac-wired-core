@@ -34,6 +34,7 @@
 #include "ws_server.h"
 #include "zigbee_pool.h"
 #include "log_ring.h"
+#include "log_cloud_core.h"
 #include "lua_engine.h"   // lua_engine_scripts_held
 #include "remote_client.h"
 #include "remote_state.h"
@@ -173,6 +174,8 @@ void api_status_fill(JsonObject doc) {
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     // The hub page shows its "Allow script changes from the cloud" switch only when this is present.
     doc["remote_scripts"] = sys_remote_scripts();
+    // ... and its "Log to cloud" switch only when this is (spec 2026-10-06 §4.1).
+    doc["log_to_cloud"] = logcloud::level_name(logcloud::level_from_u8(sys_log_cloud()));
 #endif
     // lua_engine's boot-loop guard held the scripts (two crashes in a row while they started): the Scripts
     // page says so. The script that was loading at the last crash, "" when unknown. Only while it holds.

@@ -1110,13 +1110,23 @@ void ws_push(const char* event, JsonDocument& data) {
 // What this firmware supports for remote editing (spec 2026-10-05 §3.6): rules.v1 = paged rule.list,
 // rule.create answers its id, rule.update takes base, rule.check; scripts.v1 = the script ops and events
 // and the switch. Sent in remote.auth and in hub.caps.
-static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\"]";
+// logs.v1: this firmware sends log.batch / log.tail and reports its "Log to cloud" level (spec 2026-10-06).
+static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\",\"logs.v1\"]";
+
+static const char* log_level_now() { return logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())); }
+
+// Worst cases (longest level "everything", remote_scripts false), checked at build time (spec §8): the
+// hub.caps payload must fit ws_push_hub_caps' buffer, the remote.auth extra remote_client.cpp's extra[160].
+static_assert(sizeof("{\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+                     "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
+static_assert(sizeof(",\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+                     "\"log_to_cloud\":\"everything\"") <= 160, "remote_hello_extra outgrew remote_client's extra[160]");
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
-    char buf[96];
-    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s}", kRemoteCapsJson,
-                           sys_remote_scripts() ? "true" : "false");
+    char buf[160];   // 95 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
+    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"}",
+                           kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now());
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
 }
 
@@ -1777,8 +1787,8 @@ extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
 // remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default
 // (none), which dual-chip and mono keep, so the cloud treats those as read-only.
 extern "C" size_t remote_hello_extra(char* out, size_t cap) {
-    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s", kRemoteCapsJson,
-                           sys_remote_scripts() ? "true" : "false");
+    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"", kRemoteCapsJson,
+                           sys_remote_scripts() ? "true" : "false", log_level_now());
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 #endif
