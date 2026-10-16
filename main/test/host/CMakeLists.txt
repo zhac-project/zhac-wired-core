@@ -29,3 +29,14 @@ add_executable(devlist_page_tests test_devlist_page.cpp)
 target_include_directories(devlist_page_tests PRIVATE
     "${ZHAC_COMPONENTS}/components/arduinojson/src")
 add_test(NAME devlist_page COMMAND devlist_page_tests)
+
+# json_buf.h (Task 3) includes utf8_seq.h from zhac-net-core's ws_server (a sibling checkout).
+set(ZHAC_NET_CORE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../zhac-net-core" CACHE PATH "zhac-net-core checkout")
+
+add_executable(log_cloud_core_tests
+    test_log_cloud_core.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../log_cloud_core.cpp)
+target_include_directories(log_cloud_core_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    ${ZHAC_NET_CORE}/components/ws_server/include)
+add_test(NAME log_cloud_core COMMAND log_cloud_core_tests)
