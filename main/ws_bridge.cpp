@@ -1863,6 +1863,22 @@ static void on_device_leave(const Event& e) {
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("device.removed", buf, (size_t)n);
 }
 
+// A device ended a long silence, usually by answering an availability ping, which changes no state and so
+// sends no attr.changed. Push its new last_seen alone, as an attr.bulk entry with no attrs (the hub page and
+// the cloud both merge it as is), the way zigbee2mqtt publishes last_seen. Without a clock there is nothing
+// to say.
+static void on_device_seen(const Event& e) {
+    if (!push_listeners()) return;
+    const uint32_t t = esp_zigbee_backend_wall_clock_s();
+    if (!t) return;
+    uint64_t ieee = 0;
+    std::memcpy(&ieee, e.data, sizeof(ieee));
+    char buf[80];
+    const int n = snprintf(buf, sizeof(buf), "[{\"ieee\":\"0x%016" PRIX64 "\",\"last_seen\":%" PRIu32 ",\"attrs\":{}}]",
+                           ieee, t);
+    if (n > 0 && (size_t)n < sizeof(buf)) push_event("attr.bulk", buf, (size_t)n);
+}
+
 // Rules changed by any door (WebSocket, REST, a backup restore) -> one push,
 // built here from the store so REST edits reach open tabs and the relay too.
 // rule.added / rule.updated carry the row rule.list carries (rule_row_json: escaped, UTF-8-safe, in a
@@ -1912,6 +1928,7 @@ void ws_bridge_install() {
     event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, on_zcl_attr);
     event_bus_subscribe(EventType::DEVICE_JOIN, on_device_join);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
+    event_bus_subscribe(EventType::DEVICE_SEEN, on_device_seen);
     event_bus_subscribe(EventType::RULE_CHANGED, on_rule_changed);
     esp_zb_netmap_set_listener(on_netmap_event);
     lua_engine_set_error_hook(on_script_error);
