@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Reached only through the gated rule in main/idf_component.yml. The same rule
+# is repeated on both dependencies so a default build, which still discovers
+# this directory, never fetches them either.
+#
+# Same pins as tools/c6-rcp-installer: the pair known to build on IDF 6.0.
+# tools/build-c5-wifi-cp.sh builds the C5 image from THIS esp_hosted's slave/
+# project, so host and co-processor always speak one protocol version.
+dependencies:
+  idf: ">=6.0"
+  espressif/esp_hosted:
+    version: "==2.12.13"
+    rules:
+      - if: 'target == "esp32p4" && $CONFIG{ZHAC_WIFI_HOSTED} == True'
+  espressif/esp_wifi_remote:
+    version: ">=0.10,<2.0"
+    rules:
+      - if: 'target == "esp32p4" && $CONFIG{ZHAC_WIFI_HOSTED} == True'

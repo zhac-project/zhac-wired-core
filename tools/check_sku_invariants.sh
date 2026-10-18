@@ -35,7 +35,8 @@ check() {
     label="$1"
     pattern="$2"
     hint="$3"
-    if hits=$(grep -rnE "$pattern" $SCAN 2>/dev/null | strip_comments) && [ -n "$hits" ]; then
+    skip="${4:+--exclude-dir=$4}"
+    if hits=$(grep -rnE $skip "$pattern" $SCAN 2>/dev/null | strip_comments) && [ -n "$hits" ]; then
         echo "FAIL: $label" >&2
         echo "$hits" >&2
         echo "  -> $hint" >&2
@@ -48,9 +49,14 @@ check "RainMaker reference" \
       '#include .*rainmaker|esp_rmaker_[a-z_]+|CONFIG_ZHAC_RAINMAKER' \
       "This SKU ships without RainMaker; provisioning assumes WiFi/BLE, and it has neither."
 
+# components/wifi_hosted is the one sanctioned exception: the P4 Wi-Fi test
+# variant, reachable only through the Kconfig-gated rule in
+# main/idf_component.yml (ZHAC_WIFI_HOSTED, off by default). The graph check
+# below proves it stays out of the default images.
 check "WiFi usage" \
       '#include "esp_wifi\.h"|esp_wifi_[a-z_]+\(|WIFI_MODE_|wifi_config_t' \
-      "Ethernet-only build. Network state comes from eth.h / NetStatus."
+      "Ethernet-only build. Network state comes from eth.h / NetStatus." \
+      wifi_hosted
 
 # Note the (^|[^_[:alnum:]]) prefix on zigbee_backend_register. Without it the
 # pattern also matches THIS SKU's own esp_zigbee_backend_register() -- the
@@ -74,7 +80,9 @@ check "legacy radio backend" \
 # other, so CI runs this once per build dir.
 GRAPH="${1:-build}/project_description.json"
 if [ -f "$GRAPH" ]; then
-    for comp in znp_driver ezsp_driver zigbee_backend; do
+    # wifi_hosted / esp_hosted / esp_wifi_remote: the Wi-Fi test variant has
+    # its own build dir (build.wifi*) and is never checked here.
+    for comp in znp_driver ezsp_driver zigbee_backend wifi_hosted espressif__esp_hosted espressif__esp_wifi_remote; do
         if python3 -c "import json,sys; sys.exit(0 if '$comp' in json.load(open('$GRAPH'))['build_components'] else 1)" 2>/dev/null; then
             echo "FAIL: '$comp' is in the build graph" >&2
             echo "  -> Something requires it transitively. Find the path with:" >&2

@@ -198,6 +198,9 @@ void mqtt_glue_start() {
     });
 
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, on_got_ip, nullptr);
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_got_ip, nullptr);
+#endif
     NetStatus st{};
     eth_get_status(&st);
     if (st.has_ip) mqtt_gw_on_sta_up();   // the link beat us to it

@@ -52,6 +52,9 @@
 #include "auth.h"
 #include "ota_update.h"
 #include "eth.h"
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+#include "wifi_hosted.h"
+#endif
 #include "net_discovery.h"
 #include "radio_state.h"
 #include "esp_system.h"
@@ -358,6 +361,61 @@ static void cmd_net_status(int fd, uint32_t id) {
     da["hostname"]   = net_discovery_hostname();
     char buf[448]; size_t n = serializeJson(d, buf, sizeof(buf)); ws_server_reply(fd, buf, n);
 }
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+// Wi-Fi test variant: the four commands the shared SPA's WiFi card already
+// sends, answered by the ESP-Hosted station (components/wifi_hosted). mode is
+// "sta" when joined, "off" otherwise -- never "ap", there is no AP here. SSIDs
+// go through JsonWriter: a neighbour's network name is arbitrary bytes, and one
+// invalid UTF-8 sequence in a text frame makes the browser drop the socket.
+static void cmd_wifi_status(int fd, uint32_t id) {
+    WifiStatus w{}; wifi_hosted_status(&w);
+    char buf[384];
+    JsonWriter j(buf, sizeof(buf));
+    j.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"mode\":\"%s\",\"ready\":%s,\"ssid\":\"",
+          id, w.connected ? "sta" : "off", w.ready ? "true" : "false")
+     .str(w.ssid, sizeof(w.ssid))
+     .fmt("\",\"ip\":\"%s\",\"rssi\":%d,\"sta_configured\":%s,\"sta_connected\":%s,\"sta_ssid\":\"",
+          w.ip, w.rssi, w.configured ? "true" : "false", w.connected ? "true" : "false")
+     .str(w.ssid, sizeof(w.ssid))
+     .fmt("\",\"sta_ip\":\"%s\",\"sta_rssi\":%d,\"ap_ssid\":\"\"}}", w.ip, w.rssi);
+    const size_t n = j.finish();
+    if (n) ws_server_reply(fd, buf, n); else send_err(fd, id, "reply too large");
+}
+static void cmd_wifi_scan(int fd, uint32_t id) {
+    constexpr size_t kMax = 20;
+    WifiAp aps[kMax];
+    const int n = wifi_hosted_scan(aps, kMax);
+    if (n < 0) { send_err(fd, id, "wifi not ready: the co-processor did not answer"); return; }
+    char* buf = static_cast<char*>(heap_caps_malloc(2048, MALLOC_CAP_SPIRAM));
+    if (!buf) { send_err(fd, id, "out of memory"); return; }
+    JsonWriter j(buf, 2048);
+    j.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"networks\":[", id);
+    for (int i = 0; i < n; i++) {
+        j.raw(i ? ",{\"ssid\":\"" : "{\"ssid\":\"").str(aps[i].ssid, sizeof(aps[i].ssid))
+         .fmt("\",\"rssi\":%d,\"auth\":\"%s\"}", aps[i].rssi, aps[i].open ? "open" : "wpa");
+    }
+    j.raw("]}}");
+    const size_t len = j.finish();
+    if (len) ws_server_reply(fd, buf, len); else send_err(fd, id, "reply too large");
+    heap_caps_free(buf);
+}
+static void cmd_wifi_connect(int fd, uint32_t id, JsonDocument& doc) {
+    const char* ssid = doc["args"]["ssid"] | (const char*)"";
+    const char* pass = doc["args"]["pass"] | (const char*)"";
+    if (!ssid[0]) { send_err(fd, id, "ssid required"); return; }
+    if (!wifi_hosted_connect(ssid, pass)) {
+        send_err(fd, id, "not saved: SSID is 1-32 bytes, password at most 64");
+        return;
+    }
+    char buf[48]; int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true}", id);
+    ws_server_reply(fd, buf, (size_t)n);
+}
+static void cmd_wifi_disconnect(int fd, uint32_t id) {
+    wifi_hosted_connect("", "");   // forget; no reboot, Ethernet carries on
+    char buf[48]; int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true}", id);
+    ws_server_reply(fd, buf, (size_t)n);
+}
+#else
 static void cmd_wifi_status(int fd, uint32_t id) {
     NetStatus st{}; eth_get_status(&st);
     JsonDocument d; d["id"] = id; d["ok"] = true;
@@ -379,6 +437,7 @@ static void cmd_wifi_scan(int fd, uint32_t id) {
 static void cmd_wifi_unsupported(int fd, uint32_t id) {
     send_err(fd, id, "wifi unsupported: zhac-wired-core is Ethernet-only");
 }
+#endif
 
 // ── logs.get ──────────────────────────────────────────────────────────
 // Envelope built by splicing log_ring_to_json's {"logs":[...]} after the
@@ -1719,8 +1778,13 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     // wifi.* kept registered for the shared SPA; see cmd_net_status above.
     if (std::strcmp(cmd, "wifi.status")           == 0) { cmd_wifi_status(fd, id);                 return; }
     if (std::strcmp(cmd, "wifi.scan")             == 0) { cmd_wifi_scan(fd, id);                   return; }
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+    if (std::strcmp(cmd, "wifi.connect")          == 0) { cmd_wifi_connect(fd, id, doc);           return; }
+    if (std::strcmp(cmd, "wifi.disconnect")       == 0) { cmd_wifi_disconnect(fd, id);             return; }
+#else
     if (std::strcmp(cmd, "wifi.connect")          == 0) { cmd_wifi_unsupported(fd, id);            return; }
     if (std::strcmp(cmd, "wifi.disconnect")       == 0) { cmd_wifi_unsupported(fd, id);            return; }
+#endif
     if (std::strcmp(cmd, "logs.get")              == 0) { cmd_logs_get(fd, id);                    return; }
     if (std::strcmp(cmd, "device.reinterview") == 0) { cmd_device_reinterview(fd, id, doc);  return; }
     if (std::strcmp(cmd, "device.configure")   == 0) { cmd_device_configure(fd, id, doc);    return; }

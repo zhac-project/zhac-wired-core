@@ -176,6 +176,18 @@ menu "ZHAC wired-core board"
             Green blink while the join window is open, blue flash on Zigbee
             traffic, off otherwise. The S31 dev board has one on GPIO 60.
 
+    config ZHAC_WIFI_HOSTED
+        bool "Wi-Fi through an ESP-Hosted co-processor (test variant)"
+        depends on IDF_TARGET_ESP32P4
+        default n
+        help
+            Adds a Wi-Fi station through a second chip (an ESP32-C5 running
+            ESP-Hosted, on SPI) beside Ethernet, which stays the preferred
+            uplink. Pulls in components/wifi_hosted through the Kconfig-gated
+            rule in main/idf_component.yml; with this off the image has no
+            Wi-Fi code at all. Pins and wiring: sdkconfig.defaults.wifi-hosted.
+            Build with tools/build-p4-wifi-hosted.sh.
+
     config ZHAC_TEST_CRASH_CMD
         bool "Test builds only: the debug.crash command"
         default n

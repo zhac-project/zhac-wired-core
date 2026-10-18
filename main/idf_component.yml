@@ -59,6 +59,19 @@ dependencies:
 
   espressif/led_strip: "^3.0.0"
 
+  # -- local, gated -----------------------------------------------------------
+
+  # Wi-Fi through an ESP-Hosted co-processor: the P4 test variant
+  # (ZHAC_WIFI_HOSTED, off by default). Gated HERE rather than in
+  # main/CMakeLists.txt because component requirements are expanded before
+  # Kconfig is loaded -- an if(CONFIG_...) around REQUIRES is silently ignored.
+  # The target test comes first so the S31 build, where the option does not
+  # exist, never evaluates it (short-circuit).
+  wifi_hosted:
+    path: "../components/wifi_hosted"
+    rules:
+      - if: 'target == "esp32p4" && $CONFIG{ZHAC_WIFI_HOSTED} == True'
+
   # -- zhac-net-core (not on EXTRA_COMPONENT_DIRS; named explicitly) ----------
 
   ws_server:
