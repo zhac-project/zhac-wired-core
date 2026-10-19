@@ -14,6 +14,14 @@
 // Credentials live in the hub's NVS (namespace "wifi_sta"), not the
 // co-processor's: swap the C5 and the hub still knows its network.
 //
+// Setup access point, for a hub with no cable: if neither Wi-Fi nor Ethernet
+// has an address 30 s after Wi-Fi starts, an OPEN network "ZHAC-XXXX" comes up
+// (owner's call, 2026-10-19: easy first connection beats a password printed on
+// serial). A small DNS responder points every name at the hub, so phones show
+// the web UI as a sign-in page (the SPA fallback answers their probe URLs);
+// Settings > WiFi then scans and joins as usual. The AP closes once the hub has
+// held a network for 2 min, and opens at most once per boot.
+//
 // Every call goes to the esp_wifi_remote_* twin and every event arrives on
 // WIFI_REMOTE_EVENT. On the P4, which has no radio, the plain esp_wifi_*
 // calls are one-line wrappers around those and WIFI_REMOTE_EVENT is
@@ -23,6 +31,7 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_wifi_remote.h"
@@ -32,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 #include "ntp_cfg.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -49,6 +59,8 @@ static const char* kNvsNs = "wifi_sta";
 static constexpr int kRoutePrio = 20;
 static constexpr uint32_t kRetryMs = 5000;
 static constexpr EventBits_t kRetryBit = BIT0;
+static constexpr TickType_t kApAfter = pdMS_TO_TICKS(30 * 1000);    // no network this long -> AP
+static constexpr TickType_t kApGrace = pdMS_TO_TICKS(120 * 1000);   // network held this long -> AP off
 
 #if CONFIG_ESP_WIFI_ENABLED
 // ── S31: Wi-Fi remote beside a native radio ─────────────────────────
@@ -87,6 +99,10 @@ static void forward_event(void*, esp_event_base_t, int32_t id, void* data) {
     case WIFI_EVENT_STA_CONNECTED:    n = sizeof(wifi_event_sta_connected_t); break;
     case WIFI_EVENT_STA_DISCONNECTED: n = sizeof(wifi_event_sta_disconnected_t); break;
     case WIFI_EVENT_SCAN_DONE:        n = sizeof(wifi_event_sta_scan_done_t); break;
+    case WIFI_EVENT_AP_START:
+    case WIFI_EVENT_AP_STOP:          break;
+    case WIFI_EVENT_AP_STACONNECTED:    n = sizeof(wifi_event_ap_staconnected_t); break;
+    case WIFI_EVENT_AP_STADISCONNECTED: n = sizeof(wifi_event_ap_stadisconnected_t); break;
     default: return;
     }
     esp_event_post(WIFI_REMOTE_EVENT, id, data, n, 0);
@@ -99,10 +115,13 @@ static void forward_event(void*, esp_event_base_t, int32_t id, void* data) {
 extern "C" esp_netif_t* esp_netif_create_wifi_remote(wifi_interface_t wifi_if,
                                                      const esp_netif_inherent_config_t* cfg);
 extern "C" esp_err_t esp_wifi_set_default_wifi_remote_sta_handlers(void);
+extern "C" esp_err_t esp_wifi_set_default_wifi_remote_ap_handlers(void);
 #endif
 
-static esp_netif_t*       s_netif = nullptr;
-static EventGroupHandle_t s_evt   = nullptr;
+static esp_netif_t*       s_netif    = nullptr;
+static esp_netif_t*       s_ap_netif = nullptr;
+static EventGroupHandle_t s_evt      = nullptr;
+static volatile bool      s_ap       = false;   // setup access point up
 
 // Written by the event handlers, the Wi-Fi task and wifi_hosted_connect();
 // read anywhere without a lock -- same contract as eth_common's link flags.
@@ -158,6 +177,10 @@ static void on_wifi(void*, esp_event_base_t, int32_t id, void* data) {
         // Retried from the task after a pause, not here: an immediate
         // reconnect from the handler spins as fast as the AP refuses.
         if (s_ssid[0]) xEventGroupSetBits(s_evt, kRetryBit);
+    } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+        ESP_LOGI(TAG, "access point: a device joined");
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        ESP_LOGI(TAG, "access point: a device left");
     }
 }
 
@@ -174,6 +197,98 @@ static void on_ip(void*, esp_event_base_t, int32_t id, void* data) {
     } else if (id == IP_EVENT_STA_LOST_IP) {
         s_connected = false;
     }
+}
+
+// ── Setup access point ──────────────────────────────────────────────
+static bool has_uplink() {
+    if (s_connected) return true;
+    esp_netif_t* eth = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    esp_netif_ip_info_t ip{};
+    return eth && esp_netif_is_netif_up(eth) &&
+           esp_netif_get_ip_info(eth, &ip) == ESP_OK && ip.ip.addr != 0;
+}
+
+// Answers every DNS question with the AP's own address, so a phone's
+// connectivity probe lands on the web UI. Runs while the AP is up.
+static void dns_task(void*) {
+    esp_netif_ip_info_t ip{};
+    esp_netif_get_ip_info(s_ap_netif, &ip);
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in sa{};
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(53);
+    sa.sin_addr.s_addr = ip.ip.addr;   // AP side only, never the LAN
+    timeval to{1, 0};                  // wake every second to see the AP close
+    if (sock < 0 || setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to)) < 0 ||
+        bind(sock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) < 0) {
+        ESP_LOGW(TAG, "access point: DNS responder off (socket/bind failed)");
+        if (sock >= 0) close(sock);
+        vTaskDelete(nullptr);
+    }
+    uint8_t buf[512];
+    while (s_ap) {
+        sockaddr_in from{};
+        socklen_t flen = sizeof(from);
+        const int n = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &flen);
+        if (n < 12 || n + 16 > static_cast<int>(sizeof(buf))) continue;   // timeout, junk or no room
+        buf[2] = 0x81;               // response, authoritative
+        buf[3] = 0x80;               // recursion available, no error
+        buf[6] = 0; buf[7] = 1;      // one answer: A record for the first question
+        static const uint8_t kAnswer[] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4};
+        std::memcpy(buf + n, kAnswer, sizeof(kAnswer));
+        std::memcpy(buf + n + sizeof(kAnswer), &ip.ip.addr, 4);
+        sendto(sock, buf, n + 16, 0, reinterpret_cast<sockaddr*>(&from), flen);
+    }
+    close(sock);
+    vTaskDelete(nullptr);
+}
+
+static void ap_open() {
+    if (!s_ap_netif) {
+        esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();   // 192.168.4.1, DHCP server
+#if CONFIG_ESP_WIFI_ENABLED
+        s_ap_netif = esp_netif_create_wifi_remote(WIFI_IF_AP, &base);
+        esp_wifi_set_default_wifi_remote_ap_handlers();
+#else
+        s_ap_netif = esp_netif_create_wifi(WIFI_IF_AP, &base);
+        esp_wifi_set_default_wifi_ap_handlers();
+#endif
+    }
+    wifi_config_t ac{};
+    uint8_t mac[6]{};
+    esp_efuse_mac_get_default(mac);   // the hub's MAC, so the name matches its Ethernet MAC
+    ac.ap.ssid_len = static_cast<uint8_t>(std::snprintf(reinterpret_cast<char*>(ac.ap.ssid),
+                                                        sizeof(ac.ap.ssid), "ZHAC-%02X%02X", mac[4], mac[5]));
+    ac.ap.channel        = 1;         // follows the station's channel once it joins
+    ac.ap.authmode       = WIFI_AUTH_OPEN;
+    ac.ap.max_connection = 4;
+    // Stop, reconfigure, start: switching the mode on a running radio would
+    // briefly put up an AP with the co-processor's default name.
+    esp_wifi_remote_stop();
+    esp_err_t e = esp_wifi_remote_set_mode(WIFI_MODE_APSTA);
+    if (e == ESP_OK) e = esp_wifi_remote_set_config(WIFI_IF_AP, &ac);
+    if (e == ESP_OK) e = esp_wifi_remote_start();   // STA_START -> on_wifi rejoins a stored network
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "access point failed: %s", esp_err_to_name(e));
+        esp_wifi_remote_set_mode(WIFI_MODE_STA);
+        esp_wifi_remote_start();
+        return;
+    }
+    s_ap = true;
+    ESP_LOGW(TAG, "no network -- open access point \"%s\" up: join it and the web UI "
+                  "opens (or browse to 192.168.4.1), then Settings > WiFi", ac.ap.ssid);
+    // Same stack rule as TaskWifi; the self-delete when the AP closes leaves
+    // that stack behind on the S31, once per boot at most.
+    if (zhac_task_create(dns_task, "TaskApDns", 3072, nullptr, 3, nullptr) != pdPASS) {
+        ESP_LOGW(TAG, "access point: DNS responder off (task create failed)");
+    }
+}
+
+static void ap_close() {
+    s_ap = false;   // dns_task sees it within a second
+    esp_wifi_remote_set_mode(WIFI_MODE_STA);   // the station stays joined
+    ESP_LOGI(TAG, "network held for %u s -- access point closed",
+             (unsigned)(pdTICKS_TO_MS(kApGrace) / 1000));
 }
 
 static void wifi_task(void*) {
@@ -197,10 +312,29 @@ static void wifi_task(void*) {
     if (s_ssid[0]) ESP_LOGI(TAG, "started -- joining \"%s\"", s_ssid);
     else           ESP_LOGI(TAG, "started -- no network yet (web UI: Settings > WiFi)");
 
+    // Once a second: retry the station when asked, and decide the setup AP --
+    // opened once if there is no network kApAfter after start, closed after
+    // the network has held for kApGrace.
+    const TickType_t started = xTaskGetTickCount();
+    TickType_t up_since = 0;
+    bool ap_decided = false;
     for (;;) {
-        xEventGroupWaitBits(s_evt, kRetryBit, pdTRUE, pdFALSE, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(kRetryMs));
-        if (s_ssid[0] && !s_connected) esp_wifi_remote_connect();
+        if (xEventGroupWaitBits(s_evt, kRetryBit, pdTRUE, pdFALSE, pdMS_TO_TICKS(1000)) & kRetryBit) {
+            vTaskDelay(pdMS_TO_TICKS(kRetryMs));
+            if (s_ssid[0] && !s_connected) esp_wifi_remote_connect();
+        }
+        if (ap_decided) continue;
+        const TickType_t now = xTaskGetTickCount();
+        if (!s_ap) {
+            if (now - started < kApAfter) continue;
+            if (has_uplink()) ap_decided = true;
+            else              ap_open();
+            if (!s_ap) ap_decided = true;   // uplink, or the AP failed: no second try
+            continue;
+        }
+        if (!has_uplink())                     up_since = 0;
+        else if (!up_since)                    up_since = now | 1;   // 0 means "down"
+        else if (now - up_since >= kApGrace) { ap_close(); ap_decided = true; }
     }
 }
 
