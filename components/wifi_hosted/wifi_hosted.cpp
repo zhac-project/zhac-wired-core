@@ -12,7 +12,9 @@
 // file only joins the network and keeps it joined.
 //
 // Credentials live in the hub's NVS (namespace "wifi_sta"), not the
-// co-processor's: swap the C5 and the hub still knows its network.
+// co-processor's: swap the C5 and the hub still knows its network. The same
+// copy sets the C5 up again whenever it restarts (power loss, crash, reset),
+// and a C5 missing at boot is set up once it appears.
 //
 // Setup access point, for a hub with no cable: if neither Wi-Fi nor Ethernet
 // has an address 30 s after Wi-Fi starts, an OPEN network "ZHAC-XXXX" comes up
@@ -30,6 +32,7 @@
 #include "wifi_hosted.h"
 
 #include "esp_event.h"
+#include "esp_hosted_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -58,7 +61,8 @@ static const char* kNvsNs = "wifi_sta";
 // route whenever both are up.
 static constexpr int kRoutePrio = 20;
 static constexpr uint32_t kRetryMs = 5000;
-static constexpr EventBits_t kRetryBit = BIT0;
+static constexpr EventBits_t kRetryBit   = BIT0;
+static constexpr EventBits_t kRestartBit = BIT1;   // the co-processor booted
 static constexpr TickType_t kApAfter = pdMS_TO_TICKS(30 * 1000);    // no network this long -> AP
 static constexpr TickType_t kApGrace = pdMS_TO_TICKS(120 * 1000);   // network held this long -> AP off
 
@@ -243,6 +247,16 @@ static void dns_task(void*) {
     vTaskDelete(nullptr);
 }
 
+static void ap_config(wifi_config_t* ac) {
+    uint8_t mac[6]{};
+    esp_efuse_mac_get_default(mac);   // the hub's MAC, so the name matches its Ethernet MAC
+    ac->ap.ssid_len = static_cast<uint8_t>(std::snprintf(reinterpret_cast<char*>(ac->ap.ssid),
+                                                         sizeof(ac->ap.ssid), "ZHAC-%02X%02X", mac[4], mac[5]));
+    ac->ap.channel        = 1;        // follows the station's channel once it joins
+    ac->ap.authmode       = WIFI_AUTH_OPEN;
+    ac->ap.max_connection = 4;
+}
+
 static void ap_open() {
     if (!s_ap_netif) {
         esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();   // 192.168.4.1, DHCP server
@@ -255,13 +269,7 @@ static void ap_open() {
 #endif
     }
     wifi_config_t ac{};
-    uint8_t mac[6]{};
-    esp_efuse_mac_get_default(mac);   // the hub's MAC, so the name matches its Ethernet MAC
-    ac.ap.ssid_len = static_cast<uint8_t>(std::snprintf(reinterpret_cast<char*>(ac.ap.ssid),
-                                                        sizeof(ac.ap.ssid), "ZHAC-%02X%02X", mac[4], mac[5]));
-    ac.ap.channel        = 1;         // follows the station's channel once it joins
-    ac.ap.authmode       = WIFI_AUTH_OPEN;
-    ac.ap.max_connection = 4;
+    ap_config(&ac);
     // Stop, reconfigure, start: switching the mode on a running radio would
     // briefly put up an AP with the co-processor's default name.
     esp_wifi_remote_stop();
@@ -291,22 +299,30 @@ static void ap_close() {
              (unsigned)(pdTICKS_TO_MS(kApGrace) / 1000));
 }
 
-static void wifi_task(void*) {
+// ── Co-processor (re)start ──────────────────────────────────────────
+// Everything the co-processor forgets when it restarts: the hub's copy of the
+// network, the mode (with the setup AP when it is up) and the power setting.
+static bool bring_up() {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t e = esp_wifi_remote_init(&cfg);
+    if (e == ESP_OK) {
+        esp_wifi_remote_set_storage(WIFI_STORAGE_RAM);   // the host's NVS copy is the one that counts
+        e = esp_wifi_remote_set_mode(s_ap ? WIFI_MODE_APSTA : WIFI_MODE_STA);
+    }
+    if (e == ESP_OK && s_ap) {
+        wifi_config_t ac{};
+        ap_config(&ac);
+        e = esp_wifi_remote_set_config(WIFI_IF_AP, &ac);
+    }
+    if (e == ESP_OK) {
+        if (s_ssid[0]) apply_creds();
+        e = esp_wifi_remote_start();
+    }
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "co-processor did not answer (esp_wifi_init: %s) -- Wi-Fi off. "
+        ESP_LOGE(TAG, "co-processor did not answer (%s) -- Wi-Fi off until it starts. "
                       "Check the C5 wiring and that it runs the matching ESP-Hosted image.",
                  esp_err_to_name(e));
-        vTaskDelete(nullptr);
-    }
-    esp_wifi_remote_set_storage(WIFI_STORAGE_RAM);   // the host's NVS copy is the one that counts
-    esp_wifi_remote_set_mode(WIFI_MODE_STA);
-    if (s_ssid[0]) apply_creds();
-    e = esp_wifi_remote_start();
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_start: %s -- Wi-Fi off", esp_err_to_name(e));
-        vTaskDelete(nullptr);
+        return false;
     }
     // Mains-powered hub: no modem sleep. With the default it answers ~100 ms
     // late (it wakes only for DTIM beacons), which the web UI and WS feel.
@@ -314,19 +330,58 @@ static void wifi_task(void*) {
     s_ready = true;
     if (s_ssid[0]) ESP_LOGI(TAG, "started -- joining \"%s\"", s_ssid);
     else           ESP_LOGI(TAG, "started -- no network yet (web UI: Settings > WiFi)");
+    return true;
+}
 
-    // Once a second: retry the station when asked, and decide the setup AP --
-    // opened once if there is no network kApAfter after start, closed after
-    // the network has held for kApGrace.
-    const TickType_t started = xTaskGetTickCount();
+// esp_hosted posts this whenever the co-processor boots: once while the first
+// bring_up() waits for it (the hub resets the C5 at start), and again after the
+// C5 crashed, lost power or was reset. Only the later ones are restarts.
+static volatile bool s_first_try_done = false;
+static void on_cp_init(void*, esp_event_base_t, int32_t, void*) {
+    if (s_first_try_done) xEventGroupSetBits(s_evt, kRestartBit);
+}
+
+// A restarted co-processor sends no stop events for the interfaces it lost, so
+// they are posted here: the netif glue then stops the interfaces and the next
+// start brings them up clean, as after an ordinary stop.
+static void restart() {
+    ESP_LOGW(TAG, "co-processor restarted -- setting Wi-Fi up again");
+    if (s_ready) {
+        s_ready = false;
+        if (s_connected) {
+            wifi_event_sta_disconnected_t d{};
+            d.reason = WIFI_REASON_UNSPECIFIED;
+            esp_event_post(WIFI_REMOTE_EVENT, WIFI_EVENT_STA_DISCONNECTED, &d, sizeof(d), portMAX_DELAY);
+        }
+        esp_event_post(WIFI_REMOTE_EVENT, WIFI_EVENT_STA_STOP, nullptr, 0, portMAX_DELAY);
+        if (s_ap) esp_event_post(WIFI_REMOTE_EVENT, WIFI_EVENT_AP_STOP, nullptr, 0, portMAX_DELAY);
+    }
+    s_connected = false;
+    bring_up();
+}
+
+static void wifi_task(void*) {
+    bring_up();   // a failure here (no C5) waits for its boot-up announcement
+    s_first_try_done = true;
+
+    // Once a second: redo the set-up after a co-processor restart, retry the
+    // station when asked, and decide the setup AP -- opened once if there is
+    // no network kApAfter after Wi-Fi first started, closed after the network
+    // has held for kApGrace.
+    TickType_t started = s_ready ? xTaskGetTickCount() : 0;
     TickType_t up_since = 0;
     bool ap_decided = false;
     for (;;) {
-        if (xEventGroupWaitBits(s_evt, kRetryBit, pdTRUE, pdFALSE, pdMS_TO_TICKS(1000)) & kRetryBit) {
+        const EventBits_t bits = xEventGroupWaitBits(s_evt, kRetryBit | kRestartBit, pdTRUE, pdFALSE,
+                                                     pdMS_TO_TICKS(1000));
+        if (bits & kRestartBit) {
+            restart();
+        } else if (bits & kRetryBit) {
             vTaskDelay(pdMS_TO_TICKS(kRetryMs));
-            if (s_ssid[0] && !s_connected) esp_wifi_remote_connect();
+            if (s_ready && s_ssid[0] && !s_connected) esp_wifi_remote_connect();
         }
-        if (ap_decided) continue;
+        if (!started && s_ready) started = xTaskGetTickCount() | 1;   // 0 means "not yet"
+        if (!started || ap_decided) continue;
         const TickType_t now = xTaskGetTickCount();
         if (!s_ap) {
             if (now - started < kApAfter) continue;
@@ -362,6 +417,7 @@ void wifi_hosted_start() {
     esp_wifi_set_default_wifi_sta_handlers();
 #endif
 
+    esp_event_handler_register(ESP_HOSTED_EVENT, ESP_HOSTED_EVENT_CP_INIT, on_cp_init, nullptr);
     esp_event_handler_register(WIFI_REMOTE_EVENT, ESP_EVENT_ANY_ID, on_wifi, nullptr);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip, nullptr);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip, nullptr);
