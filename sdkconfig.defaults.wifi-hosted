@@ -5,6 +5,9 @@
 # duplex. tools/build-p4-wifi-hosted.sh loads this LAST, after
 # sdkconfig.defaults (and sdkconfig.defaults.p4rev3x on v3.x silicon).
 # The C5 side is tools/c5-wifi-cp.defaults; the two pin lists must match.
+# The pins below are the P4's; on the S31 IDF also loads
+# sdkconfig.defaults.wifi-hosted.esp32s31 right after this file, which
+# replaces them.
 #
 #   signal       dir      P4 GPIO  NANO header   C5 GPIO  C5-DevKitC-1
 #   CLK          P4->C5   20       P1            6        J1-7
@@ -40,3 +43,15 @@ CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=2
 CONFIG_ESP_HOSTED_SPI_FREQ_ESP32XX=10
 # A loose jumper must not reboot the hub: report the failure, keep Zigbee up.
 # CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE is not set
+
+# Keep ESP-Hosted out of internal RAM, where it would otherwise take ~94 KB
+# (the P4 hub has ~117 KB minimum free without it):
+# - its two transport buffer pools, (15+11)+(15+5) blocks x 1600 B = 73.6 KB,
+#   go to DMA-capable PSRAM (GDMA reaches PSRAM on the P4 and the S31; a failed
+#   PSRAM allocation falls back to internal);
+# - its four 5 KB task stacks (spi_trans, spi_rx, rpc_rx, rpc_tx) go to PSRAM.
+#   Safe without XIP-from-PSRAM because none of those tasks touches flash: the
+#   host side of esp_hosted has no NVS or partition calls, and the Wi-Fi
+#   credentials are saved by wifi_hosted from the web server's task.
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y

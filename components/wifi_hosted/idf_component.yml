@@ -6,14 +6,17 @@
 # this directory, never fetches them either.
 #
 # Same pins as tools/c6-rcp-installer: the pair known to build on IDF 6.0.
-# tools/build-c5-wifi-cp.sh builds the C5 image from THIS esp_hosted's slave/
-# project, so host and co-processor always speak one protocol version.
+# tools/build-p4-wifi-hosted.sh builds the C5 image from THIS esp_hosted's
+# slave/ project, so host and co-processor always speak one protocol version.
+#
+# esp_wifi_remote only on the P4: IDF 6.1 (the S31's) ships it inside
+# esp_wifi, and the registry copy then registers as an empty component.
 dependencies:
   idf: ">=6.0"
   espressif/esp_hosted:
     version: "==2.12.13"
     rules:
-      - if: 'target == "esp32p4" && $CONFIG{ZHAC_WIFI_HOSTED} == True'
+      - if: 'target in [esp32p4, esp32s31] && $CONFIG{ZHAC_WIFI_HOSTED} == True'
   espressif/esp_wifi_remote:
     version: ">=0.10,<2.0"
     rules:

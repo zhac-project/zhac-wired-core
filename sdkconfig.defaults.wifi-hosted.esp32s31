@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Wi-Fi test variant on the ESP32-S31-Function-CoreBoard-1. IDF loads this
+# right after sdkconfig.defaults.wifi-hosted on the esp32s31 target only, so
+# it just swaps the host pins; the C5 side (tools/c5-wifi-cp.defaults, same
+# C5 image as the P4 variant) does not change.
+#
+# The S31 has a Wi-Fi radio of its own, but it shares the one RF front end
+# with Zigbee (coexistence time-slicing); the C5 keeps the S31's radio for
+# Zigbee only. The firmware never starts the native Wi-Fi.
+#
+#   signal       dir       S31 GPIO  J2 pin (label)  C5 GPIO  C5-DevKitC-1
+#   MISO         C5->S31   20        26 (D0)         9        J1-10
+#   Handshake    C5->S31   21        27 (D1)         23       J3-5
+#   Data Ready   C5->S31   22        28 (D2)         24       J3-4
+#   CS           S31->C5   23        29 (D3)         10       J1-11
+#   CLK          S31->C5   24        30 (CLK)        6        J1-7
+#   MOSI         S31->C5   25        31 (CMD)        8        J1-9
+#   Reset        S31->C5   47        13              RST/EN   J1-2
+#   GND          --        GND       33/34           GND      J1-15, J3-1
+#
+# J2 26-31 are the six "SDIO" pins (GPIO20-25): nothing on the board uses them
+# (no card slot). Kept clear of: Ethernet (5 MDC, 6 MDIO, 7 PHY reset, 8-19
+# RGMII, 4 PHY interrupt through R83), the ES8311/PA (50-57), the RGB LED and
+# strapping pins (36, 37, 60, 61), USB (33/34), UART0 (58/59), flash (26-32).
+# SPI2 goes through the GPIO matrix, which is fine at 10 MHz.
+
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CLK=24
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_MOSI=25
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_MISO=20
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CS=23
+CONFIG_ESP_HOSTED_SPI_GPIO_HANDSHAKE=21
+CONFIG_ESP_HOSTED_SPI_GPIO_DATA_READY=22
+CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=47
+
+# Internal RAM is the S31's tight spot: the GP-SPI master ISR and HAL would add
+# ~7 KB of IRAM, and nothing needs them there -- esp_hosted is the only SPI
+# master user and asks for no ESP_INTR_FLAG_IRAM; at 10 MHz the ISR waiting out
+# a flash write costs nothing that matters.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
