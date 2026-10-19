@@ -308,6 +308,9 @@ static void wifi_task(void*) {
         ESP_LOGE(TAG, "esp_wifi_start: %s -- Wi-Fi off", esp_err_to_name(e));
         vTaskDelete(nullptr);
     }
+    // Mains-powered hub: no modem sleep. With the default it answers ~100 ms
+    // late (it wakes only for DTIM beacons), which the web UI and WS feel.
+    esp_wifi_remote_set_ps(WIFI_PS_NONE);
     s_ready = true;
     if (s_ssid[0]) ESP_LOGI(TAG, "started -- joining \"%s\"", s_ssid);
     else           ESP_LOGI(TAG, "started -- no network yet (web UI: Settings > WiFi)");
