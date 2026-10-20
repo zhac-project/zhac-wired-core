@@ -29,16 +29,41 @@
 // calls are one-line wrappers around those and WIFI_REMOTE_EVENT is
 // WIFI_EVENT. On the S31 the plain calls would drive its own radio, which
 // stays off (it shares the antenna with Zigbee).
+//
+// ZHAC_WIFI_NATIVE (S31 test variant S-B) turns that around: Zigbee moves to an
+// external ot_rcp radio, the S31's own radio does Wi-Fi, and every
+// esp_wifi_remote_* name below is mapped straight onto the native call. No
+// esp_hosted, no co-processor restarts.
 #include "wifi_hosted.h"
 
 #include "esp_event.h"
-#include "esp_hosted_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "sdkconfig.h"
+#if CONFIG_ZHAC_WIFI_NATIVE
+#define esp_wifi_remote_init                esp_wifi_init
+#define esp_wifi_remote_set_storage         esp_wifi_set_storage
+#define esp_wifi_remote_set_mode            esp_wifi_set_mode
+#define esp_wifi_remote_set_config          esp_wifi_set_config
+#define esp_wifi_remote_set_ps              esp_wifi_set_ps
+#define esp_wifi_remote_start               esp_wifi_start
+#define esp_wifi_remote_stop                esp_wifi_stop
+#define esp_wifi_remote_connect             esp_wifi_connect
+#define esp_wifi_remote_disconnect          esp_wifi_disconnect
+#define esp_wifi_remote_sta_get_ap_info     esp_wifi_sta_get_ap_info
+#define esp_wifi_remote_scan_start          esp_wifi_scan_start
+#define esp_wifi_remote_scan_get_ap_records esp_wifi_scan_get_ap_records
+#define esp_wifi_remote_clear_ap_list       esp_wifi_clear_ap_list
+#define WIFI_REMOTE_EVENT                   WIFI_EVENT
+#else
+#include "esp_hosted_event.h"
 #include "esp_wifi_remote.h"
-#if CONFIG_ESP_WIFI_ENABLED
+#endif
+// The S31 with the C5 doing its Wi-Fi: remote Wi-Fi beside a native radio.
+#define S31_REMOTE (CONFIG_ESP_WIFI_ENABLED && !CONFIG_ZHAC_WIFI_NATIVE)
+#if S31_REMOTE
 #include "esp_private/wifi.h"   // wifi_rxcb_t, for the S31 stand-in below
 #endif
 #include "freertos/FreeRTOS.h"
@@ -47,7 +72,6 @@
 #include "lwip/sockets.h"
 #include "ntp_cfg.h"
 #include "nvs.h"
-#include "sdkconfig.h"
 #include "zhac_task.h"
 
 #include <cstdio>
@@ -66,7 +90,7 @@ static constexpr EventBits_t kRestartBit = BIT1;   // the co-processor booted
 static constexpr TickType_t kApAfter = pdMS_TO_TICKS(30 * 1000);    // no network this long -> AP
 static constexpr TickType_t kApGrace = pdMS_TO_TICKS(120 * 1000);   // network held this long -> AP off
 
-#if CONFIG_ESP_WIFI_ENABLED
+#if S31_REMOTE
 // ── S31: Wi-Fi remote beside a native radio ─────────────────────────
 // IDF 6.1 supports a remote Wi-Fi next to the native one (events on
 // WIFI_REMOTE_EVENT, netif glue in esp_wifi/remote/esp_wifi_remote_net2.c),
@@ -260,7 +284,7 @@ static void ap_config(wifi_config_t* ac) {
 static void ap_open() {
     if (!s_ap_netif) {
         esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();   // 192.168.4.1, DHCP server
-#if CONFIG_ESP_WIFI_ENABLED
+#if S31_REMOTE
         s_ap_netif = esp_netif_create_wifi_remote(WIFI_IF_AP, &base);
         esp_wifi_set_default_wifi_remote_ap_handlers();
 #else
@@ -319,9 +343,13 @@ static bool bring_up() {
         e = esp_wifi_remote_start();
     }
     if (e != ESP_OK) {
+#if CONFIG_ZHAC_WIFI_NATIVE
+        ESP_LOGE(TAG, "Wi-Fi start failed (%s) -- Wi-Fi off", esp_err_to_name(e));
+#else
         ESP_LOGE(TAG, "co-processor did not answer (%s) -- Wi-Fi off until it starts. "
                       "Check the C5 wiring and that it runs the matching ESP-Hosted image.",
                  esp_err_to_name(e));
+#endif
         return false;
     }
     // Mains-powered hub: no modem sleep. With the default it answers ~100 ms
@@ -337,9 +365,11 @@ static bool bring_up() {
 // bring_up() waits for it (the hub resets the C5 at start), and again after the
 // C5 crashed, lost power or was reset. Only the later ones are restarts.
 static volatile bool s_first_try_done = false;
+#if !CONFIG_ZHAC_WIFI_NATIVE
 static void on_cp_init(void*, esp_event_base_t, int32_t, void*) {
     if (s_first_try_done) xEventGroupSetBits(s_evt, kRestartBit);
 }
+#endif
 
 // A restarted co-processor sends no stop events for the interfaces it lost, so
 // they are posted here: the netif glue then stops the interfaces and the next
@@ -403,21 +433,23 @@ void wifi_hosted_start() {
 
     esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_WIFI_STA();
     base.route_prio = kRoutePrio;
-#if CONFIG_ESP_WIFI_ENABLED
+#if S31_REMOTE
     s_netif = esp_netif_create_wifi_remote(WIFI_IF_STA, &base);
 #else
     s_netif = esp_netif_create_wifi(WIFI_IF_STA, &base);
 #endif
     // Same DHCP hostname as the Ethernet side, so the router lists "zhac".
     esp_netif_set_hostname(s_netif, CONFIG_ZHAC_MDNS_HOSTNAME);
-#if CONFIG_ESP_WIFI_ENABLED
+#if S31_REMOTE
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, forward_event, nullptr);
     esp_wifi_set_default_wifi_remote_sta_handlers();
 #else
     esp_wifi_set_default_wifi_sta_handlers();
 #endif
 
+#if !CONFIG_ZHAC_WIFI_NATIVE
     esp_event_handler_register(ESP_HOSTED_EVENT, ESP_HOSTED_EVENT_CP_INIT, on_cp_init, nullptr);
+#endif
     esp_event_handler_register(WIFI_REMOTE_EVENT, ESP_EVENT_ANY_ID, on_wifi, nullptr);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip, nullptr);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip, nullptr);
