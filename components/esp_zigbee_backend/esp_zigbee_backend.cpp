@@ -33,6 +33,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "device_backend.h"
+#include "device_shadow.h"   // device_shadow_remove (network reset)
 #include "esp_attr.h"     // __NOINIT_ATTR
 #include "esp_log.h"
 #include "esp_system.h"   // esp_restart
@@ -689,6 +690,68 @@ static void coordinator_address_remember() {
     nvs_close(h);
 }
 
+// ── Zigbee network reset (review 2026-10-24 PB-06) ──────────────────────
+// Only on the owner's command (zigbee_force_recommission, below): every device
+// is forgotten (pool, device store, shadow), and a mark in NVS asks the next
+// boot to erase zb_storage (PAN, keys, child table) and the address pin before
+// the stack starts, so it forms a new network with new keys. Settings, rules
+// and sign-in stay. The mark is kept until the erase worked, so a power cut on
+// the way finishes at the next boot.
+static constexpr char kResetKey[] = "reset";
+
+// Forget every device: pool, adapter caches, device store, shadow (state and
+// options). Returns how many.
+static uint16_t forget_all_devices() {
+    uint16_t n = 0;
+    for (; n <= ZAP_MAX_DEVICES; n++) {   // bound: a record that would not go
+        uint64_t ieee = 0;
+        zigbee_pool_lock();
+        for (uint16_t i = 0; i < pool_count() && !ieee; i++) ieee = pool_all()[i].ieee_addr;
+        zigbee_pool_unlock();
+        if (!ieee) break;
+        zb_interview_forget(ieee);
+        device_shadow_remove(ieee);
+    }
+    return n;
+}
+
+// At boot, after the pool restore and before zb_storage is opened.
+static void network_reset_if_marked() {
+    uint8_t mark = 0;
+    nvs_handle_t h;
+    if (nvs_open(kPinNs, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, kResetKey, &mark) != ESP_OK) mark = 0;
+        nvs_close(h);
+    }
+    if (!mark) return;
+    // The mark goes first: a mark that cannot be cleared must never erase the
+    // network at every boot. A cut right after it loses the reset instead, and
+    // the owner runs it again.
+    esp_err_t e = nvs_open(kPinNs, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_erase_key(h, kResetKey);
+        if (e == ESP_OK) e = nvs_commit(h);
+        if (e != ESP_OK) nvs_close(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: cannot clear its mark (%s) -- nothing erased", esp_err_to_name(e));
+        return;
+    }
+    // Normally no device is left: they were forgotten before the restart. One
+    // that came back (a cut before that finished) was on the old network too.
+    const uint16_t stale = forget_all_devices();
+    e = nvs_flash_erase_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
+    if (e == ESP_OK && nvs_erase_key(h, kPinKey) == ESP_OK) nvs_commit(h);   // new network, radio's address
+    nvs_close(h);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: erasing '%s' failed (%s) -- the old network stays; "
+                      "run the reset again", CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGW(TAG, "Zigbee network reset: the old network is erased (%u stale device record(s) "
+                  "dropped) -- a new one is formed now", (unsigned)stale);
+}
+
 static bool has_server_cluster(const ZapDevice& d, uint16_t cluster) {
     for (uint8_t e = 0; e < d.endpoint_count && e < 8; e++)
         for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP; c++)
@@ -1109,7 +1172,9 @@ static bool zb_init() {
     // Never erased here (review 2026-10-24 PB-01): it holds the network --
     // PAN, keys, the coordinator's child table -- and wiping it on an init
     // error formed a new network at autostart, orphaning every paired device.
-    // An unreadable dataset keeps the radio down and says so instead.
+    // An unreadable dataset keeps the radio down and says so instead. Only
+    // the owner's network reset erases it, just below (PB-06).
+    network_reset_if_marked();
     const esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
     if (nerr != ESP_OK) {
         s_last_error = "zb_storage_error";
@@ -1480,13 +1545,6 @@ bool zigbee_permit_join(uint8_t duration_s) { return zb_start_discovery(duration
 // stack is up, which bind and enrol treat as "not yet".
 uint64_t zigbee_mgr_coordinator_ieee() { return s_coord_ieee.load(); }
 
-// Not yet implemented on this backend -- ZDO bind/unbind and recommission need
-// the ZDO request path, which lands with the join-handling increment. Refusing
-// loudly beats pretending.
-static inline bool not_yet(const char* op) {
-    ESP_LOGW(TAG, "%s: not implemented on esp_zigbee_backend yet", op);
-    return false;
-}
 bool zigbee_zdo_bind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
                      uint16_t cluster, uint64_t dst_ieee, uint8_t dst_ep) {
     if (!s_running) return false;
@@ -1500,7 +1558,30 @@ bool zigbee_zdo_unbind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
                            /*unbind=*/true);
 }
 bool zigbee_interview_trigger(uint64_t ieee) { return zb_interview_trigger(ieee); }
-bool zigbee_force_recommission() { return not_yet("force_recommission"); }
+
+// The owner's Zigbee network reset (ws_bridge `zigbee.reset`, which restarts
+// the hub after a true): mark the network for erasure at the next boot, then
+// forget every device now (see network_reset_if_marked). False, with nothing
+// changed, when the mark cannot be saved. Works on a boot without the radio
+// too, which is how a hub with an unreadable zb_storage gets a new network.
+bool zigbee_force_recommission() {
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(kPinNs, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_set_u8(h, kResetKey, 1);
+        if (e == ESP_OK) e = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: cannot save the request (%s) -- nothing changed",
+                 esp_err_to_name(e));
+        return false;
+    }
+    const uint16_t n = forget_all_devices();
+    ESP_LOGW(TAG, "Zigbee network reset by the owner: %u device(s) forgotten; the network is "
+                  "erased and a new one formed at the restart", (unsigned)n);
+    return true;
+}
 
 #else   // !CONFIG_ZHAC_ESP_ZIGBEE
 
