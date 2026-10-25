@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Host stand-ins for what main/auth.cpp touches outside itself: ESP-IDF's NVS / log / timer / random,
-// FreeRTOS's mutex, PSA hashing, the HTTP server, the WebSocket server and the set-up window.
-// The WebSocket fake (harness.cpp) remembers the installed token and whether a socket is signed in.
+// FreeRTOS's mutex, PSA hashing, the HTTP server, the WebSocket server, mDNS and the set-up window.
+// The fakes (harness.cpp) keep NVS in a map, serve one request at a time from its headers and body,
+// and remember the installed WebSocket token and whether a socket is signed in.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,8 @@
 typedef int esp_err_t;
 constexpr esp_err_t ESP_OK = 0;
 constexpr esp_err_t ESP_FAIL = -1;
+
+#define CONFIG_ZHAC_MDNS_HOSTNAME "zhac"
 
 #define ESP_LOGE(tag, fmt, ...) do { (void)(tag); if (0) std::printf(fmt, ##__VA_ARGS__); } while (0)
 #define ESP_LOGW(tag, fmt, ...) do { (void)(tag); if (0) std::printf(fmt, ##__VA_ARGS__); } while (0)
@@ -39,6 +42,7 @@ esp_err_t nvs_get_str(nvs_handle_t, const char* key, char* out, size_t* len);
 esp_err_t nvs_set_str(nvs_handle_t, const char* key, const char* v);
 esp_err_t nvs_get_blob(nvs_handle_t, const char* key, void* out, size_t* len);
 esp_err_t nvs_set_blob(nvs_handle_t, const char* key, const void* v, size_t len);
+esp_err_t nvs_erase_key(nvs_handle_t, const char* key);
 esp_err_t nvs_commit(nvs_handle_t);
 void      nvs_close(nvs_handle_t);
 
@@ -48,22 +52,27 @@ constexpr psa_status_t PSA_SUCCESS = 0;
 psa_status_t psa_crypto_init();
 psa_status_t psa_hash_compute(int alg, const uint8_t* in, size_t in_len, uint8_t* out, size_t out_cap, size_t* out_len);
 
-typedef struct httpd_req { size_t content_len; void* user_ctx; } httpd_req_t;
+typedef struct httpd_req { size_t content_len; void* user_ctx; int fd; } httpd_req_t;
 typedef void* httpd_handle_t;
 enum httpd_method_t { HTTP_GET, HTTP_POST };
 typedef struct httpd_uri {
     const char* uri; httpd_method_t method; esp_err_t (*handler)(httpd_req_t*); void* user_ctx;
 } httpd_uri_t;
 int       httpd_req_to_sockfd(httpd_req_t*);
+size_t    httpd_req_get_hdr_value_len(httpd_req_t*, const char* field);
 esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char* field, char* val, size_t len);
 esp_err_t httpd_resp_set_status(httpd_req_t*, const char* status);
 esp_err_t httpd_resp_set_type(httpd_req_t*, const char* type);
+esp_err_t httpd_resp_set_hdr(httpd_req_t*, const char* field, const char* value);
 esp_err_t httpd_resp_sendstr(httpd_req_t*, const char* str);
 int       httpd_req_recv(httpd_req_t*, char* buf, size_t len);
 esp_err_t httpd_register_uri_handler(httpd_handle_t, const httpd_uri_t*);
 
 void ws_server_set_api_token(const char* token);
 void ws_server_fd_deauth_all();
+void ws_server_close_unauthed();
+
+const char* net_discovery_hostname();
 
 constexpr uint32_t kZapSetupWindowS = 600;
 uint32_t zap_setup_secs_left();
