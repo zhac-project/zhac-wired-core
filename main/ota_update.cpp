@@ -254,18 +254,22 @@ void run(const char* url) {
     }
     // Only this firmware, and no older release unless the owner asked for one
     // (ota_image.h, review 2026-10-24 HS-10). The image's strings are its own:
-    // copied with a terminator.
+    // copied with a terminator, control bytes as '?' (they go into the log and
+    // the ota.complete event).
     esp_app_desc_t img{};
-    if (esp_https_ota_get_img_desc(h, &img) != ESP_OK) {
+    if (esp_https_ota_get_img_desc(h, &img) != ESP_OK) {   // a short read too: the link dropped
         esp_https_ota_abort(h);
-        ESP_LOGE(TAG, "update refused: the download has no app description");
-        event("ota.complete", true, false, 0, 0, "the download is not a firmware image");
+        ESP_LOGE(TAG, "update refused: no app description in the download");
+        event("ota.complete", true, false, 0, 0, "the download is not a firmware image, or it broke off");
         return;
     }
     char proj[sizeof(img.project_name) + 1] = {};
     char ver[sizeof(img.version) + 1] = {};
     memcpy(proj, img.project_name, sizeof(img.project_name));
     memcpy(ver, img.version, sizeof(img.version));
+    for (char* s : {proj, ver})
+        for (; *s; ++s)
+            if (static_cast<unsigned char>(*s) < 0x20 || *s == 0x7F) *s = '?';
     const esp_app_desc_t* me = esp_app_get_description();
     const OtaImage verdict = ota_image_check(me->project_name, me->version, proj, ver, s_allow_older);
     if (verdict != OtaImage::OK) {
