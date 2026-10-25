@@ -638,7 +638,10 @@ static bool esp_zb_adapter_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t clus
 // ran with is therefore kept in NVS and set again before every start.
 static constexpr char kPinNs[]  = "zb_coord";
 static constexpr char kPinKey[] = "ieee";
-static constexpr char kRebindKey[] = "rebind";   // u8 1 once the ZR-01 repair ran
+// Set once the ZR-01 repair has marked the devices. A device-store flag, not
+// an NVS key of its own: it must roll back, move and reset with the records
+// that carry the repair's per-device flags.
+static constexpr char kRepairFlag[] = "coord_rebind";
 
 // The address the network runs under, for everything that names the
 // coordinator to a device (binds, IAS CIE, the Bind tab). It used to be read
@@ -704,17 +707,9 @@ static void coordinator_rebind_once() {
         return;
     }
     if (mac.u64 != coord) s_stale_bind_target.store(mac.u64);
-
-    nvs_handle_t h;
-    if (nvs_open(kPinNs, NVS_READWRITE, &h) != ESP_OK) return;
-    uint8_t done = 0;
-    nvs_get_u8(h, kRebindKey, &done);
-    if (done || mac.u64 == coord || !zap_store_is_ready()) {
-        // Nothing bound to the radio address, or nothing to repair it in.
-        if (!done && mac.u64 == coord && nvs_set_u8(h, kRebindKey, 1) == ESP_OK) nvs_commit(h);
-        nvs_close(h);
-        return;
-    }
+    // Nothing bound to the radio address, or nothing to repair it in (the
+    // store shut: next boot), or done already.
+    if (mac.u64 == coord || !zap_store_is_ready() || zap_store_flag_get(kRepairFlag)) return;
 
     static uint64_t marked[ZAP_MAX_DEVICES];   // boot-time pass: off app_main's stack
     uint16_t n = 0;
@@ -731,16 +726,19 @@ static void coordinator_rebind_once() {
         marked[n++] = d.ieee_addr;
     }
     zigbee_pool_unlock();
+    // Saved directly, not through the 64-slot dirty table (more devices would
+    // overflow it into immediate saves with extra copies on this stack).
     static ZapDevice snap;
+    bool saved = true;
     for (uint16_t i = 0; i < n; i++)
-        if (zigbee_pool_snapshot(marked[i], &snap)) zap_store_mark_dirty(&snap, ZAP_PERSIST_HIGH);
-    zap_store_flush_now();
-    if (nvs_set_u8(h, kRebindKey, 1) == ESP_OK) nvs_commit(h);
-    nvs_close(h);
+        if (zigbee_pool_snapshot(marked[i], &snap)) saved = zap_store_save_device(&snap) && saved;
+    // The mark only after every device's flags are stored: else the next boot repeats this.
+    if (saved) zap_store_flag_set(kRepairFlag);
     ESP_LOGW(TAG, "coordinator address %016llx differs from the radio's %016llx: %u device(s) "
                   "will be configured again as they next talk (binds made to the radio address "
-                  "are removed, IAS sensors re-enrolled)",
-             (unsigned long long)coord, (unsigned long long)mac.u64, (unsigned)n);
+                  "are removed, IAS sensors re-enrolled)%s",
+             (unsigned long long)coord, (unsigned long long)mac.u64, (unsigned)n,
+             saved ? "" : " -- some could not be saved, repeated next boot");
 }
 
 uint64_t esp_zb_stale_bind_target() { return s_stale_bind_target.load(); }
@@ -778,7 +776,7 @@ static void coordinator_repair_on_frame(uint64_t ieee, uint16_t nwk, ZapDevice& 
         d->flags &= static_cast<uint8_t>(~*static_cast<const uint8_t*>(c));
     }, &clear);
     dev.flags &= static_cast<uint8_t>(~clear);
-    zap_store_mark_dirty(&dev, ZAP_PERSIST_LOW);
+    zap_store_mark_dirty(&dev, ZAP_PERSIST_HIGH);   // flushed within 5 s: the dirty table never fills
 }
 
 // ── Stack lifecycle signals ──────────────────────────────────────────────
@@ -973,24 +971,6 @@ const char* esp_zigbee_backend_last_error(void) { return s_last_error; }
 // ── DeviceBackend implementation ─────────────────────────────────────────
 
 static bool zb_init() {
-    // The dataset partition must be an initialised NVS partition BEFORE
-    // esp_zigbee_init: ezb_plat_datasets_init calls nvs_open_from_partition()
-    // and abort()s on failure. Note esp-zigbee-lib v2.x uses NVS here, unlike
-    // v1.x (and IDF's bundled examples) which used a FAT partition.
-    //
-    // Never erased here (review 2026-10-24 PB-01): it holds the network --
-    // PAN, keys, the coordinator's child table -- and wiping it on an init
-    // error formed a new network at autostart, orphaning every paired device.
-    // An unreadable dataset keeps the radio down and says so instead.
-    const esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
-    if (nerr != ESP_OK) {
-        s_last_error = "zb_storage_error";
-        ESP_LOGE(TAG, "zigbee storage partition '%s' unavailable: %s -- radio down, the network "
-                      "data is kept (not erased)",
-                 CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(nerr));
-        return false;
-    }
-
     // The device pool is normally brought up by zigbee_mgr_init(), which is
     // ZNP-bound and therefore not compiled into this SKU. Nothing else calls
     // these, so without them pool_add() would write through a null pool and
@@ -1011,6 +991,25 @@ static bool zb_init() {
     }
 
     // After the pool restore, so a radio-less boot still lists the devices.
+    //
+    // The dataset partition must be an initialised NVS partition BEFORE
+    // esp_zigbee_init: ezb_plat_datasets_init calls nvs_open_from_partition()
+    // and abort()s on failure. Note esp-zigbee-lib v2.x uses NVS here, unlike
+    // v1.x (and IDF's bundled examples) which used a FAT partition.
+    //
+    // Never erased here (review 2026-10-24 PB-01): it holds the network --
+    // PAN, keys, the coordinator's child table -- and wiping it on an init
+    // error formed a new network at autostart, orphaning every paired device.
+    // An unreadable dataset keeps the radio down and says so instead.
+    const esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
+    if (nerr != ESP_OK) {
+        s_last_error = "zb_storage_error";
+        ESP_LOGE(TAG, "zigbee storage partition '%s' unavailable: %s -- radio down, the network "
+                      "data is kept (not erased)",
+                 CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(nerr));
+        return false;
+    }
+
     if (boot_guard_tripped()) {
         s_last_error = "radio_crashed";
         ESP_LOGE(TAG, "the previous boot died while starting the radio -- running "

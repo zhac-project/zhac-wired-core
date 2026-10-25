@@ -9,11 +9,12 @@
 // simple POST need no CORS preflight, and DNS rebinding makes a foreign page
 // same-origin with the hub. With sign-in off, such a page could drive every
 // command, up to an OTA. Browsers name the page in `Origin` on every
-// cross-origin request and on every POST/PUT/DELETE, so:
-//   - an Origin must be the hub's own (its host equal to Host's), or a
-//     loopback dev server proxying to the hub;
-//   - with sign-in off, Host must be the hub's name, <name>.local or an IP
-//     literal: a rebinding page always arrives with its own domain in Host.
+// cross-origin request and on every POST/PUT/DELETE, so (auth.cpp applies
+// both while sign-in is off, and always to the first claim of a fresh hub):
+//   - an Origin must be the hub's own: its host equal to Host's (a dev server
+//     proxying to the hub passes, its Origin and Host are both localhost);
+//   - Host must be the hub's name, <name>.local, an IP literal or a loopback
+//     name: a rebinding page always arrives with its own domain in Host.
 // curl and scripts send no Origin and are not affected by the first rule.
 #pragma once
 
@@ -62,12 +63,11 @@ inline bool req_origin_ok(const char* origin, const char* host) {
     if (!origin || !*origin) return true;
     char o[96], h[96];
     if (!req_host_part(origin, o, sizeof(o))) return false;
-    if (req_is_loopback(o)) return true;
     return host && req_host_part(host, h, sizeof(h)) && !strcasecmp(o, h);
 }
 
-// Applied while sign-in is off. `name` is the hub's mDNS hostname ("zhac").
-// A request without a Host (HTTP/1.0 tooling) passes.
+// `name` is the hub's mDNS hostname ("zhac"). A request without a Host
+// (HTTP/1.0 tooling) passes.
 inline bool req_host_ok(const char* host, const char* name) {
     if (!host || !*host) return true;
     char h[96];

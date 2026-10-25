@@ -85,6 +85,7 @@ const char* health_problem() {
     if (!ws_server_get_handle()) return "web server not running";
     if (!sys_event_task_ok()) return "event dispatcher not running (rules and web UI would see no device events)";
     if (auth_storage_error()) return "sign-in storage not readable";
+    if (!zap_store_is_ready()) return "device store not readable";
     uint8_t radio_was_ok = 0;
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READONLY, &h) == ESP_OK) {
@@ -109,6 +110,9 @@ void health_tick(void*) {
         }
         ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK",
                  s_health_ticks * kHealthTickS);
+        // No rollback any more: a move of the device store to zhac_data made on
+        // this trial boot is final now, so the next update does not copy over it.
+        zap_store_confirm_move();
         s_state = "verified";
         nvs_put_str(kNvsRollback, nullptr);
         esp_timer_stop(s_health_timer);

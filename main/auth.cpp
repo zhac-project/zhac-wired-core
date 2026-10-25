@@ -240,8 +240,9 @@ esp_err_t handle_login(httpd_req_t* req) {
 // kZapSetupWindowS ago (zap_setup_window.h): the first visitor to a fresh hub
 // claims it, but only someone who can power-cycle the hub can reopen that.
 esp_err_t handle_setup(httpd_req_t* req) {
-    // A foreign page must not claim a fresh hub either (review HS-05).
-    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
+    // A foreign page, rebinding included, must not claim a fresh hub and read
+    // its token from the answer (review HS-05): both rules, sign-in on or off.
+    if (!auth_request_from_hub_page(req)) return auth_reply_cross_site(req);
     if (s_storage_error) return reply(req, "503 Service Unavailable", "{\"error\":\"storage_error\"}");
     if (s_pw_set) return reply(req, "403 Forbidden", "{\"error\":\"already_set\"}");
     if (zap_setup_secs_left() == 0) return reply(req, "403 Forbidden", "{\"error\":\"setup_closed\"}");
@@ -349,6 +350,10 @@ void auth_set_enabled(bool en) {
     // Sockets opened while sign-in was off were let in without a token; the
     // dispatcher trusts that flag, so they must sign in like everyone else.
     if (en && !was) ws_server_fd_deauth_all();
+    // The other way, every socket is trusted from now on: those that never
+    // signed in may be another site's page (the upgrade filter only runs while
+    // sign-in is off), so they go. The owner's signed-in page stays.
+    if (!en && was) ws_server_close_unauthed();
     ESP_LOGW(TAG, "API auth %s", en ? "enabled" : "DISABLED -- anyone on the LAN has full access");
 }
 
@@ -393,7 +398,7 @@ static void log_refusal(const char* why) {
     ESP_LOGW(TAG, "refused a request: %s", why);
 }
 
-bool auth_request_allowed(httpd_req_t* req) {
+bool auth_request_from_hub_page(httpd_req_t* req) {
     char host[96] = {}, origin[128] = {};
     const size_t hl = httpd_req_get_hdr_value_len(req, "Host");
     const size_t ol = httpd_req_get_hdr_value_len(req, "Origin");
@@ -404,15 +409,22 @@ bool auth_request_allowed(httpd_req_t* req) {
     if (hl) httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
     if (ol) httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
     if (!req_origin_ok(origin, host)) {
-        log_refusal("sent by a page of another site");
+        log_refusal("sent by a page of another site, or through a proxy that rewrites Host");
         return false;
     }
-    if (!s_enabled && !req_host_ok(host, net_discovery_hostname())) {
-        log_refusal("unknown host name while sign-in is off -- open the hub by its IP address "
-                    "or its .local name, or turn sign-in on");
+    // The configured name or the one mDNS gave the hub after a conflict ("zhac-2").
+    if (!req_host_ok(host, net_discovery_hostname()) && !req_host_ok(host, CONFIG_ZHAC_MDNS_HOSTNAME)) {
+        log_refusal("a host name other than the hub's -- open it by its IP address or its .local name");
         return false;
     }
     return true;
+}
+
+// With sign-in on the token is the gate: a page of another site cannot read
+// it, and a reverse proxy that rewrites Host or a router's DNS name keep
+// working. The filter guards what is open without it.
+bool auth_request_allowed(httpd_req_t* req) {
+    return s_enabled || auth_request_from_hub_page(req);
 }
 
 esp_err_t auth_reply_cross_site(httpd_req_t* req) {

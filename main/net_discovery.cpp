@@ -15,6 +15,13 @@ static char s_hostname[64] = {0};
 
 const char* net_discovery_hostname() { return s_hostname; }
 
+// mDNS renames the hub when another device answers to its name ("zhac" ->
+// "zhac-2"): keep the name it really has, for status, the UI and the
+// cross-site filter's Host rule. No mDNS calls in here (mdns.h).
+static void on_hostname_changed(const char* hostname, void*) {
+    if (hostname) snprintf(s_hostname, sizeof(s_hostname), "%s", hostname);
+}
+
 void net_discovery_start(const char* hostname) {
     if (!hostname || !hostname[0]) hostname = "zhac";
 
@@ -32,6 +39,8 @@ void net_discovery_start(const char* hostname) {
         return;
     }
     snprintf(s_hostname, sizeof(s_hostname), "%s", hostname);
+    if (mdns_register_hostname_changed_callback(on_hostname_changed, nullptr) != ESP_OK)
+        ESP_LOGW(TAG, "mdns rename callback not registered");
 
     err = mdns_instance_name_set("ZHAC wired gateway");
     if (err != ESP_OK) {

@@ -231,14 +231,17 @@ void device_options_restore_all() {
     migrate_old_keys(h);
 
     // A record of a device not in the pool is never applied: that made up a
-    // shadow entry (HS-02). It is dropped when the pool came from a working
-    // store (hard-removed, or written for an address that never joined); an
-    // empty pool after a storage error says nothing, so then it is kept. A
-    // soft-removed device keeps its options for when it rejoins.
+    // shadow entry (HS-02). It is dropped only when the pool was restored from
+    // a working store (hard-removed, or written for an address that never
+    // joined); an empty pool -- a storage error, a radio backend that never
+    // started -- says nothing, so then it is kept. A soft-removed device keeps
+    // its options for when it rejoins.
     constexpr int kMaxStale = 32;
     static char stale[kMaxStale][16];   // static: one boot-time pass on app_main
     int n_stale = 0;
-    const bool prune = zap_store_is_ready();
+    zigbee_pool_lock();
+    const bool prune = zap_store_is_ready() && pool_count() > 0;
+    zigbee_pool_unlock();
 
     nvs_iterator_t it = nullptr;
     esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, kNamespace,

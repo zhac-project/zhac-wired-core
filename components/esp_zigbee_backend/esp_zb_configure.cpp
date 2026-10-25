@@ -162,6 +162,25 @@ bool do_bind_owned(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t clu
     return s_bind_ok;
 }
 
+// The ZR-01 repair's unbind of a stale bind: sent and not waited for. Most
+// devices answer NO_ENTRY, and waiting (up to kBindTimeoutMs) before every
+// bind ate a sleepy device's short awake window and held the one configure
+// worker. Its answer goes to a callback that ignores it.
+void unbind_no_wait(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t cluster,
+                    uint64_t dst_ieee, uint8_t dst_ep) {
+    ezb_zdo_bind_req_t req{};
+    req.dst_nwk_addr           = nwk;
+    req.field.src_addr.u64     = src_ieee;
+    req.field.src_ep           = src_ep;
+    req.field.cluster_id       = cluster;
+    req.field.dst_addr_mode    = 0x03;   // 64-bit address + endpoint present
+    req.field.dst_addr.extended_addr.u64 = dst_ieee;
+    req.field.dst_ep           = dst_ep;
+    req.cb                     = [](const ezb_zdp_bind_req_result_t*, void*) {};
+    zb_lock::Guard g;
+    if (g) (void)ezb_zdo_unbind_req(&req);
+}
+
 // Set by the one-time ZR-01 repair (esp_zigbee_backend.cpp): this device's
 // binds were made to the radio's factory address.
 bool fix_binds(uint64_t ieee) {
@@ -189,7 +208,7 @@ bool cfg_bind(uint64_t ieee, uint8_t ep, uint16_t cluster) {
     // address, which no node has. Drop it first (that frees a slot on devices
     // with small tables); its answer does not matter.
     if (const uint64_t stale = esp_zb_stale_bind_target(); stale && stale != coord && fix_binds(ieee)) {
-        (void)do_bind(nwk, ieee, ep, cluster, stale, 1, /*unbind=*/true);
+        unbind_no_wait(nwk, ieee, ep, cluster, stale, 1);
     }
     // Destination is always the coordinator's endpoint 1 -- that is the
     // endpoint this firmware registers and the one reports must land on.

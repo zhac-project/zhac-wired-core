@@ -17,7 +17,10 @@ int main() {
     CHECK(req_origin_ok("http://ZHAC.local", "zhac.local"), "host names are case-insensitive");
     CHECK(req_origin_ok("http://[fe80::1]:80", "[fe80::1]"), "IPv6 literal");
     CHECK(req_origin_ok(nullptr, "zhac.local") && req_origin_ok("", "zhac.local"), "no Origin: a script");
-    CHECK(req_origin_ok("http://localhost:5173", "192.168.1.127"), "a loopback dev server");
+    CHECK(req_origin_ok("http://localhost:5173", "localhost:5173") &&
+          req_origin_ok("http://localhost:5173", "localhost:8080"), "a dev server proxying to the hub");
+    CHECK(!req_origin_ok("http://localhost:5173", "192.168.1.127"),
+          "a page on the user's own machine, aimed at the hub directly");
 
     // Any other page.
     CHECK(!req_origin_ok("https://example.com", "zhac.local"), "a foreign page");
