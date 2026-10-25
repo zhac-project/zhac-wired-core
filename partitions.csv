@@ -20,10 +20,16 @@ scripts,        data,  spiffs,   ,        2M
 # it with nvs_open_from_partition() and abort()s inside esp_zigbee_init if that
 # fails -- a boot loop with no error message. IDF's own bundled zigbee examples
 # declare `fat` because they are still v1.x (esp_zb_* API).
-zb_storage,     data,  nvs,      ,        16K
-coredump,       data,  coredump, ,        64K
+# 128K since review 2026-10-24 PB-07 (was 16K, then the core dump): hubs
+# flashed before keep 16K. Grown in place, so a reflash of this table without
+# an erase keeps the network: NVS keeps its old pages and takes the core dump's
+# old sectors as free ones.
+zb_storage,     data,  nvs,      0xE20000, 128K
 # The device pool and the shadow cache (review 2026-09 WC-04: they filled the
 # 64K nvs). Hubs flashed with the table before it get this same region, unused
 # there, registered at run time (main.cpp data_partition_register), so its
 # offset and size must never change.
 zhac_data,      data,  nvs,      0xE40000, 1M
+# Found by type, so it can sit anywhere; 0xE24000 on hubs flashed before
+# PB-07. 0xF50000-0xFFFFFF stays free for later.
+coredump,       data,  coredump, 0xF40000, 64K

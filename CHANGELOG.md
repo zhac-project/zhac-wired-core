@@ -59,6 +59,8 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **New installs get a 128 KB `zb_storage`, and CI checks the app's room** (`partitions.csv`, `tools/check_app_fits.sh`, review 2026-10-24 PB-07). `zb_storage` (the Zigbee network's child table, link keys, bindings and groups) grows from 16 KB to 128 KB in place at 0xE20000, and the core dump moves to 0xF40000; 704 KB at the end stay free. Hubs already installed keep their table (16 KB) until a USB reflash; a reflash of this table without an erase keeps the network, because NVS keeps its old pages and takes the core dump's old sectors as free ones. A build whose app image passes 90 % of its 6 MB OTA slot now fails (`build.yml`, `release.yml`, every hub image; today about 80 %), so a release that would no longer fit installed hubs is caught while there is room to act.
+
 - **`ZHAC_REMOTE_ALLOW_PRIVILEGED` help no longer says it exposes Lua** (`main/Kconfig.projbuild`): `script.write`, `script.run`, `script.reload` and `system.restart` follow the script switch above; the option exposes exactly the relay's privileged list (`ota.s3`, `ota.p4`, `zigbee.reset`, `device.delete`, `settings.set`, `system.token.rotate`, `uplink.set`). `main/json_buf.h` now takes `utf8_seq_len` from zhac-net-core's shared `utf8_seq.h` (one shared validator, no behaviour change; the header moved from `remote_client` to `ws_server` in the final fix wave; either location builds).
 
 - **Device support caught up with zigbee2mqtt 2.14.2** (embedded-zhc a23efb7, zigbee-herdsman-converters v26.105.0 → v26.115.1): 46 new devices and 99 upstream changes ported; deferrals and reasons in zhac-tools `parity/catchup_26105_26115/R8_WORKLIST.md`.
