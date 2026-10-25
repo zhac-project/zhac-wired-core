@@ -448,8 +448,8 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
         // against yet. Record it so /api/diagnostics/unhandled shows it rather
         // than it vanishing. ZCL byte 0 is frame control (bit0 = cluster
         // specific); the attr/cmd id sits after the 1-byte TSN.
-        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
-        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
+        const bool cluster_specific = ind->asdu && ind->asdu_length >= 1 && (ind->asdu[0] & 0x01) != 0;
+        const uint16_t attr_or_cmd = (ind->asdu && ind->asdu_length >= 3) ? ind->asdu[2] : 0;
         zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, 0);
         // Say so, rate-limited: a device that talks but is not in the pool was
         // invisible in the log, which reads exactly like a device that is silent.
@@ -507,8 +507,8 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
         ind->asdu, ind->asdu_length);
 
     if (!decoded) {
-        const bool cluster_specific = (ind->asdu[0] & 0x01) != 0;
-        const uint16_t attr_or_cmd = (ind->asdu_length >= 3) ? ind->asdu[2] : 0;
+        const bool cluster_specific = ind->asdu && ind->asdu_length >= 1 && (ind->asdu[0] & 0x01) != 0;
+        const uint16_t attr_or_cmd = (ind->asdu && ind->asdu_length >= 3) ? ind->asdu[2] : 0;
         zb_diag_record_unhandled(ind->cluster_id, attr_or_cmd, cluster_specific, ieee);
     }
 

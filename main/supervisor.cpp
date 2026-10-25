@@ -62,6 +62,7 @@ void supervisor_start(httpd_handle_t hd) {
     if (started) return;
     started = true;
     s_hd = hd;
-    if (zhac_task_create(task_supervisor, "TaskSupervisor", 3072, nullptr, 1, nullptr) != pdPASS)
+    // 4 KB: esp_restart() runs the store flush handlers on this stack.
+    if (zhac_task_create(task_supervisor, "TaskSupervisor", 4096, nullptr, 1, nullptr) != pdPASS)
         ESP_LOGE(TAG, "supervisor task not started");
 }
