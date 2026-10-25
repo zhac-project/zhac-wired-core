@@ -924,6 +924,40 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     }
 }
 
+// ── Heartbeat (review 2026-10-24 PB-05) ──────────────────────────────────
+// A stamp taken ON the Zigbee task every second, for main/'s supervisor: a
+// 1 s esp_timer posts it to the stack's task queue, and a mainloop that is
+// stuck never runs it, so the stamp stops. At most one stamp is in the queue.
+// esp_zigbee_task_queue_post waits (10 ticks) only when its 8-slot queue is
+// full; with one stamp in flight and esp_zigbee_stop its only other user, it
+// never is, so the esp_timer task is not held up.
+static std::atomic<int64_t> s_hb_us{0};
+static std::atomic<bool>    s_hb_pending{false};
+static esp_timer_handle_t   s_hb_timer = nullptr;
+
+static void hb_stamp(void*) {
+    s_hb_us.store(esp_timer_get_time());
+    s_hb_pending.store(false);
+}
+
+static void hb_tick(void*) {
+    if (s_hb_pending.exchange(true)) return;   // the last stamp has not run yet
+    if (esp_zigbee_task_queue_post(hb_stamp, nullptr) != ESP_OK) s_hb_pending.store(false);
+}
+
+static void heartbeat_start() {
+    esp_timer_create_args_t args{};
+    args.callback = hb_tick;
+    args.name     = "zb_heartbeat";
+    if (!s_hb_timer && esp_timer_create(&args, &s_hb_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "heartbeat timer create failed -- the stack is not watched");
+        return;
+    }
+    esp_timer_start_periodic(s_hb_timer, 1000000);
+}
+
+int64_t esp_zigbee_backend_heartbeat_us(void) { return s_hb_us.load(); }
+
 // ── The Zigbee task ──────────────────────────────────────────────────────
 // esp_zigbee_launch_mainloop() does not return; it needs its own task.
 static void task_zigbee(void*) {
@@ -942,6 +976,8 @@ static void task_zigbee(void*) {
     // the SPA renders, and every device silently stops working.
     s_running = false;
     s_formed  = false;
+    if (s_hb_timer) esp_timer_stop(s_hb_timer);
+    s_hb_us.store(0);   // no stack left to watch
     const int64_t uptime_s = (esp_timer_get_time() - started_us) / 1000000;
     ESP_LOGE(TAG, "stack mainloop EXITED after %llds: %s -- radio is down",
              (long long)uptime_s, esp_err_to_name(err));
@@ -1122,6 +1158,7 @@ static bool zb_init() {
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
         return false;
     }
+    heartbeat_start();   // the first stamp lands when the mainloop runs
 
     // Wait for autostart to produce a PAN, then form explicitly if it did not.
     //
@@ -1428,5 +1465,6 @@ bool esp_zigbee_backend_register(void) {
     ESP_LOGW("esp_zb", "built without CONFIG_ZHAC_ESP_ZIGBEE -- no radio backend");
     return false;
 }
+int64_t esp_zigbee_backend_heartbeat_us(void) { return 0; }   // no stack to watch
 
 #endif  // CONFIG_ZHAC_ESP_ZIGBEE

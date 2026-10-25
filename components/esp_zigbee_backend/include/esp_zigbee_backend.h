@@ -31,6 +31,14 @@ const char* esp_zigbee_backend_last_error(void);
 // True once the stack runs and holds a network (formed, or restored at boot).
 bool esp_zigbee_backend_network_up(void);
 
+// Heartbeat of the Zigbee stack's own task (review 2026-10-24 PB-05): the
+// esp_timer_get_time() of the last stamp taken on that task, refreshed every
+// second while the stack's mainloop runs; a blocked mainloop stops it. 0 until
+// the mainloop first runs, on a boot without the radio, after the mainloop
+// exits, and on builds without this backend: nothing to watch. Lock-free, safe
+// from any task.
+int64_t esp_zigbee_backend_heartbeat_us(void);
+
 // Wall-clock seconds for ZapDevice::last_seen, which the web UI reads as Unix
 // time (the dual-chip build's zigbee_mgr does the same). 0 until SNTP has set
 // the clock, i.e. before 2020-01-01; callers keep the previous value then, and
