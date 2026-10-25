@@ -55,6 +55,7 @@ constexpr uint32_t kHealthTickS      = 5;
 constexpr uint32_t kHealthDeadlineS  = 10 * 60;
 constexpr const char* kNvsNs         = "sys_cfg";
 constexpr const char* kNvsRadioOk    = "ota_radio_ok";   // u8: radio was fine before the update
+constexpr const char* kNvsStoreOk    = "ota_store_ok";   // u8: device store was fine before it (absent: yes)
 constexpr const char* kNvsRollback   = "ota_rb_why";     // str: why the last update was undone
 
 esp_timer_handle_t s_health_timer = nullptr;
@@ -85,13 +86,17 @@ const char* health_problem() {
     if (!ws_server_get_handle()) return "web server not running";
     if (!sys_event_task_ok()) return "event dispatcher not running (rules and web UI would see no device events)";
     if (auth_storage_error()) return "sign-in storage not readable";
-    if (!zap_store_is_ready()) return "device store not readable";
     uint8_t radio_was_ok = 0;
+    uint8_t store_was_ok = 1;   // a build before this one did not record it: hold the update to it
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READONLY, &h) == ESP_OK) {
         nvs_get_u8(h, kNvsRadioOk, &radio_was_ok);
+        nvs_get_u8(h, kNvsStoreOk, &store_was_ok);
         nvs_close(h);
     }
+    // Only a store that worked before: an update must not roll back for one
+    // that was already shut (and may be what the update is meant to fix).
+    if (store_was_ok && !zap_store_is_ready()) return "device store not readable (it was before the update)";
     if (radio_was_ok && !radio_ok()) return "Zigbee radio not ready (it was before the update)";
     return nullptr;
 }
@@ -250,6 +255,7 @@ void run(const char* url) {
     event("ota.complete", true, true, total, total, nullptr);
     // What the new image has to live up to, and a clean slate for its verdict.
     nvs_put_u8(kNvsRadioOk, radio_ok() ? 1 : 0);
+    nvs_put_u8(kNvsStoreOk, zap_store_is_ready() ? 1 : 0);
     nvs_put_str(kNvsRollback, nullptr);
     rule_store_flush_now();
     zap_store_flush_now();

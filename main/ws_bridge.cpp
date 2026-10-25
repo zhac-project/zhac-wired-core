@@ -1681,11 +1681,14 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     const char* cmd = doc["cmd"] | (const char*)nullptr;
     if (!cmd) { send_err(fd, id, "missing cmd"); return; }
 
-    // With auth on, a browser socket must send {"cmd":"auth","args":{"token":
-    // ...}} before anything else runs -- the token rides a frame, never the
-    // URL (as on the dual-chip S3). fd < 0 is the remote relay, which has its
-    // own authentication.
-    if (auth_enabled() && fd >= 0 && !ws_server_fd_is_authed(fd)) {
+    // A browser socket that is not signed in must send {"cmd":"auth","args":
+    // {"token":...}} before anything else runs -- the token rides a frame,
+    // never the URL (as on the dual-chip S3). Its own flag decides, not the
+    // sign-in setting: a socket opened while sign-in is off starts signed in,
+    // and one left over from before sign-in was turned off is not let in
+    // while its close is still queued (review 2026-10-24 HS-01). fd < 0 is the
+    // remote relay, which has its own authentication.
+    if (fd >= 0 && !ws_server_fd_is_authed(fd)) {
         const bool is_auth = std::strcmp(cmd, "auth") == 0;
         if (is_auth && auth_check_token(doc["args"]["token"] | "", fd)) {
             ws_server_fd_set_authed(fd);

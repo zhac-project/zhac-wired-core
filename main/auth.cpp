@@ -379,7 +379,8 @@ bool auth_rotate_token(char* out, size_t cap) {
 }
 
 bool auth_check_token(const char* token, int fd) {
-    if (!s_enabled) return true;
+    // The real token even with sign-in off: only a socket that never signed in
+    // asks then (one opened while sign-in is off starts signed in).
     // Failures count against the socket's peer, as on REST: one shared bucket
     // let any peer's five wrong guesses refuse everyone's valid token (review F31).
     const uint32_t ip = peer_ipv4_fd(fd);
