@@ -852,6 +852,41 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         return true;
     }
 
+    // The trust centre's own word that a device joined (review ZR-02): an
+    // announce from an IEEE the pool lacks is admitted only after one of
+    // these, or while permit-join is open. Observed, not consumed.
+    case EZB_ZDO_SIGNAL_DEVICE_AUTHORIZED: {
+        const auto* p = static_cast<const ezb_zdo_signal_device_authorized_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "device authorized: ieee %016llx nwk 0x%04x type %u status %u",
+                     (unsigned long long)p->device_addr.u64, (unsigned)p->short_addr,
+                     (unsigned)p->type, (unsigned)p->status);
+            if (p->status == EZB_ZDO_AUTH_STATUS_SUCCESS) zb_interview_on_authorised(p->device_addr.u64);
+        }
+        return false;
+    }
+
+    case EZB_ZDO_SIGNAL_DEVICE_UPDATE: {
+        const auto* p = static_cast<const ezb_zdo_signal_device_update_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "device update: ieee %016llx nwk 0x%04x status %u tc_action %u",
+                     (unsigned long long)p->device_addr.u64, (unsigned)p->short_addr,
+                     (unsigned)p->status, (unsigned)p->tc_action);
+            if (p->tc_action == EZB_ZDO_TC_ACTION_ACCEPT && p->status != EZB_ZDO_UPDDEV_DEVICE_LEFT)
+                zb_interview_on_authorised(p->device_addr.u64);
+        }
+        return false;
+    }
+
+    case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS: {
+        const auto* p = static_cast<const ezb_nwk_signal_permit_join_status_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) zb_interview_on_permit_join(p->duration);
+        return false;
+    }
+
     case EZB_ZDO_SIGNAL_LEAVE: {
         // This coordinator left the network. The payload is only the leave
         // type -- reading it as a LEAVE_INDICATION took unrelated bytes for a
@@ -1224,6 +1259,7 @@ static bool zb_start_discovery(uint8_t duration_s) {
         ESP_LOGW(TAG, "open_network(%us) failed (%d)", (unsigned)duration_s, (int)e);
         return false;
     }
+    zb_interview_on_permit_join(duration_s);   // new devices may join the pool now
     ESP_LOGI(TAG, "network open for %us", (unsigned)duration_s);
     return true;
 }
@@ -1237,6 +1273,7 @@ static bool zb_stop_discovery() {
         ESP_LOGW(TAG, "close_network failed (%d)", (int)e);
         return false;
     }
+    zb_interview_on_permit_join(0);
     ESP_LOGI(TAG, "network closed");
     return true;
 }
