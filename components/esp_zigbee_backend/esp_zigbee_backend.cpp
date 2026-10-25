@@ -25,6 +25,7 @@
 // Everything above is identical, which was the entire argument for keeping
 // both SKUs in one repo.
 #include "esp_zigbee_backend.h"
+#include "esp_zb_boot_guard.h"
 #include "esp_zb_interview.h"
 #include <ctime>
 #include "sdkconfig.h"
@@ -32,6 +33,7 @@
 #if CONFIG_ZHAC_ESP_ZIGBEE
 
 #include "device_backend.h"
+#include "device_shadow.h"   // device_shadow_remove (network reset)
 #include "esp_attr.h"     // __NOINIT_ATTR
 #include "esp_log.h"
 #include "esp_system.h"   // esp_restart
@@ -368,16 +370,18 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     }
 
     // Source may arrive short or extended; the pool is keyed by IEEE.
+    // One record for the pool lookups below, static: this callback runs only
+    // on the stack task, and the decode further down needs that task's stack
+    // (review ZR-04). Read only after a lookup that found something.
+    static ZapDevice snap;
     uint64_t ieee = 0;
     uint16_t nwk  = 0;
     if (ind->src_address.addr_mode == EZB_ADDR_MODE_EXT) {
         // ezb_extaddr_t is a packed union struct, not a raw byte array.
         ieee = ind->src_address.u.extended_addr.u64;
-        ZapDevice snap{};
         if (zigbee_pool_snapshot(ieee, &snap)) nwk = snap.nwk_addr;
     } else {
         nwk = ind->src_address.u.short_addr;
-        ZapDevice snap{};
         if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) {
             ieee = snap.ieee_addr;
             // A stale pool entry can still hold the address a newly joined
@@ -387,8 +391,7 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
             if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
                 ext.u64 != ieee) {
                 pool_set_nwk(ieee, 0);   // the old holder no longer has it
-                ZapDevice real{};
-                if (zigbee_pool_snapshot(ext.u64, &real)) {
+                if (zigbee_pool_snapshot(ext.u64, &snap)) {
                     pool_set_nwk(ext.u64, nwk);
                     ESP_LOGW(TAG, "nwk 0x%04x is %016llx, not %016llx -- pool refreshed",
                              nwk, (unsigned long long)ext.u64, (unsigned long long)ieee);
@@ -412,9 +415,9 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                 // Joined (the stack resolves it) but not ours: adopt it. The
                 // pool entry appears now, so this frame and the next ones
                 // decode under the right device; the interview fills identity.
+                // The admission gate may refuse it (ZR-02): then it stays unknown.
                 zb_interview_adopt(ext.u64, nwk);
-                zigbee_pool_snapshot(ext.u64, &snap);
-                ieee = snap.ieee_addr;
+                if (zigbee_pool_snapshot(ext.u64, &snap)) ieee = snap.ieee_addr;
             } else if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
                        zigbee_pool_snapshot(ext.u64, &snap)) {
                 ieee = ext.u64;
@@ -488,8 +491,9 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                        static_cast<uint8_t>(ind->asdu_length));
     feed_late_identity(nwk, ind->cluster_id, ind->asdu, ind->asdu_length);
 
-    // Identity strings for the matcher, straight from the pool snapshot.
-    ZapDevice dev{};
+    // Identity strings for the matcher, straight from the pool snapshot (the
+    // static record above; every use below is behind `have`).
+    ZapDevice& dev = snap;
     const bool have = zigbee_pool_snapshot(ieee, &dev);
     const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
     const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
@@ -686,6 +690,68 @@ static void coordinator_address_remember() {
     nvs_close(h);
 }
 
+// ── Zigbee network reset (review 2026-10-24 PB-06) ──────────────────────
+// Only on the owner's command (zigbee_force_recommission, below): every device
+// is forgotten (pool, device store, shadow), and a mark in NVS asks the next
+// boot to erase zb_storage (PAN, keys, child table) and the address pin before
+// the stack starts, so it forms a new network with new keys. Settings, rules
+// and sign-in stay. The mark is kept until the erase worked, so a power cut on
+// the way finishes at the next boot.
+static constexpr char kResetKey[] = "reset";
+
+// Forget every device: pool, adapter caches, device store, shadow (state and
+// options). Returns how many.
+static uint16_t forget_all_devices() {
+    uint16_t n = 0;
+    for (; n <= ZAP_MAX_DEVICES; n++) {   // bound: a record that would not go
+        uint64_t ieee = 0;
+        zigbee_pool_lock();
+        for (uint16_t i = 0; i < pool_count() && !ieee; i++) ieee = pool_all()[i].ieee_addr;
+        zigbee_pool_unlock();
+        if (!ieee) break;
+        zb_interview_forget(ieee);
+        device_shadow_remove(ieee);
+    }
+    return n;
+}
+
+// At boot, after the pool restore and before zb_storage is opened.
+static void network_reset_if_marked() {
+    uint8_t mark = 0;
+    nvs_handle_t h;
+    if (nvs_open(kPinNs, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, kResetKey, &mark) != ESP_OK) mark = 0;
+        nvs_close(h);
+    }
+    if (!mark) return;
+    // The mark goes first: a mark that cannot be cleared must never erase the
+    // network at every boot. A cut right after it loses the reset instead, and
+    // the owner runs it again.
+    esp_err_t e = nvs_open(kPinNs, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_erase_key(h, kResetKey);
+        if (e == ESP_OK) e = nvs_commit(h);
+        if (e != ESP_OK) nvs_close(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: cannot clear its mark (%s) -- nothing erased", esp_err_to_name(e));
+        return;
+    }
+    // Normally no device is left: they were forgotten before the restart. One
+    // that came back (a cut before that finished) was on the old network too.
+    const uint16_t stale = forget_all_devices();
+    e = nvs_flash_erase_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
+    if (e == ESP_OK && nvs_erase_key(h, kPinKey) == ESP_OK) nvs_commit(h);   // new network, radio's address
+    nvs_close(h);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: erasing '%s' failed (%s) -- the old network stays; "
+                      "run the reset again", CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGW(TAG, "Zigbee network reset: the old network is erased (%u stale device record(s) "
+                  "dropped) -- a new one is formed now", (unsigned)stale);
+}
+
 static bool has_server_cluster(const ZapDevice& d, uint16_t cluster) {
     for (uint8_t e = 0; e < d.endpoint_count && e < 8; e++)
         for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP; c++)
@@ -779,6 +845,53 @@ static void coordinator_repair_on_frame(uint64_t ieee, uint16_t nwk, ZapDevice& 
     zap_store_mark_dirty(&dev, ZAP_PERSIST_HIGH);   // flushed within 5 s: the dirty table never fills
 }
 
+// ── Boot guard: a radio that kills the chip must not kill the hub ─────────
+//
+// With no radio firmware on the C6 (a new Guition board ships it with
+// ESP-Hosted, not ot_rcp) or a mismatched one, OpenThread's spinel driver
+// ends the RCP handshake in DieNow() -> abort(), either inside
+// esp_zigbee_init() or a little later from the Zigbee task. Unguarded that is
+// a boot loop, and the web UI never stays up long enough to say why.
+//
+// The guard (esp_zb_boot_guard.h, no-init RAM) is armed just before radio
+// init and disarmed when the stack reports a network. Three crashes in a row
+// while armed make the next boot run without the radio, keeping the device
+// pool and UI up and saying so in status; whenever the radio is down, the hub
+// restarts later to try again (review 2026-10-24 ZR-05 / PB-03: one crash in
+// the first 30 s, often not the radio's, used to leave it radio-less until
+// someone reset it).
+static __NOINIT_ATTR BootGuard s_guard;
+static const char*             s_last_error = nullptr;
+
+static BootGuard::Reset reset_kind() {
+    switch (esp_reset_reason()) {
+    case ESP_RST_PANIC: case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT:
+        return BootGuard::Reset::CRASH;
+    case ESP_RST_SW:
+        return BootGuard::Reset::RESTART;
+    default:
+        return BootGuard::Reset::OTHER;
+    }
+}
+
+// The radio is down for this boot: restart later and try again (10 min, 1 h,
+// then every 6 h), so neither a passing fault nor a board without radio
+// firmware needs a person -- and the latter does not reboot all day.
+static void schedule_radio_retry() {
+    static esp_timer_handle_t timer = nullptr;
+    esp_timer_create_args_t args{};
+    args.callback = [](void*) {
+        s_guard.retrying();
+        ESP_LOGW(TAG, "restarting to try the radio again");
+        esp_restart();   // the stores flush in their shutdown handlers
+    };
+    args.name = "zb_retry";
+    if (!timer && esp_timer_create(&args, &timer) != ESP_OK) return;
+    const uint32_t s = s_guard.next_retry_s();
+    if (esp_timer_start_once(timer, static_cast<uint64_t>(s) * 1000000ULL) == ESP_OK)
+        ESP_LOGW(TAG, "radio down -- the hub restarts in %u min to try it again", (unsigned)(s / 60));
+}
+
 // ── Stack lifecycle signals ──────────────────────────────────────────────
 //
 // This handler is not optional decoration -- it DRIVES commissioning.
@@ -821,6 +934,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         // No formation needed; joined devices keep their addresses.
         if (!bdb_signal_ok(app_signal, "resuming the network")) return true;
         s_formed = true;
+        s_guard.network_up();   // the radio started: later crashes are not its
         coordinator_address_remember();
         ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
@@ -830,6 +944,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     case EZB_BDB_SIGNAL_FORMATION:
         if (!bdb_signal_ok(app_signal, "network formation")) return true;
         s_formed = true;
+        s_guard.network_up();
         coordinator_address_remember();
         spawn_group_join_task();   // first formation of this network
         ESP_LOGI(TAG, "network formed: pan 0x%04x channel %u",
@@ -850,6 +965,41 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
             zb_interview_on_announce(p->device_addr.u64, p->short_addr);
         }
         return true;
+    }
+
+    // The trust centre's own word that a device joined (review ZR-02): an
+    // announce from an IEEE the pool lacks is admitted only after one of
+    // these, or while permit-join is open. Observed, not consumed.
+    case EZB_ZDO_SIGNAL_DEVICE_AUTHORIZED: {
+        const auto* p = static_cast<const ezb_zdo_signal_device_authorized_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "device authorized: ieee %016llx nwk 0x%04x type %u status %u",
+                     (unsigned long long)p->device_addr.u64, (unsigned)p->short_addr,
+                     (unsigned)p->type, (unsigned)p->status);
+            if (p->status == EZB_ZDO_AUTH_STATUS_SUCCESS) zb_interview_on_authorised(p->device_addr.u64);
+        }
+        return false;
+    }
+
+    case EZB_ZDO_SIGNAL_DEVICE_UPDATE: {
+        const auto* p = static_cast<const ezb_zdo_signal_device_update_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) {
+            ESP_LOGI(TAG, "device update: ieee %016llx nwk 0x%04x status %u tc_action %u",
+                     (unsigned long long)p->device_addr.u64, (unsigned)p->short_addr,
+                     (unsigned)p->status, (unsigned)p->tc_action);
+            if (p->tc_action == EZB_ZDO_TC_ACTION_ACCEPT && p->status != EZB_ZDO_UPDDEV_DEVICE_LEFT)
+                zb_interview_on_authorised(p->device_addr.u64);
+        }
+        return false;
+    }
+
+    case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS: {
+        const auto* p = static_cast<const ezb_nwk_signal_permit_join_status_params_t*>(
+            ezb_app_signal_get_params(app_signal));
+        if (p) zb_interview_on_permit_join(p->duration);
+        return false;
     }
 
     case EZB_ZDO_SIGNAL_LEAVE: {
@@ -889,6 +1039,62 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     }
 }
 
+// ── Heartbeat (review 2026-10-24 PB-05) ──────────────────────────────────
+// A stamp taken ON the Zigbee task every second, for main/'s supervisor: a
+// 1 s esp_timer posts it to the stack's task queue, and a mainloop that is
+// stuck never runs it, so the stamp stops. At most one stamp is in the queue.
+// esp_zigbee_task_queue_post waits (10 ticks) only when its 8-slot queue is
+// full; with one stamp in flight and esp_zigbee_stop its only other user, it
+// never is, so the esp_timer task is not held up.
+static std::atomic<int64_t> s_hb_us{0};
+static std::atomic<bool>    s_hb_pending{false};
+static esp_timer_handle_t   s_hb_timer = nullptr;
+
+// How close TaskZigbee came to the end of its stack, where every frame is
+// decoded (review ZR-04): checked once a minute from the stamp, which runs on
+// that task, and logged at each new low (in 256-byte steps, so a few lines a
+// boot; /api/diagnostics names the worst task too).
+static void stack_note(int64_t now) {
+    static int64_t  s_next_us = 0;
+    static uint32_t s_low     = UINT32_MAX;
+    if (now < s_next_us) return;
+    s_next_us = now + 60 * 1000000LL;
+    const uint32_t free_b = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
+    if (free_b + 256 > s_low) return;
+    s_low = free_b;
+    if (free_b < 2048)
+        ESP_LOGW(TAG, "TaskZigbee stack: %u of %u bytes never used", (unsigned)free_b,
+                 (unsigned)zhac::stack::kEspZigbee);
+    else
+        ESP_LOGI(TAG, "TaskZigbee stack: %u of %u bytes never used", (unsigned)free_b,
+                 (unsigned)zhac::stack::kEspZigbee);
+}
+
+static void hb_stamp(void*) {
+    const int64_t now = esp_timer_get_time();
+    s_hb_us.store(now);
+    s_hb_pending.store(false);
+    stack_note(now);
+}
+
+static void hb_tick(void*) {
+    if (s_hb_pending.exchange(true)) return;   // the last stamp has not run yet
+    if (esp_zigbee_task_queue_post(hb_stamp, nullptr) != ESP_OK) s_hb_pending.store(false);
+}
+
+static void heartbeat_start() {
+    esp_timer_create_args_t args{};
+    args.callback = hb_tick;
+    args.name     = "zb_heartbeat";
+    if (!s_hb_timer && esp_timer_create(&args, &s_hb_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "heartbeat timer create failed -- the stack is not watched");
+        return;
+    }
+    esp_timer_start_periodic(s_hb_timer, 1000000);
+}
+
+int64_t esp_zigbee_backend_heartbeat_us(void) { return s_hb_us.load(); }
+
 // ── The Zigbee task ──────────────────────────────────────────────────────
 // esp_zigbee_launch_mainloop() does not return; it needs its own task.
 static void task_zigbee(void*) {
@@ -907,6 +1113,8 @@ static void task_zigbee(void*) {
     // the SPA renders, and every device silently stops working.
     s_running = false;
     s_formed  = false;
+    if (s_hb_timer) esp_timer_stop(s_hb_timer);
+    s_hb_us.store(0);   // no stack left to watch
     const int64_t uptime_s = (esp_timer_get_time() - started_us) / 1000000;
     ESP_LOGE(TAG, "stack mainloop EXITED after %llds: %s -- radio is down",
              (long long)uptime_s, esp_err_to_name(err));
@@ -921,49 +1129,13 @@ static void task_zigbee(void*) {
         vTaskDelay(pdMS_TO_TICKS(1000));   // let the log drain
         esp_restart();
     }
-    ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting, to avoid "
+    ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting now, to avoid "
                   "a boot loop. /api/status reports the radio as down.",
              (long long)uptime_s, kMainloopRebootMinUptimeS);
+    s_guard.disarm();
+    schedule_radio_retry();   // later, with the boot guard's backoff (PB-03)
     vTaskDelete(nullptr);   // PSRAM-stack task (zhac_task_create): the stack is not
                             // reclaimed on this dead-radio endpoint, and need not be
-}
-
-// ── Boot guard: a radio that kills the chip must not kill the hub ─────────
-//
-// With no radio firmware on the C6 (a new Guition board ships it with
-// ESP-Hosted, not ot_rcp) or a mismatched one, OpenThread's spinel driver
-// ends the RCP handshake in DieNow() -> abort(), either inside
-// esp_zigbee_init() or a little later from the Zigbee task. Unguarded that is
-// a boot loop, and the web UI never stays up long enough to say why.
-//
-// kGuardArmed sits in no-init RAM from just before radio init until the stack
-// has survived kGuardWindowS seconds. It survives a panic or watchdog reset
-// but not a power cycle. Finding it armed after such a reset means the last
-// boot most likely died starting the radio: skip the radio this boot, keep the
-// device pool and UI up, and say so in status. The next reset tries again. An
-// unrelated crash inside the window costs one radio-less boot, nothing more.
-static __NOINIT_ATTR uint32_t s_boot_guard;
-static constexpr uint32_t kGuardArmed   = 0x5A424755;   // "ZBGU"
-static constexpr int      kGuardWindowS = 30;
-static const char*        s_last_error  = nullptr;
-
-static bool boot_guard_tripped() {
-    const esp_reset_reason_t r = esp_reset_reason();
-    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
-                         r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
-    const bool tripped = crashed && s_boot_guard == kGuardArmed;
-    s_boot_guard = 0;   // no-init RAM is garbage after power-on: always clear
-    return tripped;
-}
-
-static void boot_guard_arm() {
-    static esp_timer_handle_t timer = nullptr;
-    esp_timer_create_args_t args{};
-    args.callback = [](void*) { s_boot_guard = 0; };
-    args.name     = "zb_boot_guard";
-    if (!timer && esp_timer_create(&args, &timer) != ESP_OK) return;  // unguarded, as before
-    s_boot_guard = kGuardArmed;
-    esp_timer_start_once(timer, static_cast<uint64_t>(kGuardWindowS) * 1000000ULL);
 }
 
 const char* esp_zigbee_backend_last_error(void) { return s_last_error; }
@@ -1000,7 +1172,9 @@ static bool zb_init() {
     // Never erased here (review 2026-10-24 PB-01): it holds the network --
     // PAN, keys, the coordinator's child table -- and wiping it on an init
     // error formed a new network at autostart, orphaning every paired device.
-    // An unreadable dataset keeps the radio down and says so instead.
+    // An unreadable dataset keeps the radio down and says so instead. Only
+    // the owner's network reset erases it, just below (PB-06).
+    network_reset_if_marked();
     const esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
     if (nerr != ESP_OK) {
         s_last_error = "zb_storage_error";
@@ -1010,14 +1184,15 @@ static bool zb_init() {
         return false;
     }
 
-    if (boot_guard_tripped()) {
+    if (s_guard.on_boot(reset_kind())) {
         s_last_error = "radio_crashed";
-        ESP_LOGE(TAG, "the previous boot died while starting the radio -- running "
-                      "WITHOUT Zigbee this boot; reset to retry. On the P4 board "
-                      "this usually means the ESP32-C6 has no ot_rcp firmware.");
+        ESP_LOGE(TAG, "the last %u boots died while starting the radio -- running "
+                      "WITHOUT Zigbee this boot. On the P4 board this usually means "
+                      "the ESP32-C6 has no ot_rcp firmware.", (unsigned)BootGuard::kTrips);
+        schedule_radio_retry();
         return false;
     }
-    boot_guard_arm();
+    s_guard.arm();
 
     esp_zigbee_config_t cfg{};
     cfg.device_config.device_type         = EZB_NWK_DEVICE_TYPE_COORDINATOR;
@@ -1050,6 +1225,8 @@ static bool zb_init() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_init failed: %s", esp_err_to_name(err));
         s_last_error = "radio_init_failed";
+        s_guard.disarm();   // a failure, not a crash
+        schedule_radio_retry();
         return false;
     }
 
@@ -1073,6 +1250,8 @@ static bool zb_init() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_start failed: %s", esp_err_to_name(err));
         s_last_error = "radio_init_failed";
+        s_guard.disarm();
+        schedule_radio_retry();
         return false;
     }
 
@@ -1081,12 +1260,15 @@ static bool zb_init() {
     // function resumes -- setting it afterwards reported a radio with no live
     // task (review F12).
     s_running = true;
-    if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
+    if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEspZigbee,
                     nullptr, 5, nullptr) != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
+        s_guard.disarm();
+        schedule_radio_retry();
         return false;
     }
+    heartbeat_start();   // the first stamp lands when the mainloop runs
 
     // Wait for autostart to produce a PAN, then form explicitly if it did not.
     //
@@ -1161,6 +1343,7 @@ static bool zb_init() {
             ESP_LOGW(TAG, "coordinator state unknown at init: SDK lock timeout");
         } else if (zb_network_ready()) {
             s_formed = true;
+            s_guard.network_up();   // also when the signal never came
             ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
                      (unsigned)ezb_nwk_get_panid(),
                      (unsigned)ezb_nwk_get_current_channel(),
@@ -1224,6 +1407,7 @@ static bool zb_start_discovery(uint8_t duration_s) {
         ESP_LOGW(TAG, "open_network(%us) failed (%d)", (unsigned)duration_s, (int)e);
         return false;
     }
+    zb_interview_on_permit_join(duration_s);   // new devices may join the pool now
     ESP_LOGI(TAG, "network open for %us", (unsigned)duration_s);
     return true;
 }
@@ -1237,6 +1421,7 @@ static bool zb_stop_discovery() {
         ESP_LOGW(TAG, "close_network failed (%d)", (int)e);
         return false;
     }
+    zb_interview_on_permit_join(0);
     ESP_LOGI(TAG, "network closed");
     return true;
 }
@@ -1360,13 +1545,6 @@ bool zigbee_permit_join(uint8_t duration_s) { return zb_start_discovery(duration
 // stack is up, which bind and enrol treat as "not yet".
 uint64_t zigbee_mgr_coordinator_ieee() { return s_coord_ieee.load(); }
 
-// Not yet implemented on this backend -- ZDO bind/unbind and recommission need
-// the ZDO request path, which lands with the join-handling increment. Refusing
-// loudly beats pretending.
-static inline bool not_yet(const char* op) {
-    ESP_LOGW(TAG, "%s: not implemented on esp_zigbee_backend yet", op);
-    return false;
-}
 bool zigbee_zdo_bind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
                      uint16_t cluster, uint64_t dst_ieee, uint8_t dst_ep) {
     if (!s_running) return false;
@@ -1380,7 +1558,30 @@ bool zigbee_zdo_unbind(uint16_t src_nwk, uint64_t src_ieee, uint8_t src_ep,
                            /*unbind=*/true);
 }
 bool zigbee_interview_trigger(uint64_t ieee) { return zb_interview_trigger(ieee); }
-bool zigbee_force_recommission() { return not_yet("force_recommission"); }
+
+// The owner's Zigbee network reset (ws_bridge `zigbee.reset`, which restarts
+// the hub after a true): mark the network for erasure at the next boot, then
+// forget every device now (see network_reset_if_marked). False, with nothing
+// changed, when the mark cannot be saved. Works on a boot without the radio
+// too, which is how a hub with an unreadable zb_storage gets a new network.
+bool zigbee_force_recommission() {
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(kPinNs, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_set_u8(h, kResetKey, 1);
+        if (e == ESP_OK) e = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee network reset: cannot save the request (%s) -- nothing changed",
+                 esp_err_to_name(e));
+        return false;
+    }
+    const uint16_t n = forget_all_devices();
+    ESP_LOGW(TAG, "Zigbee network reset by the owner: %u device(s) forgotten; the network is "
+                  "erased and a new one formed at the restart", (unsigned)n);
+    return true;
+}
 
 #else   // !CONFIG_ZHAC_ESP_ZIGBEE
 
@@ -1391,5 +1592,6 @@ bool esp_zigbee_backend_register(void) {
     ESP_LOGW("esp_zb", "built without CONFIG_ZHAC_ESP_ZIGBEE -- no radio backend");
     return false;
 }
+int64_t esp_zigbee_backend_heartbeat_us(void) { return 0; }   // no stack to watch
 
 #endif  // CONFIG_ZHAC_ESP_ZIGBEE

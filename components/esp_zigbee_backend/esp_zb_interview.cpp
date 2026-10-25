@@ -39,6 +39,7 @@
 #include "esp_zb_interview.h"
 #include "esp_zigbee_backend.h"   // esp_zigbee_backend_wall_clock_s
 #include "esp_zb_lock.h"
+#include "esp_zb_admit.h"
 #include "esp_zb_forget_log.h"
 #include "esp_zb_interview_merge.h"
 #include "esp_zb_req_gen.h"
@@ -88,6 +89,34 @@ bool forgotten(const JoinReq& r) {
     const bool c = s_forgotten.cancelled(r.ieee, r.seq);
     taskEXIT_CRITICAL(&s_forget_mux);
     return c;
+}
+
+// Which unknown devices may join the pool (review ZR-02, esp_zb_admit.h). Fed
+// by the trust-centre signals and permit-join, asked from the stack task.
+AdmitGate    s_admit;
+portMUX_TYPE s_admit_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// An announce or a frame (`via`) from an IEEE the pool does not have. A
+// refusal is logged at most once a minute, with how many there were (a
+// forgotten device keeps sending).
+bool admit_new(uint64_t ieee, const char* via) {
+    const int64_t now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_admit_mux);
+    const AdmitGate::Verdict v = s_admit.admit(ieee, now);
+    taskEXIT_CRITICAL(&s_admit_mux);
+    if (v == AdmitGate::Verdict::ADMIT) return true;
+    static int64_t  s_log_us  = -60 * 1000000LL;
+    static uint32_t s_refused = 0;
+    s_refused++;
+    if (now - s_log_us > 60 * 1000000LL) {
+        s_log_us = now;
+        ESP_LOGW(TAG, "%s from unknown %016llx not admitted: %s (%u refused)", via, (unsigned long long)ieee,
+                 v == AdmitGate::Verdict::CAPPED ? "too many new devices in 10 min"
+                                                 : "not let in by the trust centre, permit-join closed",
+                 (unsigned)s_refused);
+        s_refused = 0;
+    }
+    return false;
 }
 
 QueueHandle_t     s_join_q   = nullptr;
@@ -509,8 +538,10 @@ bool do_interview(uint64_t ieee, uint16_t nwk) {
              work.endpoint_count, work.interview_state, work.support_state);
 
     // Persist outside the visitor -- mark_dirty can write flash on overflow,
-    // and the pool mutex must not be held across that.
-    zap_store_mark_dirty(&work, ZAP_PERSIST_HIGH);
+    // and the pool mutex must not be held across that. Only once the identity
+    // is known (review ZR-02): an address that never answers the Basic read
+    // stays in RAM until a reboot instead of filling the store.
+    if (have_identity) zap_store_mark_dirty(&work, ZAP_PERSIST_HIGH);
 
     // Configure: bindings + reporting + config_steps. Without this the device
     // is identified but inert -- nothing has told it to send its reports here.
@@ -666,10 +697,14 @@ void zb_interview_init() {
 // firmware was down. Joined devices do not announce again, so without this a
 // forgotten mains device is never interviewed and shows as "not in the pool"
 // forever. The ZNP path adopts such devices from their first frame; same here.
+// The address map also learns from announces anyone can send, so a new IEEE
+// passes the admission gate first (ZR-02): a forgotten device that does not
+// rejoin is adopted while permit-join is open.
 void zb_interview_adopt(uint64_t ieee, uint16_t nwk) {
     if (ieee == 0 || nwk == 0) return;
     ZapDevice snap{};
     if (zigbee_pool_snapshot(ieee, &snap)) return;   // known: nothing to do
+    if (!admit_new(ieee, "frame")) return;
     if (!pool_upsert(ieee, nwk)) return;             // pool full: logged there
     ESP_LOGI(TAG, "%016llx at nwk 0x%04x is joined but unknown -- adopting it, interview queued",
              (unsigned long long)ieee, nwk);
@@ -770,8 +805,24 @@ void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
         // the retry loop was waiting for.
         zap_store_mark_dirty(&c.snap, ZAP_PERSIST_LOW);
         zb_interview_note_traffic(ieee);
+    } else if (!admit_new(ieee, "announce")) {
+        return;   // anyone can announce any address (ZR-02)
     }
     zb_interview_enqueue(ieee, nwk);
+}
+
+void zb_interview_on_authorised(uint64_t ieee) {
+    const int64_t now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_admit_mux);
+    s_admit.authorised(ieee, now);
+    taskEXIT_CRITICAL(&s_admit_mux);
+}
+
+void zb_interview_on_permit_join(uint32_t seconds) {
+    const int64_t now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_admit_mux);
+    s_admit.permit_join(seconds, now);
+    taskEXIT_CRITICAL(&s_admit_mux);
 }
 
 void zb_interview_on_leave(uint64_t ieee) {

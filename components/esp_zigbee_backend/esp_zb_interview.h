@@ -29,8 +29,15 @@ bool zb_interview_trigger(uint64_t ieee);
 // already fully interviewed -- just refresh its address) and a full interview.
 // Routers announce on every power cycle, so this is the difference between a
 // mains outage costing one pool update per device and costing a full 4-stage
-// ZDO interview per device, serialised on one radio.
+// ZDO interview per device, serialised on one radio. An IEEE the pool does not
+// have must pass the admission gate (esp_zb_admit.h, review ZR-02).
 void zb_interview_on_announce(uint64_t ieee, uint16_t nwk);
+
+// Feed the admission gate: the trust centre let this device in
+// (DEVICE_AUTHORIZED, or a DEVICE_UPDATE it accepted), and permit-join opened
+// for `seconds` or closed (0). Safe from any task.
+void zb_interview_on_authorised(uint64_t ieee);
+void zb_interview_on_permit_join(uint32_t seconds);
 
 // Soft-remove: the device told us it is leaving (or was told to). Keeps the
 // record so friendly name, interview state and shadow survive a rejoin.
@@ -55,8 +62,9 @@ bool zb_interview_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
 // every other device.
 // A frame from a device the stack knows but the pool does not (NVS wiped, or
 // it joined while ZHAC was down): create the pool entry and queue an
-// interview. Joined devices never announce again, so this is the only way
-// back. No-op for a device already in the pool.
+// interview, when the admission gate lets it in. Joined devices never
+// announce again, so this is the only way back. No-op for a device already
+// in the pool.
 void zb_interview_adopt(uint64_t ieee, uint16_t nwk);
 
 void zb_interview_note_traffic(uint64_t ieee);
