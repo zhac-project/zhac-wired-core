@@ -148,26 +148,39 @@ void event(const char* name, bool has_ok, bool ok, int offset, int total, const 
     ws_push(name, d);
 }
 
+struct Hop { char* loc; size_t cap; bool cut; };   // the Location a hop answered with
+
+esp_err_t on_hop_event(esp_http_client_event_t* e) {
+    auto* h = static_cast<Hop*>(e->user_data);
+    if (h && e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value &&
+        strcasecmp(e->header_key, "Location") == 0 &&
+        snprintf(h->loc, h->cap, "%s", e->header_value) >= static_cast<int>(h->cap))
+        h->cut = true;
+    return ESP_OK;
+}
+
 // One request, headers only, redirects off: the HTTP status, and for a 3xx
-// the absolute target (the client resolves a relative Location). Negative when
-// the server cannot be reached.
+// the Location value as sent (ota_follow resolves a relative one). Negative
+// when the server cannot be reached or the Location does not fit. Not
+// esp_http_client_get_url(): it leaves the query out, and a signed download
+// URL carries its signature there (review 2026-10-24 F-04).
 int fetch_hop(const char* url, char* next, size_t cap) {
+    Hop hop{next, cap, false};
+    next[0] = '\0';
     esp_http_client_config_t c{};
     c.url = url;
     c.crt_bundle_attach = esp_crt_bundle_attach;
     c.disable_auto_redirect = true;
     c.buffer_size_tx = 2048;   // a signed URL in the request line, as below
+    c.event_handler = on_hop_event;
+    c.user_data = &hop;
     esp_http_client_handle_t cl = esp_http_client_init(&c);
     if (!cl) return -1;
     int status = -1;
     if (esp_http_client_open(cl, 0) == ESP_OK) {
         esp_http_client_fetch_headers(cl);
         status = esp_http_client_get_status_code(cl);
-        if (status <= 0) status = -1;
-        else if (ota_is_redirect(status) &&
-                 (esp_http_client_set_redirection(cl) != ESP_OK ||
-                  esp_http_client_get_url(cl, next, static_cast<int>(cap)) != ESP_OK))
-            status = -1;
+        if (status <= 0 || (hop.cut && ota_is_redirect(status))) status = -1;
     }
     esp_http_client_cleanup(cl);
     return status;
