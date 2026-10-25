@@ -97,17 +97,18 @@ AdmitGate    s_admit;
 portMUX_TYPE s_admit_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // An announce or a frame (`via`) from an IEEE the pool does not have. A
-// refusal is logged at most every 10 s, with how many there were.
+// refusal is logged at most once a minute, with how many there were (a
+// forgotten device keeps sending).
 bool admit_new(uint64_t ieee, const char* via) {
     const int64_t now = esp_timer_get_time();
     taskENTER_CRITICAL(&s_admit_mux);
     const AdmitGate::Verdict v = s_admit.admit(ieee, now);
     taskEXIT_CRITICAL(&s_admit_mux);
     if (v == AdmitGate::Verdict::ADMIT) return true;
-    static int64_t  s_log_us  = -10 * 1000000LL;
+    static int64_t  s_log_us  = -60 * 1000000LL;
     static uint32_t s_refused = 0;
     s_refused++;
-    if (now - s_log_us > 10 * 1000000LL) {
+    if (now - s_log_us > 60 * 1000000LL) {
         s_log_us = now;
         ESP_LOGW(TAG, "%s from unknown %016llx not admitted: %s (%u refused)", via, (unsigned long long)ieee,
                  v == AdmitGate::Verdict::CAPPED ? "too many new devices in 10 min"
