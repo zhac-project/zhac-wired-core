@@ -23,9 +23,11 @@ bool esp_zigbee_backend_register(void);
 
 // Why the radio is down, or nullptr while it is fine. Stable strings, sent to
 // the web UI as status `radio_error`:
-//   "radio_crashed"     the previous boot died while starting the radio, so this
+//   "radio_crashed"     the last boots died while starting the radio, so this
 //                       boot runs without it (see the boot guard in the .cpp)
 //   "radio_init_failed" the stack reported an error while starting
+//   "zb_storage_error"  the network's storage partition cannot be opened
+// After the first two the hub restarts later by itself to try again.
 const char* esp_zigbee_backend_last_error(void);
 
 // True once the stack runs and holds a network (formed, or restored at boot).

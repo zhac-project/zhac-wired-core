@@ -37,6 +37,9 @@ add_test(NAME forget_log COMMAND forget_log_tests)
 add_executable(admit_gate_tests test_admit_gate.cpp)
 add_test(NAME admit_gate COMMAND admit_gate_tests)
 
+add_executable(boot_guard_tests test_boot_guard.cpp)
+add_test(NAME boot_guard COMMAND boot_guard_tests)
+
 # zap_common and ArduinoJson come from the sibling zhac-components checkout.
 set(ZHAC_COMPONENTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components"
     CACHE PATH "zhac-components checkout")

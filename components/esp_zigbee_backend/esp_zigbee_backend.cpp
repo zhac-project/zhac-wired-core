@@ -25,6 +25,7 @@
 // Everything above is identical, which was the entire argument for keeping
 // both SKUs in one repo.
 #include "esp_zigbee_backend.h"
+#include "esp_zb_boot_guard.h"
 #include "esp_zb_interview.h"
 #include <ctime>
 #include "sdkconfig.h"
@@ -781,6 +782,53 @@ static void coordinator_repair_on_frame(uint64_t ieee, uint16_t nwk, ZapDevice& 
     zap_store_mark_dirty(&dev, ZAP_PERSIST_HIGH);   // flushed within 5 s: the dirty table never fills
 }
 
+// ── Boot guard: a radio that kills the chip must not kill the hub ─────────
+//
+// With no radio firmware on the C6 (a new Guition board ships it with
+// ESP-Hosted, not ot_rcp) or a mismatched one, OpenThread's spinel driver
+// ends the RCP handshake in DieNow() -> abort(), either inside
+// esp_zigbee_init() or a little later from the Zigbee task. Unguarded that is
+// a boot loop, and the web UI never stays up long enough to say why.
+//
+// The guard (esp_zb_boot_guard.h, no-init RAM) is armed just before radio
+// init and disarmed when the stack reports a network. Three crashes in a row
+// while armed make the next boot run without the radio, keeping the device
+// pool and UI up and saying so in status; whenever the radio is down, the hub
+// restarts later to try again (review 2026-10-24 ZR-05 / PB-03: one crash in
+// the first 30 s, often not the radio's, used to leave it radio-less until
+// someone reset it).
+static __NOINIT_ATTR BootGuard s_guard;
+static const char*             s_last_error = nullptr;
+
+static BootGuard::Reset reset_kind() {
+    switch (esp_reset_reason()) {
+    case ESP_RST_PANIC: case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT:
+        return BootGuard::Reset::CRASH;
+    case ESP_RST_SW:
+        return BootGuard::Reset::RESTART;
+    default:
+        return BootGuard::Reset::OTHER;
+    }
+}
+
+// The radio is down for this boot: restart later and try again (10 min, 1 h,
+// then every 6 h), so neither a passing fault nor a board without radio
+// firmware needs a person -- and the latter does not reboot all day.
+static void schedule_radio_retry() {
+    static esp_timer_handle_t timer = nullptr;
+    esp_timer_create_args_t args{};
+    args.callback = [](void*) {
+        s_guard.retrying();
+        ESP_LOGW(TAG, "restarting to try the radio again");
+        esp_restart();   // the stores flush in their shutdown handlers
+    };
+    args.name = "zb_retry";
+    if (!timer && esp_timer_create(&args, &timer) != ESP_OK) return;
+    const uint32_t s = s_guard.next_retry_s();
+    if (esp_timer_start_once(timer, static_cast<uint64_t>(s) * 1000000ULL) == ESP_OK)
+        ESP_LOGW(TAG, "radio down -- the hub restarts in %u min to try it again", (unsigned)(s / 60));
+}
+
 // ── Stack lifecycle signals ──────────────────────────────────────────────
 //
 // This handler is not optional decoration -- it DRIVES commissioning.
@@ -823,6 +871,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         // No formation needed; joined devices keep their addresses.
         if (!bdb_signal_ok(app_signal, "resuming the network")) return true;
         s_formed = true;
+        s_guard.network_up();   // the radio started: later crashes are not its
         coordinator_address_remember();
         ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
@@ -832,6 +881,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
     case EZB_BDB_SIGNAL_FORMATION:
         if (!bdb_signal_ok(app_signal, "network formation")) return true;
         s_formed = true;
+        s_guard.network_up();
         coordinator_address_remember();
         spawn_group_join_task();   // first formation of this network
         ESP_LOGI(TAG, "network formed: pan 0x%04x channel %u",
@@ -1016,49 +1066,13 @@ static void task_zigbee(void*) {
         vTaskDelay(pdMS_TO_TICKS(1000));   // let the log drain
         esp_restart();
     }
-    ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting, to avoid "
+    ESP_LOGE(TAG, "died %llds into the run (< %ds) -- NOT restarting now, to avoid "
                   "a boot loop. /api/status reports the radio as down.",
              (long long)uptime_s, kMainloopRebootMinUptimeS);
+    s_guard.disarm();
+    schedule_radio_retry();   // later, with the boot guard's backoff (PB-03)
     vTaskDelete(nullptr);   // PSRAM-stack task (zhac_task_create): the stack is not
                             // reclaimed on this dead-radio endpoint, and need not be
-}
-
-// ── Boot guard: a radio that kills the chip must not kill the hub ─────────
-//
-// With no radio firmware on the C6 (a new Guition board ships it with
-// ESP-Hosted, not ot_rcp) or a mismatched one, OpenThread's spinel driver
-// ends the RCP handshake in DieNow() -> abort(), either inside
-// esp_zigbee_init() or a little later from the Zigbee task. Unguarded that is
-// a boot loop, and the web UI never stays up long enough to say why.
-//
-// kGuardArmed sits in no-init RAM from just before radio init until the stack
-// has survived kGuardWindowS seconds. It survives a panic or watchdog reset
-// but not a power cycle. Finding it armed after such a reset means the last
-// boot most likely died starting the radio: skip the radio this boot, keep the
-// device pool and UI up, and say so in status. The next reset tries again. An
-// unrelated crash inside the window costs one radio-less boot, nothing more.
-static __NOINIT_ATTR uint32_t s_boot_guard;
-static constexpr uint32_t kGuardArmed   = 0x5A424755;   // "ZBGU"
-static constexpr int      kGuardWindowS = 30;
-static const char*        s_last_error  = nullptr;
-
-static bool boot_guard_tripped() {
-    const esp_reset_reason_t r = esp_reset_reason();
-    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
-                         r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
-    const bool tripped = crashed && s_boot_guard == kGuardArmed;
-    s_boot_guard = 0;   // no-init RAM is garbage after power-on: always clear
-    return tripped;
-}
-
-static void boot_guard_arm() {
-    static esp_timer_handle_t timer = nullptr;
-    esp_timer_create_args_t args{};
-    args.callback = [](void*) { s_boot_guard = 0; };
-    args.name     = "zb_boot_guard";
-    if (!timer && esp_timer_create(&args, &timer) != ESP_OK) return;  // unguarded, as before
-    s_boot_guard = kGuardArmed;
-    esp_timer_start_once(timer, static_cast<uint64_t>(kGuardWindowS) * 1000000ULL);
 }
 
 const char* esp_zigbee_backend_last_error(void) { return s_last_error; }
@@ -1105,14 +1119,15 @@ static bool zb_init() {
         return false;
     }
 
-    if (boot_guard_tripped()) {
+    if (s_guard.on_boot(reset_kind())) {
         s_last_error = "radio_crashed";
-        ESP_LOGE(TAG, "the previous boot died while starting the radio -- running "
-                      "WITHOUT Zigbee this boot; reset to retry. On the P4 board "
-                      "this usually means the ESP32-C6 has no ot_rcp firmware.");
+        ESP_LOGE(TAG, "the last %u boots died while starting the radio -- running "
+                      "WITHOUT Zigbee this boot. On the P4 board this usually means "
+                      "the ESP32-C6 has no ot_rcp firmware.", (unsigned)BootGuard::kTrips);
+        schedule_radio_retry();
         return false;
     }
-    boot_guard_arm();
+    s_guard.arm();
 
     esp_zigbee_config_t cfg{};
     cfg.device_config.device_type         = EZB_NWK_DEVICE_TYPE_COORDINATOR;
@@ -1145,6 +1160,8 @@ static bool zb_init() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_init failed: %s", esp_err_to_name(err));
         s_last_error = "radio_init_failed";
+        s_guard.disarm();   // a failure, not a crash
+        schedule_radio_retry();
         return false;
     }
 
@@ -1168,6 +1185,8 @@ static bool zb_init() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_start failed: %s", esp_err_to_name(err));
         s_last_error = "radio_init_failed";
+        s_guard.disarm();
+        schedule_radio_retry();
         return false;
     }
 
@@ -1180,6 +1199,8 @@ static bool zb_init() {
                     nullptr, 5, nullptr) != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
+        s_guard.disarm();
+        schedule_radio_retry();
         return false;
     }
     heartbeat_start();   // the first stamp lands when the mainloop runs
@@ -1257,6 +1278,7 @@ static bool zb_init() {
             ESP_LOGW(TAG, "coordinator state unknown at init: SDK lock timeout");
         } else if (zb_network_ready()) {
             s_formed = true;
+            s_guard.network_up();   // also when the signal never came
             ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
                      (unsigned)ezb_nwk_get_panid(),
                      (unsigned)ezb_nwk_get_current_channel(),
