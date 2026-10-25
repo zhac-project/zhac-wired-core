@@ -31,5 +31,6 @@ const char* ota_update_rollback_reason();
 bool ota_update_rolled_back();
 
 // False (and `*err` set) when an update is already running or the URL is
-// not https://.
-bool ota_update_start(const char* url, const char** err);
+// not https://. The download is refused (ota.complete with err) when it is not
+// this firmware, or an older release and `allow_older` is false (ota_image.h).
+bool ota_update_start(const char* url, bool allow_older, const char** err);

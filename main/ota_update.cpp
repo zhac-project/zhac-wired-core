@@ -4,6 +4,7 @@
 // ota_update.cpp — see ota_update.h. Mirrors net-core's task_ota (S3 side of
 // the dual-chip build), with target "self".
 #include "ota_update.h"
+#include "ota_image.h"
 #include "ota_redirect.h"
 
 #include <cstdio>
@@ -39,6 +40,7 @@ namespace {
 
 volatile bool     s_busy = false;
 char              s_url[256];
+bool              s_allow_older = false;   // set with s_url, read by TaskOTA
 
 // ── Post-update health ──────────────────────────────────────────────────────
 // A fresh image is kept only once it has shown it can do the hub's job, not
@@ -250,6 +252,33 @@ void run(const char* url) {
         event("ota.complete", true, false, 0, 0, esp_err_to_name(ret));
         return;
     }
+    // Only this firmware, and no older release unless the owner asked for one
+    // (ota_image.h, review 2026-10-24 HS-10). The image's strings are its own:
+    // copied with a terminator.
+    esp_app_desc_t img{};
+    if (esp_https_ota_get_img_desc(h, &img) != ESP_OK) {
+        esp_https_ota_abort(h);
+        ESP_LOGE(TAG, "update refused: the download has no app description");
+        event("ota.complete", true, false, 0, 0, "the download is not a firmware image");
+        return;
+    }
+    char proj[sizeof(img.project_name) + 1] = {};
+    char ver[sizeof(img.version) + 1] = {};
+    memcpy(proj, img.project_name, sizeof(img.project_name));
+    memcpy(ver, img.version, sizeof(img.version));
+    const esp_app_desc_t* me = esp_app_get_description();
+    const OtaImage verdict = ota_image_check(me->project_name, me->version, proj, ver, s_allow_older);
+    if (verdict != OtaImage::OK) {
+        char why[160];
+        if (verdict == OtaImage::OTHER_PROJECT)
+            snprintf(why, sizeof(why), "the image is %s, not the %s firmware", proj, me->project_name);
+        else
+            snprintf(why, sizeof(why), "the image is an older release (%s) than the one running (%s)", ver, me->version);
+        esp_https_ota_abort(h);
+        ESP_LOGE(TAG, "update refused: %s", why);
+        event("ota.complete", true, false, 0, 0, why);
+        return;
+    }
     int total = esp_https_ota_get_image_size(h);
     if (total < 0) total = 0;
     int last_pct = -1;
@@ -392,13 +421,14 @@ bool ota_update_rolled_back() {
     return set;
 }
 
-bool ota_update_start(const char* url, const char** err) {
+bool ota_update_start(const char* url, bool allow_older, const char** err) {
     if (!url || strncmp(url, "https://", 8) != 0) { *err = "https:// URL required"; return false; }
     if (strlen(url) >= sizeof(s_url)) { *err = "URL too long"; return false; }
     if (s_busy) { *err = "an update is already running"; return false; }
     if (s_state[0] == 'p') { *err = "the previous update is still being checked -- wait a few minutes"; return false; }
     s_busy = true;
     snprintf(s_url, sizeof(s_url), "%s", url);
+    s_allow_older = allow_older;
     if (xTaskCreate(task, "TaskOTA", 8192, nullptr, 2, nullptr) != pdPASS) {
         s_busy = false;
         *err = "not enough memory to start the update";

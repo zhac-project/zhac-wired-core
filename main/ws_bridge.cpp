@@ -1020,12 +1020,13 @@ static void cmd_groups_all(int fd, uint32_t id) {
 // Answering "none" is the truthful answer and makes the SPA render its correct
 // "RainMaker bridging is off" copy instead of an error. There is deliberately
 // no uplink.set: there is nothing here to switch to.
-// ota.update {url} — see ota_update.h. Replies at once; progress follows as
-// ota.start / ota.progress / ota.complete events (target "self").
+// ota.update {url, allow_older?} — see ota_update.h. Replies at once; progress
+// follows as ota.start / ota.progress / ota.complete events (target "self").
 static void cmd_ota_update(int fd, uint32_t id, JsonDocument& doc) {
     const char* url = doc["args"]["url"] | (const char*)nullptr;
+    const bool allow_older = doc["args"]["allow_older"] | false;
     const char* err = nullptr;
-    if (ota_update_start(url, &err)) reply_ok_or_err(fd, id, true, nullptr);
+    if (ota_update_start(url, allow_older, &err)) reply_ok_or_err(fd, id, true, nullptr);
     else                             send_err(fd, id, err ? err : "failed");
 }
 
