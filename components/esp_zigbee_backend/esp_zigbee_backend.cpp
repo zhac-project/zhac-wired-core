@@ -368,16 +368,18 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     }
 
     // Source may arrive short or extended; the pool is keyed by IEEE.
+    // One record for the pool lookups below, static: this callback runs only
+    // on the stack task, and the decode further down needs that task's stack
+    // (review ZR-04). Read only after a lookup that found something.
+    static ZapDevice snap;
     uint64_t ieee = 0;
     uint16_t nwk  = 0;
     if (ind->src_address.addr_mode == EZB_ADDR_MODE_EXT) {
         // ezb_extaddr_t is a packed union struct, not a raw byte array.
         ieee = ind->src_address.u.extended_addr.u64;
-        ZapDevice snap{};
         if (zigbee_pool_snapshot(ieee, &snap)) nwk = snap.nwk_addr;
     } else {
         nwk = ind->src_address.u.short_addr;
-        ZapDevice snap{};
         if (zigbee_pool_snapshot_by_nwk(nwk, &snap)) {
             ieee = snap.ieee_addr;
             // A stale pool entry can still hold the address a newly joined
@@ -387,8 +389,7 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
             if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
                 ext.u64 != ieee) {
                 pool_set_nwk(ieee, 0);   // the old holder no longer has it
-                ZapDevice real{};
-                if (zigbee_pool_snapshot(ext.u64, &real)) {
+                if (zigbee_pool_snapshot(ext.u64, &snap)) {
                     pool_set_nwk(ext.u64, nwk);
                     ESP_LOGW(TAG, "nwk 0x%04x is %016llx, not %016llx -- pool refreshed",
                              nwk, (unsigned long long)ext.u64, (unsigned long long)ieee);
@@ -412,9 +413,9 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                 // Joined (the stack resolves it) but not ours: adopt it. The
                 // pool entry appears now, so this frame and the next ones
                 // decode under the right device; the interview fills identity.
+                // The admission gate may refuse it (ZR-02): then it stays unknown.
                 zb_interview_adopt(ext.u64, nwk);
-                zigbee_pool_snapshot(ext.u64, &snap);
-                ieee = snap.ieee_addr;
+                if (zigbee_pool_snapshot(ext.u64, &snap)) ieee = snap.ieee_addr;
             } else if (ezb_address_extended_by_short(nwk, &ext) == 0 && ext.u64 != 0 &&
                        zigbee_pool_snapshot(ext.u64, &snap)) {
                 ieee = ext.u64;
@@ -488,8 +489,9 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                        static_cast<uint8_t>(ind->asdu_length));
     feed_late_identity(nwk, ind->cluster_id, ind->asdu, ind->asdu_length);
 
-    // Identity strings for the matcher, straight from the pool snapshot.
-    ZapDevice dev{};
+    // Identity strings for the matcher, straight from the pool snapshot (the
+    // static record above; every use below is behind `have`).
+    ZapDevice& dev = snap;
     const bool have = zigbee_pool_snapshot(ieee, &dev);
     const char* model = (have && dev.model_id[0]) ? dev.model_id : nullptr;
     const char* manuf = (have && dev.manufacturer_name[0]) ? dev.manufacturer_name : nullptr;
@@ -935,9 +937,31 @@ static std::atomic<int64_t> s_hb_us{0};
 static std::atomic<bool>    s_hb_pending{false};
 static esp_timer_handle_t   s_hb_timer = nullptr;
 
+// How close TaskZigbee came to the end of its stack, where every frame is
+// decoded (review ZR-04): checked once a minute from the stamp, which runs on
+// that task, and logged at each new low (in 256-byte steps, so a few lines a
+// boot; /api/diagnostics names the worst task too).
+static void stack_note(int64_t now) {
+    static int64_t  s_next_us = 0;
+    static uint32_t s_low     = UINT32_MAX;
+    if (now < s_next_us) return;
+    s_next_us = now + 60 * 1000000LL;
+    const uint32_t free_b = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
+    if (free_b + 256 > s_low) return;
+    s_low = free_b;
+    if (free_b < 2048)
+        ESP_LOGW(TAG, "TaskZigbee stack: %u of %u bytes never used", (unsigned)free_b,
+                 (unsigned)zhac::stack::kEspZigbee);
+    else
+        ESP_LOGI(TAG, "TaskZigbee stack: %u of %u bytes never used", (unsigned)free_b,
+                 (unsigned)zhac::stack::kEspZigbee);
+}
+
 static void hb_stamp(void*) {
-    s_hb_us.store(esp_timer_get_time());
+    const int64_t now = esp_timer_get_time();
+    s_hb_us.store(now);
     s_hb_pending.store(false);
+    stack_note(now);
 }
 
 static void hb_tick(void*) {
@@ -1152,7 +1176,7 @@ static bool zb_init() {
     // function resumes -- setting it afterwards reported a radio with no live
     // task (review F12).
     s_running = true;
-    if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEventBus,
+    if (zhac_task_create(task_zigbee, "TaskZigbee", zhac::stack::kEspZigbee,
                     nullptr, 5, nullptr) != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "TaskZigbee create failed -- stack will not run");
