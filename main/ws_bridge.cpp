@@ -1597,12 +1597,11 @@ static void cmd_alerts_get(int fd, uint32_t id) {
     ws_server_reply(fd, buf, (size_t)n);
 }
 
-// ── zigbee.* (network settings + factory reset) ───────────────────────
+// ── zigbee.* (network settings + network reset) ───────────────────────
 // This backend keeps its network in the esp-zigbee dataset and a build-time
-// channel mask; it has no recommission yet. Saving channel/key settings
-// nobody reads, then answering "reset done" and rebooting with the network
-// untouched, told the owner something that did not happen (review F17). Both
-// are refused until they are implemented and checked on a board.
+// channel mask. Saving channel/key settings nobody reads told the owner
+// something that did not happen (review F17), so they stay refused; a new
+// network with new keys comes from `zigbee.reset` (review 2026-10-24 PB-06).
 static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) {
     send_err(fd, id, "channel and network key settings are not available on this hub yet -- nothing was saved");
 }
@@ -1625,7 +1624,7 @@ static void cmd_storage_reset(int fd, uint32_t id) {
 
 static void cmd_zigbee_reset(int fd, uint32_t id) {
     if (!zigbee_force_recommission()) {
-        send_err(fd, id, "Zigbee network reset is not available on this hub yet -- nothing was changed");
+        send_err(fd, id, "the Zigbee network reset could not be saved -- nothing was changed");
         return;
     }
     reply_ok_or_err(fd, id, true, nullptr);

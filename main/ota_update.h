@@ -11,6 +11,13 @@
 // trial (see ota_update.cpp). Call once the web server and radio are up.
 void ota_update_init();
 
+// Early in app_main (NVS and the log ring up): counts boots that crashed within
+// two minutes of starting. After three in a row it rolls back to the other
+// image when it can (does not return; the old image shows why), else returns
+// true: safe mode, no Lua, MQTT or cloud link this boot (review 2026-10-24 PB-04).
+bool ota_update_boot_guard();
+bool ota_update_safe_mode();
+
 // "pending" while a fresh image is being checked, "verified" once it is kept
 // (or was never on trial), "rolling_back" for the seconds before the reboot.
 const char* ota_update_state();

@@ -74,6 +74,7 @@
 #include "simple_rules.h"
 #include "device_cmd.h"
 #include "status_led.h"
+#include "supervisor.h"
 #include "ha_bridge.h"
 #include "spa_serve.h"
 #include "sys_state.h"
@@ -188,6 +189,9 @@ extern "C" void app_main() {
     sys_state_init();
     log_cloud_boot();   // takes the previous run's restart tail out of no-init RAM before the hook writes it
     log_ring_init();   // PSRAM log ring + esp_log vprintf hook (capture early)
+    // Three early crashes in a row: roll back, or boot without the parts that
+    // run other people's input (scripts, MQTT, the cloud link). Review PB-04.
+    const bool safe_mode = ota_update_boot_guard();
 
     log_chip_info();
     log_psram_info();
@@ -280,7 +284,7 @@ extern "C" void app_main() {
         simple_rules_reload();
         ha_bridge_device_changed(ieee);
     });
-    const bool lua_ok = lua_engine_init();
+    const bool lua_ok = !safe_mode && lua_engine_init();
     heap_mark("lua");
     // lua_engine_init() installs the rules' script.run hook itself when it
     // succeeds. Installing it after a failure sent rule actions to a scheduler
@@ -352,18 +356,22 @@ extern "C" void app_main() {
             if (s_remote_evt) xEventGroupSetBits(s_remote_evt, 1 << 3);
         }, nullptr);
 #endif
-    remote_client_init();   // no-op stub when remote disabled; reads NVS
-    heap_mark("remote_client");
-    log_cloud_start();  // the uploader: log.batch / log.tail once the cloud link is ready
+    // Safe mode leaves these unstarted; every call into them is a no-op then.
+    if (!safe_mode) {
+        remote_client_init();   // no-op stub when remote disabled; reads NVS
+        heap_mark("remote_client");
+        log_cloud_start();  // the uploader: log.batch / log.tail once the cloud link is ready
 
-    // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
-    // inbound messages feed rules / Lua / Home Assistant. With no broker
-    // configured it idles. Boots cleanly either way.
-    mqtt_glue_start();
-    heap_mark("mqtt_glue");
+        // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
+        // inbound messages feed rules / Lua / Home Assistant. With no broker
+        // configured it idles. Boots cleanly either way.
+        mqtt_glue_start();
+        heap_mark("mqtt_glue");
+    }
     ota_update_init();   // ota.update + keep a fresh image once it proves healthy
-    metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
+    if (!safe_mode) metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
     heap_mark("metrics");
+    supervisor_start(hd);   // restarts the hub if the web server or the Zigbee stack stops answering
 
     if (lua_ok) {
         // Safe now: every subsystem a script might call into is initialised.

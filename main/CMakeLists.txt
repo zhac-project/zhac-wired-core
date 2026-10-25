@@ -46,6 +46,7 @@ idf_component_register(
         "ws_bridge.cpp"
         "mqtt_glue.cpp"
         "ota_update.cpp"
+        "supervisor.cpp"
         "auth.cpp"
         "api_net.cpp"
         "api_status.cpp"

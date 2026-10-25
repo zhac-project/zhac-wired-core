@@ -13,6 +13,7 @@
 #include <strings.h>
 
 #include "ArduinoJson.h"
+#include "esp_attr.h"      // __NOINIT_ATTR: the early-crash counter
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
@@ -60,6 +61,11 @@ constexpr const char* kNvsRollback   = "ota_rb_why";     // str: why the last up
 
 esp_timer_handle_t s_health_timer = nullptr;
 uint32_t           s_health_ticks = 0;
+// Review 2026-10-24 PB-04: one passing tick used to keep an image, so a crash
+// a minute later could no longer roll it back. The checks must now pass on
+// every tick for this long in a row (well inside kHealthDeadlineS).
+constexpr uint32_t kSoakS            = 5 * 60;
+uint32_t           s_healthy_ticks   = 0;
 const char*        s_state        = "verified";          // "pending" | "verified" | "rolling_back"
 char               s_rollback_why[64] = {};
 
@@ -104,6 +110,8 @@ const char* health_problem() {
 void health_tick(void*) {
     s_health_ticks++;
     const char* why = health_problem();
+    s_healthy_ticks = why ? 0 : s_healthy_ticks + 1;
+    if (!why && s_healthy_ticks * kHealthTickS < kSoakS) return;   // healthy, still soaking
     if (!why) {
         // Only a saved verdict counts: if the boot metadata write fails the
         // bootloader still rolls back at the next reboot, so stay "pending"
@@ -113,8 +121,8 @@ void health_tick(void*) {
             ESP_LOGE(TAG, "could not mark the running image valid (%s) -- retrying", esp_err_to_name(e));
             return;
         }
-        ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK",
-                 s_health_ticks * kHealthTickS);
+        ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK "
+                      "for %" PRIu32 " s in a row", s_health_ticks * kHealthTickS, kSoakS);
         // No rollback any more: a move of the device store to zhac_data made on
         // this trial boot is final now, so the next update does not copy over it.
         zap_store_confirm_move();
@@ -286,7 +294,61 @@ void task(void*) {
     vTaskDelete(nullptr);
 }
 
+// ── Early-crash guard (review 2026-10-24 PB-04) ───────────────────────────
+// The bootloader rolls back only an image on trial, so a kept image that
+// crashes soon after every boot loops for ever. Three boots in a row that end
+// in a crash within kEarlyUs of starting roll back to the other slot when it
+// holds a bootable image; otherwise the hub runs in safe mode (no Lua, MQTT or
+// cloud link: the web UI stays up, the radio keeps its own guard) until a boot
+// lasts kEarlyUs. No-init RAM: it survives the resets it counts.
+constexpr uint32_t kEarlyMagic   = 0x5AFE0B07;
+constexpr int64_t  kEarlyUs      = 2 * 60 * 1000000LL;
+constexpr uint32_t kEarlyCrashes = 3;
+__NOINIT_ATTR uint32_t s_early_magic;
+__NOINIT_ATTR uint32_t s_early_armed;   // 1 from boot until kEarlyUs of uptime
+__NOINIT_ATTR uint32_t s_early_count;   // boots in a row that crashed early
+bool s_safe_mode = false;
+
+bool crash_reset(esp_reset_reason_t r) {
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
+           r == ESP_RST_CPU_LOCKUP;
+}
+
 }  // namespace
+
+bool ota_update_boot_guard() {
+    const esp_reset_reason_t why = esp_reset_reason();
+    if (s_early_magic != kEarlyMagic || why == ESP_RST_POWERON) {
+        s_early_magic = kEarlyMagic;
+        s_early_count = 0;
+    } else if (s_early_armed == 1 && crash_reset(why)) {
+        s_early_count++;
+    } else {
+        s_early_count = 0;
+    }
+    s_early_armed = 1;
+    static esp_timer_handle_t disarm = nullptr;
+    esp_timer_create_args_t a{};
+    a.callback = [](void*) { s_early_armed = 0; s_early_count = 0; };   // this boot lasted
+    a.name = "early_guard";
+    if (!disarm && esp_timer_create(&a, &disarm) == ESP_OK) esp_timer_start_once(disarm, kEarlyUs);
+    const uint32_t n = s_early_count;
+    if (n < kEarlyCrashes) return false;
+    if (esp_ota_check_rollback_is_possible()) {
+        ESP_LOGE(TAG, "%" PRIu32 " boots in a row crashed within %d s -- rolling back to the other image",
+                 n, static_cast<int>(kEarlyUs / 1000000));
+        s_early_count = 0;
+        nvs_put_str(kNvsRollback, "it crashed three times in a row within two minutes of starting");
+        log_cloud_planned_restart(logcloud::Planned::Rollback);
+        esp_ota_mark_app_invalid_rollback_and_reboot();   // returns only if it could not
+    }
+    s_safe_mode = true;
+    ESP_LOGE(TAG, "%" PRIu32 " boots in a row crashed within %d s -- SAFE MODE: Lua, MQTT and the cloud link "
+                  "stay off this boot", n, static_cast<int>(kEarlyUs / 1000000));
+    return true;
+}
+
+bool ota_update_safe_mode() { return s_safe_mode; }
 
 void ota_update_init() {
     if (s_health_timer) return;
