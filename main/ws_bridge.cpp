@@ -54,6 +54,7 @@
 #include "eth.h"
 #include "net_discovery.h"
 #include "radio_state.h"
+#include "esp_partition.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
@@ -1609,7 +1610,12 @@ static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) 
 // never does it by itself any more (see main.cpp). Gated like every command.
 static void cmd_storage_reset(int fd, uint32_t id) {
     ESP_LOGW(TAG, "storage reset requested -- erasing NVS and restarting");
-    const esp_err_t e = nvs_flash_erase();
+    // zhac_data (the device store, WC-04) first: a cut between the two erases
+    // then finds the store gone, never the old devices coming back.
+    esp_err_t e = ESP_OK;
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "zhac_data"))
+        e = nvs_flash_erase_partition("zhac_data");
+    if (e == ESP_OK) e = nvs_flash_erase();
     reply_ok_or_err(fd, id, e == ESP_OK, esp_err_to_name(e));
     if (e != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(500));

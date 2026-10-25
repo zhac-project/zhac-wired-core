@@ -21,6 +21,7 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_psram.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -147,6 +148,21 @@ static void task_event_bus(void*) {
     event_bus_pump_run(nullptr);   // sleeps until a publish; never returns
 }
 
+// The 1 MB `zhac_data` NVS partition, where zap_store keeps the device pool
+// and the shadow cache (review 2026-09 WC-04). partitions.csv has it; a hub
+// flashed with the table before gets the same region, unused there,
+// registered at run time, so a network update is enough. IDF refuses a
+// region that overlaps the table or runs past the flash, and the store then
+// stays on nvs. These numbers must match partitions.csv and never change.
+static void data_partition_register() {
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "zhac_data")) return;
+    const esp_err_t e = esp_partition_register_external(nullptr, 0xE40000, 0x100000, "zhac_data",
+                                                        ESP_PARTITION_TYPE_DATA,
+                                                        ESP_PARTITION_SUBTYPE_DATA_NVS, nullptr);
+    if (e == ESP_OK) ESP_LOGI(TAG, "zhac_data registered (partition table without it)");
+    else ESP_LOGE(TAG, "zhac_data not available (%s): the device store stays on nvs", esp_err_to_name(e));
+}
+
 extern "C" void app_main() {
     ESP_LOGI(TAG, "boot -- zhac-wired-core (%s, wired Ethernet)", CONFIG_IDF_TARGET);
 
@@ -187,7 +203,11 @@ extern "C" void app_main() {
     event_bus_init();
     status_led_start();   // the board's RGB LED: green = join open, blue = Zigbee traffic
     heap_mark("status_led");
+    data_partition_register();
     zap_store_init();
+    // Shut, not wiped (PB-01): status says storage_error and Settings offers
+    // the reset, as for an unusable NVS above.
+    if (!zap_store_is_ready()) sys_set_storage_error(true);
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
     esp_register_shutdown_handler(zap_store_flush_now);   // as on the P4: pending device-store writes survive a reboot
@@ -289,6 +309,7 @@ extern "C" void app_main() {
     // handle. Unlike mono there is no placeholder "/" handler -- it would
     // shadow the SPA's index, and spa_register()'s catchall already serves "/".
     ws_server_init();
+    ws_server_set_upgrade_filter(auth_request_allowed);   // no WS for other sites' pages (HS-01)
     heap_mark("ws_server");
     httpd_handle_t hd = ws_server_get_handle();
     if (hd) {

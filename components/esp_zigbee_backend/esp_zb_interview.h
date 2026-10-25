@@ -81,3 +81,8 @@ bool zb_groups_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t src_ep,
 // the apsde request plumbing.
 bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
                     const uint8_t* zcl_data, size_t zcl_len);
+
+// Defined in esp_zigbee_backend.cpp: the radio's factory address when the
+// network runs under a different (pinned) one, else 0. Binds made to it before
+// review 2026-10-24 ZR-01 point at no node; configure removes them once.
+uint64_t esp_zb_stale_bind_target();

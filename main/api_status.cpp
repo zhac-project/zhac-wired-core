@@ -183,6 +183,7 @@ void api_status_fill(JsonObject doc) {
 }
 
 static esp_err_t handle_get_status(httpd_req_t* req) {
+    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);   // public, but not to other sites (HS-01)
     JsonDocument doc;
     api_status_fill(doc.to<JsonObject>());
     // 2048, not 1024: this doc carries the full sys_diag set (cpu, heap, psram,

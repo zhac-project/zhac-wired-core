@@ -162,6 +162,16 @@ bool do_bind_owned(uint16_t nwk, uint64_t src_ieee, uint8_t src_ep, uint16_t clu
     return s_bind_ok;
 }
 
+// Set by the one-time ZR-01 repair (esp_zigbee_backend.cpp): this device's
+// binds were made to the radio's factory address.
+bool fix_binds(uint64_t ieee) {
+    uint8_t flags = 0;
+    zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+        *static_cast<uint8_t*>(c) = d->flags;
+    }, &flags);
+    return flags & ZAP_DEV_FIX_BINDS;
+}
+
 // ── Transports registered with zhc_adapter ────────────────────────────────
 
 bool cfg_bind(uint64_t ieee, uint8_t ep, uint16_t cluster) {
@@ -174,6 +184,12 @@ bool cfg_bind(uint64_t ieee, uint8_t ep, uint16_t cluster) {
     if (coord == 0) {
         ESP_LOGW(TAG, "bind: coordinator ieee not known yet");
         return false;
+    }
+    // A bind made before review 2026-10-24 ZR-01 points at the radio's factory
+    // address, which no node has. Drop it first (that frees a slot on devices
+    // with small tables); its answer does not matter.
+    if (const uint64_t stale = esp_zb_stale_bind_target(); stale && stale != coord && fix_binds(ieee)) {
+        (void)do_bind(nwk, ieee, ep, cluster, stale, 1, /*unbind=*/true);
     }
     // Destination is always the coordinator's endpoint 1 -- that is the
     // endpoint this firmware registers and the one reports must land on.

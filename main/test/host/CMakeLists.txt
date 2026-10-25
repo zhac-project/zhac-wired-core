@@ -40,3 +40,7 @@ target_include_directories(log_cloud_core_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
     ${ZHAC_NET_CORE}/components/ws_server/include)
 add_test(NAME log_cloud_core COMMAND log_cloud_core_tests)
+
+add_executable(req_filter_tests test_req_filter.cpp)
+target_include_directories(req_filter_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+add_test(NAME req_filter COMMAND req_filter_tests)

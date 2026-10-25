@@ -30,7 +30,7 @@ idf_component_register(
     INCLUDE_DIRS "${LUA_ENGINE_SRC_DIR}/include"
     PRIV_INCLUDE_DIRS "${LUA_ENGINE_SRC_DIR}/src"
     REQUIRES freertos esp_timer lua
-    PRIV_REQUIRES spiffs event_bus metrics
+    PRIV_REQUIRES spiffs esp_partition event_bus metrics
                   zap_common zap_store zhc_adapter
                   device_shadow mqtt_gw tg_gw zigbee_mgr
                   simple_rules lua_cjson

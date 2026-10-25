@@ -68,6 +68,7 @@ idf_component_register(
         esp_timer
         esp_app_format
         nvs_flash
+        esp_partition
         spi_flash
         spiffs
         esp_eth

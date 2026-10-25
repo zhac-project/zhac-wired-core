@@ -70,6 +70,7 @@
 // Defined in zhac-components' zhc_shadow_bridge.cpp; declared in no header.
 extern "C" void zhc_shadow_bridge_register(void);
 
+#include <atomic>
 #include <cstring>
 
 static const char* TAG = "esp_zb";
@@ -305,6 +306,8 @@ static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16
     out[n++] = 0x00;                                            // SUCCESS
     esp_zb_af_send(nwk, src_ep ? src_ep : 1, cluster, out, n);
 }
+
+static void coordinator_repair_on_frame(uint64_t ieee, uint16_t nwk, ZapDevice& dev);
 
 // IAS Zone auto-enroll, as the ZNP path does (zigbee_mgr.cpp
 // zcl_maybe_respond_ias_enroll): a motion/contact/leak sensor that is not
@@ -543,6 +546,9 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
         }
     }
 
+    if (have && (dev.flags & (ZAP_DEV_FIX_BINDS | ZAP_DEV_FIX_CIE)))
+        coordinator_repair_on_frame(ieee, nwk, dev);
+
     return false;
 }
 
@@ -632,6 +638,17 @@ static bool esp_zb_adapter_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t clus
 // ran with is therefore kept in NVS and set again before every start.
 static constexpr char kPinNs[]  = "zb_coord";
 static constexpr char kPinKey[] = "ieee";
+static constexpr char kRebindKey[] = "rebind";   // u8 1 once the ZR-01 repair ran
+
+// The address the network runs under, for everything that names the
+// coordinator to a device (binds, IAS CIE, the Bind tab). It used to be read
+// from the radio, which is the factory EUI-64: on a pinned network that is a
+// node nobody knows (review 2026-10-24 ZR-01). Set where the stack's address
+// is known, under its lock; read lock-free from any task.
+static std::atomic<uint64_t> s_coord_ieee{0};
+// The radio's factory address when it differs from the network's: binds made
+// before the fix point there. 0 otherwise.
+static std::atomic<uint64_t> s_stale_bind_target{0};
 
 static void coordinator_address_apply() {
     uint64_t pinned = 0;
@@ -647,21 +664,121 @@ static void coordinator_address_apply() {
     }
     ezb_extaddr_t cur{};
     ezb_nwk_get_extended_address(&cur);
+    s_coord_ieee.store(cur.u64);
     ESP_LOGI(TAG, "coordinator ieee %016llx (%s)", (unsigned long long)cur.u64,
              pinned ? "pinned" : "radio MAC");
 }
 
 // Once a network runs (formed or resumed): pin its address if none is yet.
 static void coordinator_address_remember() {
+    ezb_extaddr_t cur{};
+    ezb_nwk_get_extended_address(&cur);
+    s_coord_ieee.store(cur.u64);
     nvs_handle_t h;
     if (nvs_open(kPinNs, NVS_READWRITE, &h) != ESP_OK) return;
     uint64_t v = 0;
     if (nvs_get_u64(h, kPinKey, &v) != ESP_OK) {
-        ezb_extaddr_t cur{};
-        ezb_nwk_get_extended_address(&cur);
         if (nvs_set_u64(h, kPinKey, cur.u64) == ESP_OK) nvs_commit(h);
     }
     nvs_close(h);
+}
+
+static bool has_server_cluster(const ZapDevice& d, uint16_t cluster) {
+    for (uint8_t e = 0; e < d.endpoint_count && e < 8; e++)
+        for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP; c++)
+            if (d.clusters[e][c] == cluster) return true;
+    return false;
+}
+
+// One-time repair for hubs that ran a pinned network under the old getter
+// (ZR-01): every matched device is configured again (binds to the right
+// address; the stale ones are removed first, esp_zb_configure.cpp) and IAS
+// devices get their CIE address rewritten at their next frame. Runs before
+// the stack starts, after the pool restore.
+static void coordinator_rebind_once() {
+    ezb_extaddr_t mac{};
+    ezb_plat_radio_get_macaddr(mac.u8);
+    const uint64_t coord = s_coord_ieee.load();
+    if (mac.u64 == 0 || coord == 0) {                     // not known yet: next boot
+        ESP_LOGW(TAG, "coordinator address check skipped: radio or network address not known yet");
+        return;
+    }
+    if (mac.u64 != coord) s_stale_bind_target.store(mac.u64);
+
+    nvs_handle_t h;
+    if (nvs_open(kPinNs, NVS_READWRITE, &h) != ESP_OK) return;
+    uint8_t done = 0;
+    nvs_get_u8(h, kRebindKey, &done);
+    if (done || mac.u64 == coord || !zap_store_is_ready()) {
+        // Nothing bound to the radio address, or nothing to repair it in.
+        if (!done && mac.u64 == coord && nvs_set_u8(h, kRebindKey, 1) == ESP_OK) nvs_commit(h);
+        nvs_close(h);
+        return;
+    }
+
+    static uint64_t marked[ZAP_MAX_DEVICES];   // boot-time pass: off app_main's stack
+    uint16_t n = 0;
+    zigbee_pool_lock();
+    ZapDevice* all = pool_all();
+    for (uint16_t i = 0; i < pool_count() && n < ZAP_MAX_DEVICES; i++) {
+        ZapDevice& d = all[i];
+        if (zap_dev_is_removed(&d) ||
+            d.support_state != static_cast<uint8_t>(SupportState::MATCHED)) continue;
+        d.configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
+        d.configure_attempts = 0;
+        d.flags |= ZAP_DEV_FIX_BINDS;
+        if (has_server_cluster(d, 0x0500)) d.flags |= ZAP_DEV_FIX_CIE;
+        marked[n++] = d.ieee_addr;
+    }
+    zigbee_pool_unlock();
+    static ZapDevice snap;
+    for (uint16_t i = 0; i < n; i++)
+        if (zigbee_pool_snapshot(marked[i], &snap)) zap_store_mark_dirty(&snap, ZAP_PERSIST_HIGH);
+    zap_store_flush_now();
+    if (nvs_set_u8(h, kRebindKey, 1) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGW(TAG, "coordinator address %016llx differs from the radio's %016llx: %u device(s) "
+                  "will be configured again as they next talk (binds made to the radio address "
+                  "are removed, IAS sensors re-enrolled)",
+             (unsigned long long)coord, (unsigned long long)mac.u64, (unsigned)n);
+}
+
+uint64_t esp_zb_stale_bind_target() { return s_stale_bind_target.load(); }
+
+// The parts of that repair that need the device awake, as it is now (a frame
+// just came from it). FIX_CIE: write IAS_CIE_Address, then an unsolicited
+// enroll response, as zigbee-herdsman does at interview. FIX_BINDS ends once
+// configure has run (the stale binds go in cfg_bind). Runs on the stack task:
+// the sends never wait, and `dev` (the caller's copy) is reused for the save,
+// because this frame path has little stack to spare (review ZR-04).
+static void coordinator_repair_on_frame(uint64_t ieee, uint16_t nwk, ZapDevice& dev) {
+    uint8_t clear = 0;
+    if (dev.flags & ZAP_DEV_FIX_CIE) {
+        uint8_t ep = 0;
+        for (uint8_t e = 0; e < dev.endpoint_count && e < 8 && !ep; e++)
+            for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP && !ep; c++)
+                if (dev.clusters[e][c] == 0x0500) ep = dev.endpoints[e];
+        const uint64_t coord = s_coord_ieee.load();
+        uint8_t f[16];
+        const size_t n = (ep && coord) ? zhc_zcl::write_cie_address(f, sizeof(f), zcl_seq_next(), coord) : 0;
+        if (!ep) {
+            clear |= ZAP_DEV_FIX_CIE;                       // no IAS endpoint after all
+        } else if (n && esp_zb_af_send(nwk, ep, 0x0500, f, n)) {
+            const size_t m = zhc_zcl::zone_enroll_response(f, sizeof(f), zcl_seq_next(), 0x00);
+            esp_zb_af_send(nwk, ep, 0x0500, f, m);
+            clear |= ZAP_DEV_FIX_CIE;
+            ESP_LOGI(TAG, "%016llx: IAS CIE address set to %016llx", (unsigned long long)ieee,
+                     (unsigned long long)coord);
+        }
+    }
+    if ((dev.flags & ZAP_DEV_FIX_BINDS) &&
+        dev.configure_state == static_cast<uint8_t>(ConfigureState::DONE)) clear |= ZAP_DEV_FIX_BINDS;
+    if (!clear) return;
+    zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+        d->flags &= static_cast<uint8_t>(~*static_cast<const uint8_t*>(c));
+    }, &clear);
+    dev.flags &= static_cast<uint8_t>(~clear);
+    zap_store_mark_dirty(&dev, ZAP_PERSIST_LOW);
 }
 
 // ── Stack lifecycle signals ──────────────────────────────────────────────
@@ -860,13 +977,16 @@ static bool zb_init() {
     // esp_zigbee_init: ezb_plat_datasets_init calls nvs_open_from_partition()
     // and abort()s on failure. Note esp-zigbee-lib v2.x uses NVS here, unlike
     // v1.x (and IDF's bundled examples) which used a FAT partition.
-    esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
-    if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION));
-        nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
-    }
+    //
+    // Never erased here (review 2026-10-24 PB-01): it holds the network --
+    // PAN, keys, the coordinator's child table -- and wiping it on an init
+    // error formed a new network at autostart, orphaning every paired device.
+    // An unreadable dataset keeps the radio down and says so instead.
+    const esp_err_t nerr = nvs_flash_init_partition(CONFIG_ZHAC_ZB_STORAGE_PARTITION);
     if (nerr != ESP_OK) {
-        ESP_LOGE(TAG, "zigbee storage partition '%s' unavailable: %s -- radio down",
+        s_last_error = "zb_storage_error";
+        ESP_LOGE(TAG, "zigbee storage partition '%s' unavailable: %s -- radio down, the network "
+                      "data is kept (not erased)",
                  CONFIG_ZHAC_ZB_STORAGE_PARTITION, esp_err_to_name(nerr));
         return false;
     }
@@ -944,6 +1064,7 @@ static bool zb_init() {
     zhac_adapter_register_send(esp_zb_adapter_send);
     zhac_adapter_register_sleepy(esp_zb_is_sleepy);
     coordinator_address_apply();
+    coordinator_rebind_once();
     register_coordinator_endpoint();
     ezb_bdb_set_primary_channel_set(CONFIG_ZHAC_ZB_CHANNEL_MASK);
 
@@ -1236,11 +1357,9 @@ bool esp_zigbee_backend_register(void) {
 // sibling zigbee_mgr declares in zigbee_mgr.h.
 bool zigbee_permit_join(uint8_t duration_s) { return zb_start_discovery(duration_s); }
 
-uint64_t zigbee_mgr_coordinator_ieee() {
-    ezb_extaddr_t addr{};
-    ezb_plat_radio_get_macaddr(addr.u8);
-    return addr.u64;
-}
+// The network's address, not the radio's factory one (ZR-01); 0 before the
+// stack is up, which bind and enrol treat as "not yet".
+uint64_t zigbee_mgr_coordinator_ieee() { return s_coord_ieee.load(); }
 
 // Not yet implemented on this backend -- ZDO bind/unbind and recommission need
 // the ZDO request path, which lands with the join-handling increment. Refusing

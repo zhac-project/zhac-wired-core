@@ -22,3 +22,8 @@ scripts,        data,  spiffs,   ,        2M
 # declare `fat` because they are still v1.x (esp_zb_* API).
 zb_storage,     data,  nvs,      ,        16K
 coredump,       data,  coredump, ,        64K
+# The device pool and the shadow cache (review 2026-09 WC-04: they filled the
+# 64K nvs). Hubs flashed with the table before it get this same region, unused
+# there, registered at run time (main.cpp data_partition_register), so its
+# offset and size must never change.
+zhac_data,      data,  nvs,      0xE40000, 1M

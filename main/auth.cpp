@@ -17,8 +17,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "net_discovery.h"
 #include "nvs.h"
 #include "psa/crypto.h"     // IDF v6 (mbedtls 4): mbedtls/sha256.h is private
+#include "req_filter.h"
 #include "sdkconfig.h"
 #include "ws_server.h"
 #include "zap_setup_window.h"
@@ -192,6 +194,7 @@ esp_err_t reply(httpd_req_t* req, const char* status, const char* body) {
 }
 
 esp_err_t gated(httpd_req_t* req) {
+    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
     if (!check_request(req)) return reply(req, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
     return reinterpret_cast<Handler>(req->user_ctx)(req);
 }
@@ -223,6 +226,7 @@ esp_err_t send_token(httpd_req_t* req, const char* token) {
 }
 
 esp_err_t handle_login(httpd_req_t* req) {
+    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
     JsonDocument doc;
     if (!read_json(req, doc, 192)) return ESP_OK;
     if (!doc["password"].is<const char*>()) return reply(req, "400 Bad Request", "{\"error\":\"invalid request\"}");
@@ -236,6 +240,8 @@ esp_err_t handle_login(httpd_req_t* req) {
 // kZapSetupWindowS ago (zap_setup_window.h): the first visitor to a fresh hub
 // claims it, but only someone who can power-cycle the hub can reopen that.
 esp_err_t handle_setup(httpd_req_t* req) {
+    // A foreign page must not claim a fresh hub either (review HS-05).
+    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
     if (s_storage_error) return reply(req, "503 Service Unavailable", "{\"error\":\"storage_error\"}");
     if (s_pw_set) return reply(req, "403 Forbidden", "{\"error\":\"already_set\"}");
     if (zap_setup_secs_left() == 0) return reply(req, "403 Forbidden", "{\"error\":\"setup_closed\"}");
@@ -375,6 +381,42 @@ bool auth_check_token(const char* token, int fd) {
     if (locked(ip)) return false;
     if (!token || strlen(token) != 32 || !token_matches(token)) { record_failure(ip); return false; }
     return true;
+}
+
+// At most one line per 10 s, and without the header values: a page that keeps
+// trying must not fill the log, nor write its own text into it.
+static void log_refusal(const char* why) {
+    static int64_t s_last_us = 0;
+    const int64_t now = esp_timer_get_time();
+    if (s_last_us && now - s_last_us < 10 * 1000000LL) return;
+    s_last_us = now;
+    ESP_LOGW(TAG, "refused a request: %s", why);
+}
+
+bool auth_request_allowed(httpd_req_t* req) {
+    char host[96] = {}, origin[128] = {};
+    const size_t hl = httpd_req_get_hdr_value_len(req, "Host");
+    const size_t ol = httpd_req_get_hdr_value_len(req, "Origin");
+    if (hl >= sizeof(host) || ol >= sizeof(origin)) {             // cut short would not parse right
+        log_refusal("oversized Host or Origin");
+        return false;
+    }
+    if (hl) httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    if (ol) httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (!req_origin_ok(origin, host)) {
+        log_refusal("sent by a page of another site");
+        return false;
+    }
+    if (!s_enabled && !req_host_ok(host, net_discovery_hostname())) {
+        log_refusal("unknown host name while sign-in is off -- open the hub by its IP address "
+                    "or its .local name, or turn sign-in on");
+        return false;
+    }
+    return true;
+}
+
+esp_err_t auth_reply_cross_site(httpd_req_t* req) {
+    return reply(req, "403 Forbidden", "{\"error\":\"cross_site\"}");
 }
 
 esp_err_t auth_register_uri(httpd_handle_t hd, const httpd_uri_t* u) {
