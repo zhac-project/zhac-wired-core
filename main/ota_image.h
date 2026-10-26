@@ -10,10 +10,12 @@
 // not read what this one stored: below the 1 MB device store it shows no
 // devices until it is updated again).
 //
-// A release is "vYYYYMMDDVV". Any other version (git describe's
+// A release is "vYYYYMMDDVV", and "vYYYYMMDDVV-rcN" (N one or two digits) a
+// pre-release that comes before it (review LOW M3: an older -rcN was offered
+// and installed as if it were no release). Any other version (git describe's
 // "v2026101601-rc1-20-g6d04f6a" for a developer build) is never called older
 // and calls nothing older, as the hub page's version list does
-// (www-spa/src/releases.js parseTag). Pure: host-tested in test/host/ota_image.
+// (www-spa/src/releases.js tagOrder). Pure: host-tested in test/host/ota_image.
 #pragma once
 
 #include <cstdint>
@@ -21,23 +23,30 @@
 
 enum class OtaImage { OK, OTHER_PROJECT, OLDER };
 
-// 2026102501 for "v2026102501", else 0.
-inline uint64_t ota_release_number(const char* v) {
+// A key that orders releases and pre-releases: "v2026102501" -> 2026102501999,
+// "v2026102501-rc2" -> 2026102501002; 0 for anything else.
+inline uint64_t ota_release_order(const char* v) {
     if (!v || v[0] != 'v') return 0;
     uint64_t n = 0;
     for (int i = 1; i <= 10; i++) {
         if (v[i] < '0' || v[i] > '9') return 0;
         n = n * 10 + static_cast<uint64_t>(v[i] - '0');
     }
-    return v[11] == '\0' ? n : 0;
+    if (v[11] == '\0') return n * 1000 + 999;
+    if (std::strncmp(v + 11, "-rc", 3) != 0) return 0;
+    const char* d = v + 14;
+    if (d[0] < '0' || d[0] > '9') return 0;
+    uint64_t rc = static_cast<uint64_t>(d[0] - '0');
+    if (d[1] >= '0' && d[1] <= '9') { rc = rc * 10 + static_cast<uint64_t>(d[1] - '0'); d++; }
+    return d[1] == '\0' ? n * 1000 + rc : 0;
 }
 
 inline OtaImage ota_image_check(const char* running_project, const char* running_version,
                                 const char* image_project, const char* image_version, bool allow_older) {
     if (!running_project || !image_project || std::strcmp(running_project, image_project) != 0)
         return OtaImage::OTHER_PROJECT;
-    const uint64_t running = ota_release_number(running_version);
-    const uint64_t image = ota_release_number(image_version);
+    const uint64_t running = ota_release_order(running_version);
+    const uint64_t image = ota_release_order(image_version);
     if (!allow_older && running && image && image < running) return OtaImage::OLDER;
     return OtaImage::OK;
 }

@@ -26,9 +26,25 @@ int main() {
     CHECK(ota_image_check(P, "v2026102501", P, "v2026101601-rc1-20-g6d04f6a", false) == OtaImage::OK,
           "and is never called older");
     CHECK(ota_image_check(P, "v2026102501", P, "v20261", false) == OtaImage::OK, "nor is a malformed version");
-    CHECK(ota_release_number("v2026102501") == 2026102501ULL && ota_release_number("v202610250") == 0 &&
-          ota_release_number("v20261025011") == 0 && ota_release_number("v2026102501-rc1") == 0 &&
-          ota_release_number(nullptr) == 0, "release numbers: exactly v and ten digits");
+    // A pre-release tag vYYYYMMDDVV-rcN comes before its release (review LOW M3).
+    CHECK(ota_image_check(P, "v2026102501", P, "v2026100301-rc1", false) == OtaImage::OLDER,
+          "an older pre-release is refused");
+    CHECK(ota_image_check(P, "v2026102501", P, "v2026100301-rc1", true) == OtaImage::OK, "  unless asked for");
+    CHECK(ota_image_check(P, "v2026102501", P, "v2026102501-rc2", false) == OtaImage::OLDER,
+          "the installed release's own pre-release is older");
+    CHECK(ota_image_check(P, "v2026102501-rc2", P, "v2026102501", false) == OtaImage::OK, "  and its release newer");
+    CHECK(ota_image_check(P, "v2026102501-rc2", P, "v2026102501-rc1", false) == OtaImage::OLDER, "rc1 is older than rc2");
+    CHECK(ota_image_check(P, "v2026102501-rc1", P, "v2026102601-rc1", false) == OtaImage::OK, "a newer pre-release installs");
+    CHECK(ota_image_check(P, "v2026102501", P, "v2026100301-rc1-4-gabc1234", false) == OtaImage::OK,
+          "a developer build made on a pre-release tag is still not a release");
+    CHECK(ota_release_order("v2026102501") > ota_release_order("v2026102501-rc99") &&
+          ota_release_order("v2026102501-rc2") > ota_release_order("v2026102501-rc1") &&
+          ota_release_order("v2026102501-rc1") > ota_release_order("v2026102401") &&
+          ota_release_order("v2026102401") > 0 &&
+          ota_release_order("v202610250") == 0 && ota_release_order("v20261025011") == 0 &&
+          ota_release_order("v2026102501-rc") == 0 && ota_release_order("v2026102501-rc100") == 0 &&
+          ota_release_order("v2026102501-rc1x") == 0 && ota_release_order(nullptr) == 0,
+          "release order: v and ten digits, optionally -rc and one or two digits");
     printf("%s (%d failure(s))\n", s_fail ? "FAILED" : "ALL PASS", s_fail);
     return s_fail;
 }
