@@ -200,8 +200,23 @@ int fetch_hop(const char* url, char* next, size_t cap) {
 // found none: the image is then not taken.
 volatile bool s_late_redirect = false;
 esp_err_t on_http_event(esp_http_client_event_t* e) {
-    if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && strcasecmp(e->header_key, "Location") == 0)
+    if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && strcasecmp(e->header_key, "Location") == 0) {
         s_late_redirect = true;
+    } else if (s_late_redirect &&
+               (e->event_id == HTTP_EVENT_ON_CONNECTED || e->event_id == HTTP_EVENT_HEADERS_SENT)) {
+        // esp_https_ota_begin is following that redirect: it follows every
+        // one with no limit and returns only when an answer is not a redirect
+        // (IDF esp_https_ota.c _http_connect), so a server could keep the
+        // update task, and requests to whatever it names, going until the hub
+        // restarts (review HS-09). Nothing can stop it from here but a
+        // restart; nothing is written yet, and an update never starts while
+        // the last one is on trial, so the running firmware stays.
+        ESP_LOGE(TAG, "update refused: the download was redirected again -- restarting to end it");
+        event("ota.complete", true, false, 0, 0, "the update server redirected the download; the hub restarts");
+        vTaskDelay(pdMS_TO_TICKS(500));   // let the page get the answer
+        log_cloud_planned_restart(logcloud::Planned::Restart);
+        esp_restart();
+    }
     return ESP_OK;
 }
 
