@@ -16,9 +16,10 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-auth.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
 cp "$R/auth.cpp" "$R/auth.h" "$R/req_filter.h" "$R/sec_headers.h" "$H/stubs.h" "$H/harness.cpp" "$W/"
-mkdir -p "$W/lwip" "$W/freertos" "$W/psa"
+mkdir -p "$W/lwip" "$W/freertos" "$W/psa" "$W/soc"
 for h in esp_http_server.h esp_log.h esp_random.h esp_timer.h net_discovery.h nvs.h sdkconfig.h ws_server.h \
-         zap_setup_window.h lwip/sockets.h freertos/FreeRTOS.h freertos/semphr.h psa/crypto.h; do
+         zap_setup_window.h lwip/sockets.h freertos/FreeRTOS.h freertos/semphr.h psa/crypto.h \
+         bootloader_random.h soc/soc_caps.h; do
     echo '#include "stubs.h"' > "$W/$h"
 done
 
@@ -26,5 +27,9 @@ cd "$W"
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++
 FLAGS="-std=c++17 -g -fsanitize=address,undefined -Wall -Wextra -I. -I$AJ"
 g++ $FLAGS auth.cpp harness.cpp -Wl,--wrap=getpeername -Wl,--wrap=printf -o harness
+# Once more as a chip with a radio (the S31), whose boot token needs the entropy source turned on (HS-15).
+g++ $FLAGS -DSOC_IEEE802154_SUPPORTED=1 auth.cpp harness.cpp -Wl,--wrap=getpeername -Wl,--wrap=printf -o harness_rf
 set +e
-./harness
+./harness; a=$?
+echo "-- as a chip with a radio:"
+./harness_rf; exit $((a + $?))

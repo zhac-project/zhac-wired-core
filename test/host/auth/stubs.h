@@ -25,6 +25,8 @@ constexpr esp_err_t ESP_FAIL = -1;
 
 int64_t esp_timer_get_time();
 void    esp_fill_random(void* buf, size_t len);
+void    bootloader_random_enable(void);    // bootloader_random.h: the entropy source the radio chips lack at boot
+void    bootloader_random_disable(void);
 
 typedef void* SemaphoreHandle_t;
 #define pdTRUE 1

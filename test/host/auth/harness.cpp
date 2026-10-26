@@ -25,9 +25,15 @@ static uint32_t    g_setup_left = 0;               // the first-claim window
 static std::string g_serial;                       // what auth.cpp printed on the console
 
 int64_t esp_timer_get_time() { return g_now_us; }
+static bool g_entropy_on = false;      // between bootloader_random_enable and _disable
+static int  g_entropy_calls = 0;
+static bool g_last_fill_entropy = false;
+void bootloader_random_enable(void)  { g_entropy_on = true;  g_entropy_calls++; }
+void bootloader_random_disable(void) { g_entropy_on = false; g_entropy_calls++; }
 void esp_fill_random(void* buf, size_t len) {
     static uint8_t n = 0;
     for (size_t i = 0; i < len; i++) static_cast<uint8_t*>(buf)[i] = n++;
+    g_last_fill_entropy = g_entropy_on;
 }
 SemaphoreHandle_t xSemaphoreCreateMutex() { static int m; return &m; }
 int xSemaphoreTake(SemaphoreHandle_t, int) { return pdTRUE; }
@@ -185,6 +191,14 @@ int main() {
     const char* kWrong = "00000000000000000000000000000000";
     auth_init();                                  // nothing stored, default off
     auth_register(nullptr);
+    // The first token is drawn at boot, before the radio runs (HS-15). A chip with a radio (the S31) has
+    // true entropy then only with the bootloader's source turned on again; the P4 keeps its source on.
+#if SOC_WIFI_SUPPORTED || SOC_IEEE802154_SUPPORTED || SOC_BT_SUPPORTED
+    expect("radio chip: the boot token is drawn with the entropy source on", g_last_fill_entropy);
+    expect("  which is off again before the radio starts", !g_entropy_on && g_entropy_calls == 2);
+#else
+    expect("no radio: the entropy source is left as it is", g_entropy_calls == 0);
+#endif
     expect("sign-in starts off", !auth_enabled());
     expect("no token installed while off", g_ws_token.empty());
 

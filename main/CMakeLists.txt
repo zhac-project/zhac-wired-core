@@ -83,6 +83,8 @@ idf_component_register(
         # auth.cpp: PSA hashing for the admin password; getpeername for lockout.
         mbedtls
         lwip
+        # auth.cpp: bootloader_random_enable/disable around the first-boot token (review HS-15).
+        bootloader_support
         # IDF v6.0 split the monolithic `driver` component; `driver/gpio.h`
         # now comes from esp_driver_gpio. Requiring `driver` builds but the
         # header is not on the include path.

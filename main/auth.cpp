@@ -13,6 +13,7 @@
 #include <lwip/sockets.h>   // getpeername, for the per-peer lockout
 
 #include "ArduinoJson.h"
+#include "bootloader_random.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -24,6 +25,7 @@
 #include "req_filter.h"
 #include "sdkconfig.h"
 #include "sec_headers.h"
+#include "soc/soc_caps.h"
 #include "ws_server.h"
 #include "zap_setup_window.h"
 
@@ -242,6 +244,22 @@ void new_token(char out[33]) {
     for (int i = 0; i < 16; i++) snprintf(out + i * 2, 3, "%02x", rnd[i]);
 }
 
+// A token drawn at boot, before the radio runs. On a chip with a radio (the
+// S31) the RNG has true entropy only while the radio or the bootloader's
+// entropy source is on, and the bootloader turns its source off before the app
+// starts: turn it on for these bytes, as IDF's nvs_sec_provider does for its
+// first-boot key. Nothing uses the ADC this early. The P4 has no radio and
+// keeps the source on; it is left alone there (review HS-15).
+void boot_token(char out[33]) {
+#if SOC_WIFI_SUPPORTED || SOC_IEEE802154_SUPPORTED || SOC_BT_SUPPORTED
+    bootloader_random_enable();
+    new_token(out);
+    bootloader_random_disable();
+#else
+    new_token(out);
+#endif
+}
+
 bool persist_token(const char* t) {
     nvs_handle_t h;
     if (nvs_open("zhac_auth", NVS_READWRITE, &h) != ESP_OK) return false;
@@ -385,7 +403,7 @@ void auth_init() {
         s_storage_error = true;
         s_enabled = true;
         s_pw_set = false;
-        new_token(s_token);
+        boot_token(s_token);
         ws_server_set_api_token(s_token);
         ESP_LOGE(TAG, "nvs_open(zhac_auth) failed -- STORAGE ERROR: sign-in forced on, "
                       "password set-up refused until storage is reset");
@@ -404,7 +422,7 @@ void auth_init() {
     s_enabled = en != 0;
     size_t len = sizeof(s_token);
     if (nvs_get_str(h, "token", s_token, &len) != ESP_OK || !s_token[0]) {
-        new_token(s_token);
+        boot_token(s_token);
         nvs_set_str(h, "token", s_token);
         nvs_commit(h);
     }
