@@ -38,6 +38,7 @@
 #include "lua_engine.h"   // lua_engine_scripts_held
 #include "remote_client.h"
 #include "remote_state.h"
+#include "sec_headers.h"
 
 static const char* TAG = "api_status";
 
@@ -64,6 +65,16 @@ void api_status_fill_metrics(JsonObject d) {
     eth_get_status(&net);
     d["link_up"] = net.link_up;
     fill_remote_state(d);
+}
+
+// What the sign-in page needs before anyone has signed in.
+static void fill_auth(JsonObject doc) {
+    doc["auth_enabled"]    = sys_auth_enabled();
+    // Drives the web UI's one-time "set admin password" card. Discloses only
+    // that no password exists yet -- the same fact /api/auth/setup makes true.
+    doc["auth_setup_required"] = sys_auth_enabled() && !auth_password_is_set();
+    doc["auth_setup_secs_left"] = auth_setup_secs_left();   // 0 = closed; power-cycle the hub to reopen
+    if (auth_storage_error()) doc["auth_storage_error"] = true;   // sign-in forced on, serial token only
 }
 
 void api_status_fill(JsonObject doc) {
@@ -146,12 +157,7 @@ void api_status_fill(JsonObject doc) {
     doc["ws_clients"]      = ws_server_client_count();
     doc["metrics_enabled"] = sys_metrics_enabled();
     doc["ap_disabled"]     = sys_ap_disabled();
-    doc["auth_enabled"]    = sys_auth_enabled();
-    // Drives the web UI's one-time "set admin password" card. Discloses only
-    // that no password exists yet -- the same fact /api/auth/setup makes true.
-    doc["auth_setup_required"] = sys_auth_enabled() && !auth_password_is_set();
-    doc["auth_setup_secs_left"] = auth_setup_secs_left();   // 0 = closed; power-cycle the hub to reopen
-    if (auth_storage_error()) doc["auth_storage_error"] = true;   // sign-in forced on, serial token only
+    fill_auth(doc);
     if (sys_storage_error()) doc["storage_error"] = true;   // NVS unusable at boot; nothing erased; Settings offers the reset
     // Schedules (cron rules, Lua on_cron) wait until SNTP has set the clock;
     // the web UI's Rules page says so while this is false.
@@ -184,9 +190,18 @@ void api_status_fill(JsonObject doc) {
 }
 
 static esp_err_t handle_get_status(httpd_req_t* req) {
+    sec_headers(req);
     if (!auth_request_allowed(req)) return auth_reply_cross_site(req);   // public, but not to other sites (HS-01)
     JsonDocument doc;
-    api_status_fill(doc.to<JsonObject>());
+    // With sign-in on, a caller without the token sees only what the sign-in
+    // page needs: the full set names the firmware version, the MQTT broker and
+    // its topic root, addresses, the time server and more (review HS-08).
+    if (auth_request_signed_in(req)) {
+        api_status_fill(doc.to<JsonObject>());
+    } else {
+        doc["sku"] = "wired";
+        fill_auth(doc.as<JsonObject>());
+    }
     // 2048, not 1024: this doc carries the full sys_diag set (cpu, heap, psram,
     // stack, net) plus this SKU's own legacy keys, and adding four IPv6 fields
     // pushed it past 1024. serializeJson TRUNCATES rather than failing, so the

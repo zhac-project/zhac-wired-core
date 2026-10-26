@@ -15,7 +15,7 @@ AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-auth.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
-cp "$R/auth.cpp" "$R/auth.h" "$R/req_filter.h" "$H/stubs.h" "$H/harness.cpp" "$W/"
+cp "$R/auth.cpp" "$R/auth.h" "$R/req_filter.h" "$R/sec_headers.h" "$H/stubs.h" "$H/harness.cpp" "$W/"
 mkdir -p "$W/lwip" "$W/freertos" "$W/psa"
 for h in esp_http_server.h esp_log.h esp_random.h esp_timer.h net_discovery.h nvs.h sdkconfig.h ws_server.h \
          zap_setup_window.h lwip/sockets.h freertos/FreeRTOS.h freertos/semphr.h psa/crypto.h; do

@@ -23,6 +23,7 @@
 #include "psa/crypto.h"     // IDF v6 (mbedtls 4): mbedtls/sha256.h is private
 #include "req_filter.h"
 #include "sdkconfig.h"
+#include "sec_headers.h"
 #include "ws_server.h"
 #include "zap_setup_window.h"
 
@@ -260,6 +261,7 @@ esp_err_t reply(httpd_req_t* req, const char* status, const char* body) {
 }
 
 esp_err_t gated(httpd_req_t* req) {
+    sec_headers(req);
     if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
     if (!check_request(req)) return reply(req, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
     return reinterpret_cast<Handler>(req->user_ctx)(req);
@@ -306,6 +308,7 @@ esp_err_t send_token(httpd_req_t* req, const char* token) {
 }
 
 esp_err_t handle_login(httpd_req_t* req) {
+    sec_headers(req);
     if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
     JsonDocument doc;
     if (!read_json(req, doc, 192)) return ESP_OK;
@@ -326,6 +329,7 @@ esp_err_t handle_login(httpd_req_t* req) {
 esp_err_t handle_setup(httpd_req_t* req) {
     // A foreign page, rebinding included, must not claim a fresh hub and read
     // its token from the answer (review HS-05): both rules, sign-in on or off.
+    sec_headers(req);
     if (!auth_request_from_hub_page(req)) return auth_reply_cross_site(req);
     if (s_storage_error) return reply(req, "503 Service Unavailable", "{\"error\":\"storage_error\"}");
     if (s_pw_set) return reply(req, "403 Forbidden", "{\"error\":\"already_set\"}");
@@ -532,6 +536,12 @@ bool auth_request_from_hub_page(httpd_req_t* req) {
 // working. The filter guards what is open without it.
 bool auth_request_allowed(httpd_req_t* req) {
     return s_enabled || auth_request_from_hub_page(req);
+}
+
+bool auth_request_signed_in(httpd_req_t* req) {
+    if (!s_enabled) return true;
+    if (httpd_req_get_hdr_value_len(req, "X-Api-Key") == 0) return false;   // asked without a key
+    return check_request(req);
 }
 
 esp_err_t auth_reply_cross_site(httpd_req_t* req) {

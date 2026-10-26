@@ -32,6 +32,11 @@ bool   auth_check_token(const char* token, int fd);   // WS first-message auth; 
 bool   auth_request_from_hub_page(httpd_req_t* req);
 bool   auth_request_allowed(httpd_req_t* req);
 esp_err_t auth_reply_cross_site(httpd_req_t* req);   // 403 {"error":"cross_site"}
+// True with sign-in off, or when the request carries the API token. A request
+// that sends no key is no guess: only a key that is sent and wrong counts
+// toward its peer's lockout. GET /api/status answers in full only to these
+// (review 2026-10-24 HS-08).
+bool   auth_request_signed_in(httpd_req_t* req);
 
 // Register a route that needs the API token while auth is on: answers 401
 // JSON instead of calling `u->handler` (403 first if the filter above refuses

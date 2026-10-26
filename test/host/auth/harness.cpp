@@ -67,6 +67,8 @@ psa_status_t psa_hash_compute(int, const uint8_t* in, size_t n, uint8_t* out, si
 
 // One request at a time: its headers and body, and what the handler answered.
 static std::map<std::string, std::string> g_hdr;
+static std::map<std::string, std::string> g_resp_hdr;   // what the handler set, by name
+static int g_resp_hdr_dups = 0;                         // a header set twice on one response
 static std::string g_body, g_status, g_resp, g_retry_after;
 static std::map<std::string, httpd_uri_t> g_routes;
 
@@ -112,6 +114,8 @@ esp_err_t httpd_resp_set_status(httpd_req_t*, const char* s) { g_status = s; ret
 esp_err_t httpd_resp_set_type(httpd_req_t*, const char*) { return ESP_OK; }
 esp_err_t httpd_resp_set_hdr(httpd_req_t*, const char* f, const char* v) {
     if (!std::strcmp(f, "Retry-After")) g_retry_after = v;
+    if (g_resp_hdr.count(f)) g_resp_hdr_dups++;
+    g_resp_hdr[f] = v;
     return ESP_OK;
 }
 esp_err_t httpd_resp_sendstr(httpd_req_t*, const char* s) { g_resp = s; return ESP_OK; }
@@ -149,6 +153,8 @@ static std::string post(const char* uri, int fd, const std::string& body,
     g_status = "200 OK";
     g_resp.clear();
     g_retry_after.clear();
+    g_resp_hdr.clear();
+    g_resp_hdr_dups = 0;
     const httpd_uri_t& u = g_routes.at(uri);
     httpd_req_t r{body.size(), u.user_ctx, fd};
     u.handler(&r);
@@ -227,6 +233,33 @@ int main() {
     expect("login refuses a body that is not JSON",
            post("/api/auth/login", 10, "{\"password\":\"hunter2hunter2\"}", "text/plain") ==
                "415 Unsupported Media Type");
+
+    // ── who gets the full /api/status (HS-08) ──
+    auto status_req = [](int fd, const std::string& key) {
+        g_hdr = {{"Host", "192.168.1.5"}};
+        if (!key.empty()) g_hdr["X-Api-Key"] = key;
+        httpd_req_t r{0, nullptr, fd};
+        return auth_request_signed_in(&r);
+    };
+    bool none_ok = true;
+    for (int i = 0; i < 10; i++) none_ok = none_ok && !status_req(13, "");
+    expect("sign-in on: a status request without a key is not signed in", none_ok);
+    expect("  and asking without a key is no guess: the peer is not locked out", status_req(13, good));
+    expect("  a wrong key is not signed in", !status_req(14, kWrong));
+    expect("  the token is", status_req(14, good));
+
+    // ── every answer: no MIME sniffing, no Referer (HS-14) ──
+    auto sec = [] {
+        return g_resp_hdr["X-Content-Type-Options"] == "nosniff" && g_resp_hdr["Referrer-Policy"] == "no-referrer" &&
+               g_resp_hdr_dups == 0;
+    };
+    login(10, "hunter2hunter2");
+    expect("a login answer says nosniff and no-referrer, once", sec());
+    post("/api/auth/setup", 11, "{\"password\":\"another-one-1\"}");
+    expect("  a refused set-up too", g_status != "200 OK" && sec());
+    expect("  a gated route's 401 too", post("/api/auth/password", 12, "{}") == "401 Unauthorized" && sec());
+    expect("  and its answer once signed in",
+           post("/api/auth/password", 12, "{\"x\":1}", "application/json", good) == "400 Bad Request" && sec());
 
     // ── lockout answers (HS-06) and the token on the console (HS-07) ──
     for (int i = 0; i < 5; i++) login(30, "wrong-password");

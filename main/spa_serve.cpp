@@ -21,20 +21,14 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "sec_headers.h"
+#include "spa_csp.h"
 
 extern const uint8_t spa_pack_start[] asm("_binary_spa_pack_start");
 extern const uint8_t spa_pack_end[]   asm("_binary_spa_pack_end");
 
 static const char* TAG = "spa";
 static uint32_t s_count = 0;
-
-// The CSP the web UI's README asks the firmware to send (a <meta> CSP cannot
-// cover the WebSocket). 'unsafe-inline' styles: CodeMirror injects them.
-// api.github.com: the OTA page lists the published releases from the browser.
-static constexpr char kCsp[] =
-    "default-src 'self'; connect-src 'self' ws: wss: https://api.github.com; script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; "
-    "frame-ancestors 'none'";
 
 static uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint16_t rd16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
@@ -75,6 +69,7 @@ static const char* mime_for(const char* path) {
 }
 
 static esp_err_t handle_spa_catchall(httpd_req_t* req) {
+    sec_headers(req);
     if (s_count == 0) {
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_sendstr(req,
@@ -101,7 +96,13 @@ static esp_err_t handle_spa_catchall(httpd_req_t* req) {
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Cache-Control",
                        is_index ? "no-cache" : "public, max-age=31536000, immutable");
-    if (is_index) httpd_resp_set_hdr(req, "Content-Security-Policy", kCsp);
+    char csp[kSpaCspMax];   // httpd keeps the pointer until the send below
+    if (is_index) {
+        char host[kSpaCspHostMax + 1] = "";
+        if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) host[0] = '\0';
+        spa_csp(host, csp, sizeof(csp));
+        httpd_resp_set_hdr(req, "Content-Security-Policy", csp);
+    }
     return httpd_resp_send(req, reinterpret_cast<const char*>(body), size);
 }
 
