@@ -174,7 +174,11 @@ static esp_err_t handle_rules_item(httpd_req_t* req) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json"); return ESP_FAIL;
         }
         bool en = doc["enabled"] | false;
-        bool ok = simple_rules_enable(id, en);
+        bool ok;
+        {
+            EditLock lock(g_edit_mutex);   // a rule change like the others (edit_lock.h)
+            ok = simple_rules_enable(id, en);
+        }
         httpd_resp_set_type(req, "application/json");
         return ok
             ? httpd_resp_sendstr(req, "{\"ok\":true}")

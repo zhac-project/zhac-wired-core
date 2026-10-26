@@ -1274,6 +1274,7 @@ static void cmd_rule_check(int fd, uint32_t id, JsonDocument& doc) {
     else send_err(fd, id, "oom");
 }
 static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // a rule change like the others (edit_lock.h)
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     bool en = doc["args"]["enabled"] | false;
     if (!rid) { send_err(fd, id, "missing id"); return; }
