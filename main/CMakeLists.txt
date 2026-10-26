@@ -80,6 +80,8 @@ idf_component_register(
         esp_https_ota
         esp_http_client
         app_update
+        # ota_update.cpp: how its HTTPS clients judge the server (zhac-components, review HS-11).
+        zap_tls
         # auth.cpp: PSA hashing for the admin password; getpeername for lockout.
         mbedtls
         lwip

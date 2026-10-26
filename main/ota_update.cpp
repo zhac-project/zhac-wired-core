@@ -15,7 +15,6 @@
 
 #include "ArduinoJson.h"
 #include "esp_attr.h"      // __NOINIT_ATTR: the early-crash counter
-#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_log.h"
@@ -33,6 +32,7 @@
 #include "log_cloud.h"
 #include "ws_server.h"
 #include "zap_store.h"
+#include "zap_tls.h"
 
 static const char* TAG = "ota";
 
@@ -179,7 +179,7 @@ int fetch_hop(const char* url, char* next, size_t cap) {
     next[0] = '\0';
     esp_http_client_config_t c{};
     c.url = url;
-    c.crt_bundle_attach = esp_crt_bundle_attach;
+    c.crt_bundle_attach = zap_tls_attach;   // the CA bundle; dates once the clock is set (HS-11)
     c.disable_auto_redirect = true;
     c.buffer_size_tx = 2048;   // a signed URL in the request line, as below
     c.event_handler = on_hop_event;
@@ -243,7 +243,7 @@ void run(const char* url) {
 
     esp_http_client_config_t http{};
     http.url = final_url;
-    http.crt_bundle_attach = esp_crt_bundle_attach;   // verify the server
+    http.crt_bundle_attach = zap_tls_attach;   // verify the server (zap_tls.h)
     http.keep_alive_enable = true;
     // The signed URL GitHub redirects to is ~950 chars; the request line must
     // fit the TX buffer (default 512, "Out of buffer").

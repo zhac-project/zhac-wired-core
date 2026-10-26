@@ -234,7 +234,7 @@ static void cmd_status(int fd, uint32_t id) {
     // Same size as the REST reply (api_status.cpp). serializeJson truncates
     // rather than failing, and a truncated reply is invalid JSON that the
     // page silently drops -- so refuse loudly instead.
-    constexpr size_t CAP = 3072;   // as GET /api/status (api_status.cpp)
+    constexpr size_t CAP = 4096;   // as GET /api/status (api_status.cpp)
     char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
     if (!buf) { send_err(fd, id, "oom"); return; }
     size_t n = serializeJson(doc, buf, CAP);

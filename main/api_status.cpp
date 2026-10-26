@@ -210,8 +210,8 @@ static esp_err_t handle_get_status(httpd_req_t* req) {
     // Then 2560 on the heap: the same doc also answers WS status.get, which
     // added the sku / settings keys the web UI reads.
     // 3072: the remote_scripts field must not push this past the buffer ("status too large" blanks the
-    // Settings page).
-    constexpr size_t CAP = 3072;
+    // Settings page). 4096: the MQTT broker pin and its cleartext warning (review HS-13).
+    constexpr size_t CAP = 4096;
     char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");

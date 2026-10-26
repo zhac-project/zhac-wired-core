@@ -106,6 +106,9 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 CONFIG_LWIP_TCP_WND_DEFAULT=11520
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# Certificate validity dates (review 2026-10-24 HS-11). zhac-components zap_tls leaves them out until
+# the clock is set (the boards keep no time over a power cut) and checks them from then on.
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 
 # --- Radio ------------------------------------------------------------------
 # No radio in Phase 0. Deliberately absent: CONFIG_ZHAC_NCP_ZNP / _EZSP / _C6.
