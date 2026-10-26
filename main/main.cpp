@@ -261,6 +261,21 @@ extern "C" void app_main() {
     // Re-apply persisted per-device options now that device_shadow and the
     // device pool are up. A no-op while the pool is empty.
     device_options_restore_all();
+    // Group-mirror rows of devices hard-removed before a delete cleared them
+    // (review PB-08) go too -- only when the pool came from a working store,
+    // as the options restore decides.
+    zigbee_pool_lock();
+    const bool pool_trusted = zap_store_is_ready() && pool_count() > 0;
+    zigbee_pool_unlock();
+    if (pool_trusted) {
+        const uint8_t gm_dropped = dgm_prune([](uint64_t ieee) {
+            zigbee_pool_lock();
+            const bool paired = pool_find_by_ieee(ieee) != nullptr;   // a soft-removed device keeps its rows
+            zigbee_pool_unlock();
+            return paired;
+        });
+        if (gm_dropped) ESP_LOGI(TAG, "group mirror: dropped %u row(s) of devices no longer paired", gm_dropped);
+    }
 
     // ── Rules + Lua ──────────────────────────────────────────────────
     // simple_rules first (NVS-backed store + rule cache), then lua_engine
@@ -283,6 +298,12 @@ extern "C" void app_main() {
     device_cmd_set_changed_hook([](uint64_t ieee) {
         simple_rules_reload();
         ha_bridge_device_changed(ieee);
+    });
+    // And what a hard remove must take with it from this core's own stores: the
+    // device's options and its group-mirror rows (review PB-08).
+    device_cmd_set_removed_hook([](uint64_t ieee) {
+        device_options_forget(ieee);
+        dgm_forget(ieee);
     });
     const bool lua_ok = !safe_mode && lua_engine_init();
     heap_mark("lua");

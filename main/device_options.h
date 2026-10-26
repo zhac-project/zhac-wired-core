@@ -27,3 +27,7 @@ size_t device_options_get_json(uint64_t ieee, char* out, size_t cap);
 // Boot: re-apply every persisted options blob to device_shadow. Call once
 // after device_shadow_init + the device-pool restore.
 void device_options_restore_all();
+
+// A hard remove: erase the device's stored options, so a device paired again
+// later does not inherit them (review PB-08). A soft remove keeps them.
+void device_options_forget(uint64_t ieee);

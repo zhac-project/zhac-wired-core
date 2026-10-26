@@ -150,6 +150,14 @@ bool device_options_set(uint64_t ieee, const char* json, size_t len) {
     return applied && persisted;
 }
 
+void device_options_forget(uint64_t ieee) {
+    nvs_handle_t h = opts_nvs();
+    if (!h) return;
+    char key[16];
+    key_for(ieee, key);
+    if (nvs_erase_key(h, key) == ESP_OK) nvs_commit(h);
+}
+
 size_t device_options_get_json(uint64_t ieee, char* out, size_t cap) {
     if (!out || cap == 0) return 0;
     out[0] = '\0';
