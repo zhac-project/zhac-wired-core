@@ -1223,17 +1223,20 @@ static void cmd_rule_list(int fd, uint32_t id, JsonDocument& doc) {
     heap_caps_free(slots); heap_caps_free(row); heap_caps_free(buf);
 }
 
-// rule.create {name, dsl} -> data {"id": <new id>} (spec §3.3; it used to answer without the id, so the
-// cloud had to list the rules again to find it).
+// rule.create {name, dsl, enabled?} -> data {"id": <new id>, "enabled": <bool>} (spec §3.3; it used to
+// answer without the id, so the cloud had to list the rules again to find it). `enabled` false creates
+// the rule Off in one step, and the echo tells the cloud this hub knows the argument (review R-08).
 static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
     EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
+    const bool  on   = doc["args"]["enabled"] | true;
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
     uint16_t nid = 0;
-    if (!simple_rules_add(name, dsl, &nid)) { send_err(fd, id, dsl_last_error()); return; }
-    char buf[80];   // the "rule.added" push comes from RULE_CHANGED
-    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"id\":%u}}", id, (unsigned)nid);
+    if (!simple_rules_add(name, dsl, &nid, on)) { send_err(fd, id, dsl_last_error()); return; }
+    char buf[96];   // the "rule.added" push comes from RULE_CHANGED
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"id\":%u,\"enabled\":%s}}",
+                           id, (unsigned)nid, on ? "true" : "false");
     ws_server_reply(fd, buf, (size_t)n);
 }
 
