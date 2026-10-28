@@ -450,6 +450,8 @@ const char* ota_update_state() { return s_state; }
 
 const char* ota_update_rollback_reason() { return s_rollback_why[0] ? s_rollback_why : nullptr; }
 
+bool ota_update_store_unconfirmed() { return s_move_unconfirmed; }
+
 bool ota_update_rolled_back() {
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return false;

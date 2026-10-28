@@ -83,6 +83,7 @@ void api_status_fill(JsonObject doc) {
     doc["restart"]  = true;       // system.restart: the web UI shows the Restart hub button
     doc["ota_state"] = ota_update_state();   // "pending" while a new image is on trial
     if (const char* why = ota_update_rollback_reason()) doc["ota_rollback_reason"] = why;
+    if (ota_update_store_unconfirmed()) doc["ota_store_unconfirmed"] = true;   // see ota_update.h: do not restart yet
     if (ota_update_safe_mode()) doc["safe_mode"] = true;   // early crashes: no Lua, MQTT or cloud link this boot
 
     // Chip / build

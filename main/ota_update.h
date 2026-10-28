@@ -25,6 +25,11 @@ const char* ota_update_state();
 // Why the previous update was undone, or nullptr. Cleared when an update starts.
 const char* ota_update_rollback_reason();
 
+// The image is kept, but the device store's move to zhac_data could not be marked final
+// yet (storage full?): retried every few seconds, and a restart meanwhile would bring
+// back the store from before the update (review 2026-10-28 R-03, fix review N4).
+bool ota_update_store_unconfirmed();
+
 // The same flag read straight from NVS, for boot code that runs before ota_update_init() (cloud logs). Set
 // when the health deadline undid an update; it stays set until the next update starts or an image is kept.
 // Reads NVS: main task only.
