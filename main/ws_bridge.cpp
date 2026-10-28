@@ -1113,20 +1113,22 @@ void ws_push(const char* event, JsonDocument& data) {
 // rule.create answers its id, rule.update takes base, rule.check; scripts.v1 = the script ops and events
 // and the switch. Sent in remote.auth and in hub.caps.
 // logs.v1: this firmware sends log.batch / log.tail and reports its "Log to cloud" level (spec 2026-10-06).
-static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\",\"logs.v1\"]";
+// rules.v2 (with rules.v1): rule.create takes `enabled` and echoes it, so the cloud can create a rule Off in
+// one step, and refuse that before sending to a hub without it (review 2026-10-28 R-08).
+static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"]";
 
 static const char* log_level_now() { return logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())); }
 
 // Worst cases (longest level "everything", remote_scripts false), checked at build time (spec §8): the
 // hub.caps payload must fit ws_push_hub_caps' buffer, the remote.auth extra remote_client.cpp's extra[160].
-static_assert(sizeof("{\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+static_assert(sizeof("{\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
-static_assert(sizeof(",\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+static_assert(sizeof(",\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\"") <= 160, "remote_hello_extra outgrew remote_client's extra[160]");
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
-    char buf[160];   // 95 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
+    char buf[160];   // 106 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
     const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"}",
                            kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now());
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
@@ -1230,8 +1232,11 @@ static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
     EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
-    const bool  on   = doc["args"]["enabled"] | true;
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
+    // Absent or null: On. Anything but a boolean is refused (`| true` made 0 or "false" a live rule).
+    const JsonVariantConst en = doc["args"]["enabled"];
+    if (!en.isNull() && !en.is<bool>()) { send_err(fd, id, "enabled must be true or false"); return; }
+    const bool on = en.isNull() || en.as<bool>();
     uint16_t nid = 0;
     if (!simple_rules_add(name, dsl, &nid, on)) { send_err(fd, id, dsl_last_error()); return; }
     char buf[96];   // the "rule.added" push comes from RULE_CHANGED

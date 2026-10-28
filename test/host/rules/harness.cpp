@@ -477,6 +477,21 @@ static void test_rule_create() {
     h_rule_create(1, 4294967295u, q);
     CHECK(one() == R"({"id":4294967295,"ok":true,"data":{"id":65535,"enabled":false}})" && !g_add_enabled,
           "enabled:false creates the rule Off and echoes it; largest ids fit");
+    // Anything but a boolean is refused before a rule exists: `| true` made
+    // 0, "false" or "0" a live rule (fix review S3).
+    const int before_bad = g_add_calls;
+    q["args"]["enabled"] = 0;
+    h_rule_create(1, 9, q);
+    CHECK(one() == R"({"id":9,"ok":false,"err":"enabled must be true or false"})" && g_add_calls == before_bad,
+          "a number for enabled is refused before anything is created");
+    q["args"]["enabled"] = "false";
+    h_rule_create(1, 10, q);
+    CHECK(one() == R"({"id":10,"ok":false,"err":"enabled must be true or false"})" && g_add_calls == before_bad,
+          "a string for enabled is refused too");
+    q["args"]["enabled"] = nullptr;
+    h_rule_create(1, 11, q);
+    CHECK(one() == R"({"id":11,"ok":true,"data":{"id":65535,"enabled":true}})" && g_add_calls == before_bad + 1 &&
+          g_add_enabled, "a null enabled counts as absent: the rule is On");
     q["args"].remove("enabled");
 
     g_add_ok = false;

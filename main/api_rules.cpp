@@ -142,13 +142,20 @@ static esp_err_t handle_post_rules(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing dsl");
         return ESP_FAIL;
     }
+    // As WS rule.create: absent or null is On; false creates it Off in one step (review 2026-10-28 R-08).
+    const JsonVariantConst en = doc["enabled"];
+    if (!en.isNull() && !en.is<bool>()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "enabled must be true or false");
+        return ESP_FAIL;
+    }
+    const bool on = en.isNull() || en.as<bool>();
     uint16_t new_id = 0;
     EditLock lock(g_edit_mutex);   // as every rule save (edit_lock.h)
-    bool ok = simple_rules_add(name, dsl, &new_id);
+    bool ok = simple_rules_add(name, dsl, &new_id, on);
     httpd_resp_set_type(req, "application/json");
     if (ok) {
         char r[64];
-        int rl = snprintf(r, sizeof(r), "{\"ok\":true,\"id\":%u}", (unsigned)new_id);
+        int rl = snprintf(r, sizeof(r), "{\"ok\":true,\"id\":%u,\"enabled\":%s}", (unsigned)new_id, on ? "true" : "false");
         return httpd_resp_send(req, r, rl);
     }
     return send_json(req, "400 Bad Request", dsl_error_doc());
