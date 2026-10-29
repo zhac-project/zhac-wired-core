@@ -164,6 +164,17 @@ static void data_partition_register() {
     else ESP_LOGE(TAG, "zhac_data not available (%s): the device store stays on nvs", esp_err_to_name(e));
 }
 
+// Pending store writes at any deliberate restart: rules, then the shadow, then
+// the device store (the order the three separate handlers ran in: IDF calls
+// them last-registered first). One handler, not three: IDF has five slots, its
+// clock and Wi-Fi take some, and a registration past the fifth fails (fix
+// review M-5). Each flush returns at once until its store is up.
+static void flush_stores() {
+    rule_store_flush_now();
+    device_shadow_flush_now();
+    zap_store_flush_now();
+}
+
 extern "C" void app_main() {
     ESP_LOGI(TAG, "boot -- zhac-wired-core (%s, wired Ethernet)", CONFIG_IDF_TARGET);
 
@@ -214,9 +225,11 @@ extern "C" void app_main() {
     if (!zap_store_is_ready()) sys_set_storage_error(true);
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
-    esp_register_shutdown_handler(zap_store_flush_now);   // as on the P4: pending device-store writes survive a reboot
+    // Pending device-store writes, rule edits and the attribute states the 5-min
+    // sweep has not written yet all survive a reboot.
+    if (esp_register_shutdown_handler(flush_stores) != ESP_OK)
+        ESP_LOGW(TAG, "no shutdown slot left -- pending store writes are lost at a restart");
     device_shadow_init();
-    esp_register_shutdown_handler(device_shadow_flush_now);   // attr states the 5-min sweep has not written yet
     zhac_adapter_init();
     heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
@@ -291,7 +304,6 @@ extern "C" void app_main() {
     rule_store_init();
     rule_store_flush_init();
     grp_store_init();   // groups store mutex, before any server task exists
-    esp_register_shutdown_handler(rule_store_flush_now);
     simple_rules_init();
     // What follows a device rename, in one place: rules re-resolve names and
     // Home Assistant sees the new one (device_cmd cannot call either itself).

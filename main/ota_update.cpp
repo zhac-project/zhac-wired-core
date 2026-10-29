@@ -69,10 +69,17 @@ uint32_t           s_health_ticks = 0;
 constexpr uint32_t kSoakS            = 5 * 60;
 uint32_t           s_healthy_ticks   = 0;
 // Review 2026-10-28 R-03 (S1): the image is valid, but neither mark of the
-// device store's move to zhac_data would write yet. Retried every tick until one
-// sticks; until then the old copy stays on nvs. A restart meanwhile loses
-// nothing: a boot keeps the copy while nvs is unchanged (review 2026-10-29 N-05).
+// device store's move to zhac_data would write yet. Retried until one sticks;
+// until then the old copy stays on nvs. A restart meanwhile loses nothing: a
+// boot keeps the copy while nvs is unchanged (review 2026-10-29 N-05). Set on
+// the boot that kept the image and on any later boot that still finds the move
+// unmarked (fix review M-3).
 bool               s_move_unconfirmed = false;
+// Each try logs its failed writes, so the tries back off: 5 s, then twice as
+// far apart each time, up to once an hour (fix review M-4).
+constexpr uint32_t kRetryMaxTicks    = 3600 / kHealthTickS;
+uint32_t           s_retry_tick      = 0;   // health tick of the next try
+uint32_t           s_retry_gap       = 1;   // ticks to the try after it
 const char*        s_state        = "verified";          // "pending" | "verified" | "rolling_back"
 char               s_rollback_why[64] = {};
 
@@ -117,13 +124,16 @@ const char* health_problem() {
 void health_tick(void*) {
     s_health_ticks++;
     if (s_move_unconfirmed) {
+        if (s_health_ticks < s_retry_tick) return;
+        s_retry_gap = s_retry_gap < kRetryMaxTicks / 2 ? s_retry_gap * 2 : kRetryMaxTicks;
+        s_retry_tick = s_health_ticks + s_retry_gap;
         if (zap_store_confirm_move()) {
             s_move_unconfirmed = false;
             ESP_LOGI(TAG, "device store move to zhac_data confirmed");
             esp_timer_stop(s_health_timer);
-        } else if (s_health_ticks % 12 == 1) {   // once a minute
+        } else {
             ESP_LOGW(TAG, "device store move cannot be marked final yet (storage full?) -- "
-                          "the old copy stays on nvs; retrying");
+                          "the old copy stays on nvs; next try in %" PRIu32 " s", s_retry_gap * kHealthTickS);
         }
         return;
     }
@@ -146,7 +156,7 @@ void health_tick(void*) {
         s_state = "verified";
         nvs_put_str(kNvsRollback, nullptr);
         if (!zap_store_confirm_move()) {
-            s_move_unconfirmed = true;   // keep the timer: retried every tick (above)
+            s_move_unconfirmed = true;   // keep the timer: retried, backing off (above)
             ESP_LOGW(TAG, "device store move cannot be marked final yet -- retrying");
             return;
         }
@@ -418,6 +428,14 @@ bool ota_update_boot_guard() {
 
 bool ota_update_safe_mode() { return s_safe_mode; }
 
+static void start_health_timer() {
+    esp_timer_create_args_t a{};
+    a.callback = health_tick;
+    a.name = "ota_health";
+    if (esp_timer_create(&a, &s_health_timer) == ESP_OK)
+        esp_timer_start_periodic(s_health_timer, static_cast<uint64_t>(kHealthTickS) * 1000000ULL);
+}
+
 void ota_update_init() {
     if (s_health_timer) return;
     // Why the previous update was undone, if it was: the old image boots with
@@ -435,16 +453,18 @@ void ota_update_init() {
     if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK ||
         state != ESP_OTA_IMG_PENDING_VERIFY) {
         s_state = "verified";     // USB-flashed, or already judged
+        // A move of the device store left unmarked at an earlier boot (or this
+        // one) is not final yet: keep trying, as after a trial (fix review M-3).
+        if (!zap_store_confirm_move()) {
+            s_move_unconfirmed = true;
+            start_health_timer();
+        }
         return;
     }
     s_state = "pending";
     ESP_LOGI(TAG, "new image on trial: kept once storage, web server and radio check out (%" PRIu32 " s limit)",
              kHealthDeadlineS);
-    esp_timer_create_args_t a{};
-    a.callback = health_tick;
-    a.name = "ota_health";
-    if (esp_timer_create(&a, &s_health_timer) == ESP_OK)
-        esp_timer_start_periodic(s_health_timer, static_cast<uint64_t>(kHealthTickS) * 1000000ULL);
+    start_health_timer();
 }
 
 const char* ota_update_state() { return s_state; }
@@ -467,6 +487,13 @@ bool ota_update_start(const char* url, bool allow_older, const char** err) {
     if (strlen(url) >= sizeof(s_url)) { *err = "URL too long"; return false; }
     if (s_busy) { *err = "an update is already running"; return false; }
     if (s_state[0] == 'p') { *err = "the previous update is still being checked -- wait a few minutes"; return false; }
+    // An older build would run on the copy on nvs, from before the last update,
+    // and the next update would copy it over what changed since (fix review M-1).
+    // A newer build keeps the copy.
+    if (s_move_unconfirmed && allow_older) {
+        *err = "an older version cannot be installed until the device store's move is final -- see the log";
+        return false;
+    }
     s_busy = true;
     snprintf(s_url, sizeof(s_url), "%s", url);
     s_allow_older = allow_older;

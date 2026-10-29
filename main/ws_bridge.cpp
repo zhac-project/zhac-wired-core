@@ -1666,9 +1666,8 @@ static void cmd_debug_crash(int fd, uint32_t id) {
 // dispatcher for the 500 ms grace period: the delay + esp_restart() run on
 // their own short-lived task instead, off the httpd/WS handler, after the
 // reply is already on the wire. esp_restart() still runs the registered
-// shutdown handlers (zap_store_flush_now, device_shadow_flush_now,
-// rule_store_flush_now), so device states and last_seen are saved same as
-// any other reboot.
+// shutdown handler (main.cpp's flush_stores: rule store, shadow, device
+// store), so device states and last_seen are saved same as any other reboot.
 static void restart_task(void*) {
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
