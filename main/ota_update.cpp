@@ -74,8 +74,8 @@ uint32_t           s_healthy_ticks   = 0;
 // until then the old copy stays on nvs. A restart meanwhile loses nothing: a
 // boot keeps the copy while nvs is unchanged (review 2026-10-29 N-05). Set on
 // the boot that kept the image and on any later boot that still finds the move
-// unmarked (fix review M-3). Shown in status; the older-version check asks the
-// store itself.
+// unmarked, with the store open (fix review M-3, fix re-review M-a). Shown in
+// status; the older-version check asks the store itself.
 std::atomic<bool>  s_move_unconfirmed{false};
 // Each try logs its failed writes, so the tries back off: 5 s, then twice as
 // far apart each time, up to once an hour (fix review M-4).
@@ -157,7 +157,7 @@ void health_tick(void*) {
         // on this trial boot becomes final, so the old copy on nvs can go.
         s_state = "verified";
         nvs_put_str(kNvsRollback, nullptr);
-        if (!zap_store_confirm_move()) {
+        if (zap_store_is_ready() && !zap_store_confirm_move()) {   // a shut store: see ota_update_init()
             s_move_unconfirmed = true;   // keep the timer: retried, backing off (above)
             ESP_LOGW(TAG, "device store move cannot be marked final yet -- retrying");
             return;
@@ -457,7 +457,9 @@ void ota_update_init() {
         s_state = "verified";     // USB-flashed, or already judged
         // A move of the device store left unmarked at an earlier boot (or this
         // one) is not final yet: keep trying, as after a trial (fix review M-3).
-        if (!zap_store_confirm_move()) {
+        // Not while the store is shut: nothing can be marked before the next
+        // boot, and status already says storage_error (fix re-review M-a).
+        if (zap_store_is_ready() && !zap_store_confirm_move()) {
             s_move_unconfirmed = true;
             start_health_timer();
         }
