@@ -69,8 +69,9 @@ uint32_t           s_health_ticks = 0;
 constexpr uint32_t kSoakS            = 5 * 60;
 uint32_t           s_healthy_ticks   = 0;
 // Review 2026-10-28 R-03 (S1): the image is valid, but neither mark of the
-// device store's move to zhac_data would write, so the next boot would copy
-// the store from before the update over it. Retried every tick until one sticks.
+// device store's move to zhac_data would write yet. Retried every tick until one
+// sticks; until then the old copy stays on nvs. A restart meanwhile loses
+// nothing: a boot keeps the copy while nvs is unchanged (review 2026-10-29 N-05).
 bool               s_move_unconfirmed = false;
 const char*        s_state        = "verified";          // "pending" | "verified" | "rolling_back"
 char               s_rollback_why[64] = {};
@@ -121,8 +122,8 @@ void health_tick(void*) {
             ESP_LOGI(TAG, "device store move to zhac_data confirmed");
             esp_timer_stop(s_health_timer);
         } else if (s_health_ticks % 12 == 1) {   // once a minute
-            ESP_LOGE(TAG, "device store move cannot be marked final (storage full?) -- a restart now "
-                          "would bring back the store from before the update; retrying");
+            ESP_LOGW(TAG, "device store move cannot be marked final yet (storage full?) -- "
+                          "the old copy stays on nvs; retrying");
         }
         return;
     }
@@ -140,13 +141,13 @@ void health_tick(void*) {
         }
         ESP_LOGI(TAG, "running image marked valid after %" PRIu32 " s: storage, web server and radio OK "
                       "for %" PRIu32 " s in a row", s_health_ticks * kHealthTickS, kSoakS);
-        // No rollback any more: a move of the device store to zhac_data made on
-        // this trial boot is final now, so the next update does not copy over it.
+        // No rollback any more: the move of the device store to zhac_data made
+        // on this trial boot becomes final, so the old copy on nvs can go.
         s_state = "verified";
         nvs_put_str(kNvsRollback, nullptr);
         if (!zap_store_confirm_move()) {
             s_move_unconfirmed = true;   // keep the timer: retried every tick (above)
-            ESP_LOGE(TAG, "device store move cannot be marked final -- retrying");
+            ESP_LOGW(TAG, "device store move cannot be marked final yet -- retrying");
             return;
         }
         esp_timer_stop(s_health_timer);
@@ -466,9 +467,6 @@ bool ota_update_start(const char* url, bool allow_older, const char** err) {
     if (strlen(url) >= sizeof(s_url)) { *err = "URL too long"; return false; }
     if (s_busy) { *err = "an update is already running"; return false; }
     if (s_state[0] == 'p') { *err = "the previous update is still being checked -- wait a few minutes"; return false; }
-    // The next image's trial boot would copy the store from before the last
-    // update over the one in use (review 2026-10-28 R-03, S1).
-    if (s_move_unconfirmed) { *err = "the device store cannot be marked moved (storage full?) -- see the log"; return false; }
     s_busy = true;
     snprintf(s_url, sizeof(s_url), "%s", url);
     s_allow_older = allow_older;

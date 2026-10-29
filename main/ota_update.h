@@ -26,8 +26,8 @@ const char* ota_update_state();
 const char* ota_update_rollback_reason();
 
 // The image is kept, but the device store's move to zhac_data could not be marked final
-// yet (storage full?): retried every few seconds, and a restart meanwhile would bring
-// back the store from before the update (review 2026-10-28 R-03, fix review N4).
+// yet (storage full?): retried every few seconds; the old copy stays on nvs until then.
+// A restart meanwhile loses nothing (review 2026-10-28 R-03, fix review N4; 2026-10-29 N-05).
 bool ota_update_store_unconfirmed();
 
 // The same flag read straight from NVS, for boot code that runs before ota_update_init() (cloud logs). Set
