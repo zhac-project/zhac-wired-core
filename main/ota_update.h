@@ -27,8 +27,8 @@ const char* ota_update_rollback_reason();
 
 // The device store's move to zhac_data could not be marked final yet (storage full?):
 // retried from 5 s backing off to hourly; the old copy stays on nvs until then, and an
-// older version is refused. A restart meanwhile loses nothing (review 2026-10-28 R-03,
-// fix review N4; 2026-10-29 N-05, fix review M-1, M-3, M-4).
+// older version is refused. A restart meanwhile loses nothing while nvs reads back whole
+// (review 2026-10-28 R-03, fix review N4; 2026-10-29 N-05, fix review M-1, M-3, M-4).
 bool ota_update_store_unconfirmed();
 
 // The same flag read straight from NVS, for boot code that runs before ota_update_init() (cloud logs). Set

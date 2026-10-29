@@ -7,6 +7,7 @@
 #include "ota_image.h"
 #include "ota_redirect.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cinttypes>
 #include <cstdlib>
@@ -73,8 +74,9 @@ uint32_t           s_healthy_ticks   = 0;
 // until then the old copy stays on nvs. A restart meanwhile loses nothing: a
 // boot keeps the copy while nvs is unchanged (review 2026-10-29 N-05). Set on
 // the boot that kept the image and on any later boot that still finds the move
-// unmarked (fix review M-3).
-bool               s_move_unconfirmed = false;
+// unmarked (fix review M-3). Shown in status; the older-version check asks the
+// store itself.
+std::atomic<bool>  s_move_unconfirmed{false};
 // Each try logs its failed writes, so the tries back off: 5 s, then twice as
 // far apart each time, up to once an hour (fix review M-4).
 constexpr uint32_t kRetryMaxTicks    = 3600 / kHealthTickS;
@@ -489,8 +491,11 @@ bool ota_update_start(const char* url, bool allow_older, const char** err) {
     if (s_state[0] == 'p') { *err = "the previous update is still being checked -- wait a few minutes"; return false; }
     // An older build would run on the copy on nvs, from before the last update,
     // and the next update would copy it over what changed since (fix review M-1).
-    // A newer build keeps the copy.
-    if (s_move_unconfirmed && allow_older) {
+    // A newer build keeps the copy. Asked of the store rather than the flag, so
+    // no moment of a boot is left out (fix re-review N3). A boot-guard rollback
+    // (three early crashes) cannot be refused: once the older build writes its
+    // store, the next update copies that over what was saved since.
+    if (allow_older && !zap_store_move_final()) {
         *err = "an older version cannot be installed until the device store's move is final -- see the log";
         return false;
     }

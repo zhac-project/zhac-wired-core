@@ -341,6 +341,11 @@ extern "C" void app_main() {
     // every /api/* route still works.
     spa_mount();
 
+    // ota.update + keep a fresh image once it proves healthy. Before the web
+    // server and the cloud link, so no request comes before this boot knows
+    // whether its image is on trial (fix re-review N3).
+    ota_update_init();
+
     // ── HTTP + WS ────────────────────────────────────────────────────
     // ws_server owns the httpd instance; everything else registers against its
     // handle. Unlike mono there is no placeholder "/" handler -- it would
@@ -401,7 +406,6 @@ extern "C" void app_main() {
         mqtt_glue_start();
         heap_mark("mqtt_glue");
     }
-    ota_update_init();   // ota.update + keep a fresh image once it proves healthy
     if (!safe_mode) metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
     heap_mark("metrics");
     supervisor_start(hd);   // restarts the hub if the web server or the Zigbee stack stops answering
