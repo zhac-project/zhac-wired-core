@@ -34,6 +34,16 @@
 #include "ws_server.h"
 #include "zap_store.h"
 #include "zap_tls.h"
+#include "sdkconfig.h"
+
+// zap_tls checks certificate dates only when mbedTLS has a date source.
+// sdkconfig.defaults turns it on (a764fb8), but menuconfig or a custom
+// sdkconfig can turn it off again, and check_resolved_config.sh runs only in
+// CI and the build scripts. Fail every build instead of shipping an image
+// that accepts expired certificates (review 2026-11-03 K-04).
+#if !CONFIG_MBEDTLS_HAVE_TIME_DATE
+#error "CONFIG_MBEDTLS_HAVE_TIME_DATE is off, so TLS would accept expired certificates: turn it back on (sdkconfig.defaults sets it)"
+#endif
 
 static const char* TAG = "ota";
 
