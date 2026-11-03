@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ESP32-C5 co-processor for the Wi-Fi test variant: ESP-Hosted's own slave
+# project, SPI full duplex, pins matching sdkconfig.defaults.wifi-hosted (the
+# wiring table is there). Loaded by tools/build-c5-wifi-cp.sh after the slave
+# project's own sdkconfig.defaults(.esp32c5).
+CONFIG_ESP_HOST_DEV_BOARD_NONE=y
+CONFIG_ESP_SPI_HOST_INTERFACE=y
+CONFIG_ESP_SPI_PRIV_MODE_3=y
+CONFIG_ESP_SPI_HSPI_GPIO_CLK=6
+CONFIG_ESP_SPI_HSPI_GPIO_MOSI=8
+CONFIG_ESP_SPI_HSPI_GPIO_MISO=9
+CONFIG_ESP_SPI_HSPI_GPIO_CS=10
+CONFIG_ESP_SPI_GPIO_HANDSHAKE=23
+CONFIG_ESP_SPI_GPIO_DATA_READY=24

@@ -81,6 +81,9 @@ void api_status_fill(JsonObject doc) {
     doc["sku"]      = "wired";
     doc["ota"]      = true;       // ota.update: the web UI shows its update field
     doc["restart"]  = true;       // system.restart: the web UI shows the Restart hub button
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+    doc["wifi_hosted"] = true;    // wifi.*: the web UI shows the WiFi card beside Ethernet
+#endif
     doc["ota_state"] = ota_update_state();   // "pending" while a new image is on trial
     if (const char* why = ota_update_rollback_reason()) doc["ota_rollback_reason"] = why;
     if (ota_update_store_unconfirmed()) doc["ota_store_unconfirmed"] = true;   // see ota_update.h

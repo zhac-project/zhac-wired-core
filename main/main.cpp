@@ -59,6 +59,9 @@
 #include "ota_update.h"
 #include "device_shadow.h"
 #include "eth.h"
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+#include "wifi_hosted.h"
+#endif
 #include "sys_diag.h"
 #include "dgm_store.h"
 #include "zigbee_pool.h"
@@ -334,6 +337,10 @@ extern "C" void app_main() {
     // link a second or more: lets lwIP hand the router's time server to SNTP.
     // Before eth_start it asserts in tcpip_callback and the hub boot-loops.
     ntp_cfg_init();
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+    wifi_hosted_start();   // returns at once; the co-processor handshake runs on its own task
+    heap_mark("wifi");     // esp_hosted's own buffers and tasks were taken before app_main
+#endif
     net_discovery_start(CONFIG_ZHAC_MDNS_HOSTNAME);
 
     // Mount the SPA partition before registering httpd routes so the catchall
