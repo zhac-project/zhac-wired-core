@@ -54,6 +54,7 @@
 #include "eth.h"
 #include "net_discovery.h"
 #include "radio_state.h"
+#include "esp_partition.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
@@ -233,7 +234,7 @@ static void cmd_status(int fd, uint32_t id) {
     // Same size as the REST reply (api_status.cpp). serializeJson truncates
     // rather than failing, and a truncated reply is invalid JSON that the
     // page silently drops -- so refuse loudly instead.
-    constexpr size_t CAP = 3072;   // as GET /api/status (api_status.cpp)
+    constexpr size_t CAP = 4096;   // as GET /api/status (api_status.cpp)
     char* buf = (char*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
     if (!buf) { send_err(fd, id, "oom"); return; }
     size_t n = serializeJson(doc, buf, CAP);
@@ -1019,12 +1020,13 @@ static void cmd_groups_all(int fd, uint32_t id) {
 // Answering "none" is the truthful answer and makes the SPA render its correct
 // "RainMaker bridging is off" copy instead of an error. There is deliberately
 // no uplink.set: there is nothing here to switch to.
-// ota.update {url} — see ota_update.h. Replies at once; progress follows as
-// ota.start / ota.progress / ota.complete events (target "self").
+// ota.update {url, allow_older?} — see ota_update.h. Replies at once; progress
+// follows as ota.start / ota.progress / ota.complete events (target "self").
 static void cmd_ota_update(int fd, uint32_t id, JsonDocument& doc) {
     const char* url = doc["args"]["url"] | (const char*)nullptr;
+    const bool allow_older = doc["args"]["allow_older"] | false;
     const char* err = nullptr;
-    if (ota_update_start(url, &err)) reply_ok_or_err(fd, id, true, nullptr);
+    if (ota_update_start(url, allow_older, &err)) reply_ok_or_err(fd, id, true, nullptr);
     else                             send_err(fd, id, err ? err : "failed");
 }
 
@@ -1111,20 +1113,22 @@ void ws_push(const char* event, JsonDocument& data) {
 // rule.create answers its id, rule.update takes base, rule.check; scripts.v1 = the script ops and events
 // and the switch. Sent in remote.auth and in hub.caps.
 // logs.v1: this firmware sends log.batch / log.tail and reports its "Log to cloud" level (spec 2026-10-06).
-static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"scripts.v1\",\"logs.v1\"]";
+// rules.v2 (with rules.v1): rule.create takes `enabled` and echoes it, so the cloud can create a rule Off in
+// one step, and refuse that before sending to a hub without it (review 2026-10-28 R-08).
+static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"]";
 
 static const char* log_level_now() { return logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())); }
 
 // Worst cases (longest level "everything", remote_scripts false), checked at build time (spec §8): the
 // hub.caps payload must fit ws_push_hub_caps' buffer, the remote.auth extra remote_client.cpp's extra[160].
-static_assert(sizeof("{\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+static_assert(sizeof("{\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
-static_assert(sizeof(",\"caps\":[\"rules.v1\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
+static_assert(sizeof(",\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\"") <= 160, "remote_hello_extra outgrew remote_client's extra[160]");
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
-    char buf[160];   // 95 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
+    char buf[160];   // 106 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
     const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"}",
                            kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now());
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
@@ -1221,17 +1225,23 @@ static void cmd_rule_list(int fd, uint32_t id, JsonDocument& doc) {
     heap_caps_free(slots); heap_caps_free(row); heap_caps_free(buf);
 }
 
-// rule.create {name, dsl} -> data {"id": <new id>} (spec §3.3; it used to answer without the id, so the
-// cloud had to list the rules again to find it).
+// rule.create {name, dsl, enabled?} -> data {"id": <new id>, "enabled": <bool>} (spec §3.3; it used to
+// answer without the id, so the cloud had to list the rules again to find it). `enabled` false creates
+// the rule Off in one step, and the echo tells the cloud this hub knows the argument (review R-08).
 static void cmd_rule_create(int fd, uint32_t id, JsonDocument& doc) {
     EditLock lock(g_edit_mutex);   // compare and write as one step (edit_lock.h)
     const char* name = doc["args"]["name"] | "";
     const char* dsl  = doc["args"]["dsl"]  | (const char*)nullptr;
     if (!dsl || !dsl[0]) { send_err(fd, id, "missing dsl"); return; }
+    // Absent or null: On. Anything but a boolean is refused (`| true` made 0 or "false" a live rule).
+    const JsonVariantConst en = doc["args"]["enabled"];
+    if (!en.isNull() && !en.is<bool>()) { send_err(fd, id, "enabled must be true or false"); return; }
+    const bool on = en.isNull() || en.as<bool>();
     uint16_t nid = 0;
-    if (!simple_rules_add(name, dsl, &nid)) { send_err(fd, id, dsl_last_error()); return; }
-    char buf[80];   // the "rule.added" push comes from RULE_CHANGED
-    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"id\":%u}}", id, (unsigned)nid);
+    if (!simple_rules_add(name, dsl, &nid, on)) { send_err(fd, id, dsl_last_error()); return; }
+    char buf[96];   // the "rule.added" push comes from RULE_CHANGED
+    const int n = snprintf(buf, sizeof(buf), "{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"id\":%u,\"enabled\":%s}}",
+                           id, (unsigned)nid, on ? "true" : "false");
     ws_server_reply(fd, buf, (size_t)n);
 }
 
@@ -1272,6 +1282,7 @@ static void cmd_rule_check(int fd, uint32_t id, JsonDocument& doc) {
     else send_err(fd, id, "oom");
 }
 static void cmd_rule_enable(int fd, uint32_t id, JsonDocument& doc) {
+    EditLock lock(g_edit_mutex);   // a rule change like the others (edit_lock.h)
     uint16_t rid = doc["args"]["id"] | (uint16_t)0;
     bool en = doc["args"]["enabled"] | false;
     if (!rid) { send_err(fd, id, "missing id"); return; }
@@ -1596,12 +1607,11 @@ static void cmd_alerts_get(int fd, uint32_t id) {
     ws_server_reply(fd, buf, (size_t)n);
 }
 
-// ── zigbee.* (network settings + factory reset) ───────────────────────
+// ── zigbee.* (network settings + network reset) ───────────────────────
 // This backend keeps its network in the esp-zigbee dataset and a build-time
-// channel mask; it has no recommission yet. Saving channel/key settings
-// nobody reads, then answering "reset done" and rebooting with the network
-// untouched, told the owner something that did not happen (review F17). Both
-// are refused until they are implemented and checked on a board.
+// channel mask. Saving channel/key settings nobody reads told the owner
+// something that did not happen (review F17), so they stay refused; a new
+// network with new keys comes from `zigbee.reset` (review 2026-10-24 PB-06).
 static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) {
     send_err(fd, id, "channel and network key settings are not available on this hub yet -- nothing was saved");
 }
@@ -1609,7 +1619,12 @@ static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) 
 // never does it by itself any more (see main.cpp). Gated like every command.
 static void cmd_storage_reset(int fd, uint32_t id) {
     ESP_LOGW(TAG, "storage reset requested -- erasing NVS and restarting");
-    const esp_err_t e = nvs_flash_erase();
+    // zhac_data (the device store, WC-04) first: a cut between the two erases
+    // then finds the store gone, never the old devices coming back.
+    esp_err_t e = ESP_OK;
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "zhac_data"))
+        e = nvs_flash_erase_partition("zhac_data");
+    if (e == ESP_OK) e = nvs_flash_erase();
     reply_ok_or_err(fd, id, e == ESP_OK, esp_err_to_name(e));
     if (e != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -1619,7 +1634,7 @@ static void cmd_storage_reset(int fd, uint32_t id) {
 
 static void cmd_zigbee_reset(int fd, uint32_t id) {
     if (!zigbee_force_recommission()) {
-        send_err(fd, id, "Zigbee network reset is not available on this hub yet -- nothing was changed");
+        send_err(fd, id, "the Zigbee network reset could not be saved -- nothing was changed");
         return;
     }
     reply_ok_or_err(fd, id, true, nullptr);
@@ -1651,9 +1666,8 @@ static void cmd_debug_crash(int fd, uint32_t id) {
 // dispatcher for the 500 ms grace period: the delay + esp_restart() run on
 // their own short-lived task instead, off the httpd/WS handler, after the
 // reply is already on the wire. esp_restart() still runs the registered
-// shutdown handlers (zap_store_flush_now, device_shadow_flush_now,
-// rule_store_flush_now), so device states and last_seen are saved same as
-// any other reboot.
+// shutdown handler (main.cpp's flush_stores: rule store, shadow, device
+// store), so device states and last_seen are saved same as any other reboot.
 static void restart_task(void*) {
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -1675,11 +1689,14 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     const char* cmd = doc["cmd"] | (const char*)nullptr;
     if (!cmd) { send_err(fd, id, "missing cmd"); return; }
 
-    // With auth on, a browser socket must send {"cmd":"auth","args":{"token":
-    // ...}} before anything else runs -- the token rides a frame, never the
-    // URL (as on the dual-chip S3). fd < 0 is the remote relay, which has its
-    // own authentication.
-    if (auth_enabled() && fd >= 0 && !ws_server_fd_is_authed(fd)) {
+    // A browser socket that is not signed in must send {"cmd":"auth","args":
+    // {"token":...}} before anything else runs -- the token rides a frame,
+    // never the URL (as on the dual-chip S3). Its own flag decides, not the
+    // sign-in setting: a socket opened while sign-in is off starts signed in,
+    // and one left over from before sign-in was turned off is not let in
+    // while its close is still queued (review 2026-10-24 HS-01). fd < 0 is the
+    // remote relay, which has its own authentication.
+    if (fd >= 0 && !ws_server_fd_is_authed(fd)) {
         const bool is_auth = std::strcmp(cmd, "auth") == 0;
         if (is_auth && auth_check_token(doc["args"]["token"] | "", fd)) {
             ws_server_fd_set_authed(fd);

@@ -24,6 +24,7 @@
 #include "sdkconfig.h"
 #include "ws_bridge.h"
 #include "zap_common.h"
+#include "zcl_attribute.h"   // zcl_attr_key_is_secret
 #include "zhc_adapter.h"
 #include "zigbee_pool.h"
 
@@ -110,7 +111,9 @@ bool set_attr(uint64_t ieee, const char* key, const char* value_json_text) {
     if (deserializeJson(v, value_json_text)) return false;
     const char* err = nullptr;
     const bool ok = ws_bridge_attr_set(ieee, key, v.as<JsonVariantConst>(), &err);
-    if (!ok) ESP_LOGW(TAG, "HA command %s=%s: %s", key, value_json_text, err ? err : "failed");
+    if (!ok) ESP_LOGW(TAG, "HA command %s=%s: %s", key,
+                      zcl_attr_key_is_secret(key) ? "<hidden>" : value_json_text,   // a lock PIN (ZR-06)
+                      err ? err : "failed");
     return ok;
 }
 

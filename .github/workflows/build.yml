@@ -88,6 +88,13 @@ jobs:
           path: zhac-wired-core
           command: ${{ matrix.command || 'idf.py build' }}
 
+      # An installed hub keeps the partition table it was flashed with: an app
+      # that outgrows its OTA slot can no longer be installed over the network
+      # (review 2026-10-24 PB-07). Fails past 90 % of the slot.
+      - name: The app image leaves room in its OTA slot
+        working-directory: zhac-wired-core
+        run: ./tools/check_app_fits.sh build
+
       # A line in sdkconfig.defaults can do nothing in two ways, and only one
       # of them is noisy. This job covers the noisy one: unknown symbols, which
       # kconfgen warns about but does not fail on.

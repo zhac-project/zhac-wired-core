@@ -46,6 +46,7 @@ idf_component_register(
         "ws_bridge.cpp"
         "mqtt_glue.cpp"
         "ota_update.cpp"
+        "supervisor.cpp"
         "auth.cpp"
         "api_net.cpp"
         "api_status.cpp"
@@ -68,6 +69,7 @@ idf_component_register(
         esp_timer
         esp_app_format
         nvs_flash
+        esp_partition
         spi_flash
         spiffs
         esp_eth
@@ -78,9 +80,13 @@ idf_component_register(
         esp_https_ota
         esp_http_client
         app_update
+        # ota_update.cpp: how its HTTPS clients judge the server (zhac-components, review HS-11).
+        zap_tls
         # auth.cpp: PSA hashing for the admin password; getpeername for lockout.
         mbedtls
         lwip
+        # auth.cpp: bootloader_random_enable/disable around the first-boot token (review HS-15).
+        bootloader_support
         # IDF v6.0 split the monolithic `driver` component; `driver/gpio.h`
         # now comes from esp_driver_gpio. Requiring `driver` builds but the
         # header is not on the include path.

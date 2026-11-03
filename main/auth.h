@@ -24,9 +24,24 @@ size_t auth_token_copy(char* out, size_t cap);
 bool   auth_rotate_token(char* out, size_t cap); // out >= 33; deauths live WS clients
 bool   auth_check_token(const char* token, int fd);   // WS first-message auth; fd = the socket (failures lock out its peer)
 
+// The cross-site filter (req_filter.h, review 2026-10-24 HS-01). `from_hub_page`
+// is false for a request with a foreign Origin, or a Host that is not the
+// hub's IP address or name. `allowed` applies it only while sign-in is off,
+// when nothing else stands between a web page and the hub; every API route and
+// the WebSocket upgrade use it. Neither answers; callers send the 403 below.
+bool   auth_request_from_hub_page(httpd_req_t* req);
+bool   auth_request_allowed(httpd_req_t* req);
+esp_err_t auth_reply_cross_site(httpd_req_t* req);   // 403 {"error":"cross_site"}
+// True with sign-in off, or when the request carries the API token. A request
+// that sends no key is no guess: only a key that is sent and wrong counts
+// toward its peer's lockout. GET /api/status answers in full only to these
+// (review 2026-10-24 HS-08).
+bool   auth_request_signed_in(httpd_req_t* req);
+
 // Register a route that needs the API token while auth is on: answers 401
-// JSON instead of calling `u->handler`. Use for every route except the
-// public ones (GET /api/status, /api/auth/login, /api/auth/setup, the SPA).
+// JSON instead of calling `u->handler` (403 first if the filter above refuses
+// the request). Use for every route except the public ones (GET /api/status,
+// /api/auth/login, /api/auth/setup, the SPA), which apply the filter themselves.
 esp_err_t auth_register_uri(httpd_handle_t hd, const httpd_uri_t* u);
 
 // POST /api/auth/login and /api/auth/setup (public), /api/auth/password.

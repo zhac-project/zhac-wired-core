@@ -58,6 +58,15 @@ bool dgm_tbl_forget(DgmTable& t, uint64_t ieee) {
     return had;
 }
 
+uint8_t dgm_tbl_prune(DgmTable& t, bool (*paired)(uint64_t ieee)) {
+    uint8_t dropped = 0;
+    for (uint8_t i = 0; i < t.n;) {
+        if (!paired(t.devs[i].ieee)) { dgm_drop(t, i); dropped++; }   // re-check the swapped-in entry
+        else i++;
+    }
+    return dropped;
+}
+
 bool dgm_tbl_remove(DgmTable& t, uint64_t ieee, uint8_t ep, uint16_t gid) {
     for (uint8_t i = 0; i < t.n; i++) {
         DgmEntry& e = t.devs[i];
@@ -182,6 +191,12 @@ bool dgm_set(uint64_t ieee, uint8_t ep, const uint16_t* gids, uint8_t count) {
 }
 bool dgm_forget(uint64_t ieee) {
     return with_table([&](DgmTable& t) { return dgm_tbl_forget(t, ieee) ? dgm_save(t) : true; });
+}
+uint8_t dgm_prune(bool (*paired)(uint64_t ieee)) {
+    return with_table([&](DgmTable& t) -> uint8_t {
+        const uint8_t n = dgm_tbl_prune(t, paired);
+        return n && !dgm_save(t) ? 0 : n;   // 0: nothing went for good
+    });
 }
 uint8_t dgm_list(uint64_t ieee, uint16_t* out, uint8_t max) {
     return with_table([&](DgmTable& t) { return dgm_tbl_list(t, ieee, out, max); });

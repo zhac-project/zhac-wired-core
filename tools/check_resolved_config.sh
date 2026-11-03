@@ -49,6 +49,12 @@ TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
 # built with another offset cannot find its partitions.
 expect CONFIG_PARTITION_TABLE_OFFSET 0xC000 \
     "Moved from 0x8000 to give the bootloader room (see sdkconfig.defaults). An old local sdkconfig keeps 0x8000: delete it or run idf.py reconfigure."
+expect CONFIG_MBEDTLS_HAVE_TIME_DATE y \
+    "TLS certificate dates are checked once the clock is set (review 2026-10-24 HS-11, zhac-components zap_tls). Depends on MBEDTLS_HAVE_TIME: a build that drops it silently drops this too."
+expect CONFIG_APP_COMPILE_TIME_DATE y \
+    "zap_tls refuses any certificate that ended before the firmware's build day (LOW round review M2); without the build date in the app description that floor is off."
+expect CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY "" \
+    "Cross-signed bundle verification hands mbedTLS bundle roots dated year 0; with HAVE_TIME_DATE on, IDF v6.0 then refuses every TLS link once the clock is set (LOW round review M3). Leave it off."
 expect CONFIG_LUA_ENGINE_TASK_STACK_BYTES 32768 \
     "The Lua C-stack limits (zhac-main-core lua_engine/lua_limits.cmake, LUAI_MAXCCALLS=16) are sized for a 32 KB TaskLua. An old local sdkconfig keeps 8192: delete it (or run idf.py set-target) so sdkconfig.defaults applies."
 

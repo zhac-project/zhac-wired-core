@@ -85,8 +85,10 @@ static uint16_t g_new_id = 0;
 struct Upd { uint16_t id; std::string name, dsl; };
 static std::vector<Upd> g_upd;
 static int g_add_calls = 0, g_check_calls = 0;
-bool simple_rules_add(const char*, const char*, uint16_t* out) {
+static bool g_add_enabled = true;
+bool simple_rules_add(const char*, const char*, uint16_t* out, bool enabled) {
     g_add_calls++;
+    g_add_enabled = enabled;
     if (!g_add_ok) return false;
     *out = g_new_id;
     return true;
@@ -468,10 +470,29 @@ static void test_rule_create() {
     q["args"]["dsl"]  = "ON a#b=1 DO log c ENDON";
     g_new_id = 42;
     h_rule_create(1, 5, q);
-    CHECK(one() == R"({"id":5,"ok":true,"data":{"id":42}})", "create answers the new id");
+    CHECK(one() == R"({"id":5,"ok":true,"data":{"id":42,"enabled":true}})" && g_add_enabled,
+          "create answers the new id; a rule is created On by default");
+    q["args"]["enabled"] = false;   // review 2026-10-28 R-08: Off in one step, and the echo says so
     g_new_id = 65535;
     h_rule_create(1, 4294967295u, q);
-    CHECK(one() == R"({"id":4294967295,"ok":true,"data":{"id":65535}})", "largest id and request id fit");
+    CHECK(one() == R"({"id":4294967295,"ok":true,"data":{"id":65535,"enabled":false}})" && !g_add_enabled,
+          "enabled:false creates the rule Off and echoes it; largest ids fit");
+    // Anything but a boolean is refused before a rule exists: `| true` made
+    // 0, "false" or "0" a live rule (fix review S3).
+    const int before_bad = g_add_calls;
+    q["args"]["enabled"] = 0;
+    h_rule_create(1, 9, q);
+    CHECK(one() == R"({"id":9,"ok":false,"err":"enabled must be true or false"})" && g_add_calls == before_bad,
+          "a number for enabled is refused before anything is created");
+    q["args"]["enabled"] = "false";
+    h_rule_create(1, 10, q);
+    CHECK(one() == R"({"id":10,"ok":false,"err":"enabled must be true or false"})" && g_add_calls == before_bad,
+          "a string for enabled is refused too");
+    q["args"]["enabled"] = nullptr;
+    h_rule_create(1, 11, q);
+    CHECK(one() == R"({"id":11,"ok":true,"data":{"id":65535,"enabled":true}})" && g_add_calls == before_bad + 1 &&
+          g_add_enabled, "a null enabled counts as absent: the rule is On");
+    q["args"].remove("enabled");
 
     g_add_ok = false;
     g_last_err = "invalid numeric literal 'x\"y'";

@@ -175,6 +175,11 @@ jobs:
           size=$(stat -c %s zhac-wired-core/build.p4rev3x/spa.pack)
           test "$size" -gt 65536 || { echo "FAIL: build.p4rev3x/spa.pack is only $size bytes" >&2; exit 1; }
           echo "OK: build.p4rev3x/spa.pack $size bytes"
+      # Installed hubs keep their partition table: each hub image must leave
+      # room in its OTA slot (review 2026-10-24 PB-07; fails past 90 %).
+      - name: The hub images leave room in their OTA slot
+        working-directory: zhac-wired-core
+        run: ./tools/check_app_fits.sh build build.s31 build.p4rev3x
 
       - name: Resolved chip config matches main-core
         working-directory: zhac-wired-core

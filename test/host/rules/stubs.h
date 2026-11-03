@@ -40,7 +40,7 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count);
 bool     rule_store_load(uint16_t rule_id, RuleSlot* out);
 
 // simple_rules (harness.cpp: scripted results, and a successful update rewrites the stored slot)
-bool        simple_rules_add(const char* name, const char* dsl, uint16_t* out_rule_id);
+bool        simple_rules_add(const char* name, const char* dsl, uint16_t* out_rule_id, bool enabled = true);
 bool        simple_rules_update(uint16_t rule_id, const char* name, const char* dsl);
 bool        simple_rules_check(const char* dsl, char* err, size_t cap);
 const char* dsl_last_error();

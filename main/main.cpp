@@ -21,6 +21,7 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_psram.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -73,6 +74,7 @@
 #include "simple_rules.h"
 #include "device_cmd.h"
 #include "status_led.h"
+#include "supervisor.h"
 #include "ha_bridge.h"
 #include "spa_serve.h"
 #include "sys_state.h"
@@ -147,6 +149,32 @@ static void task_event_bus(void*) {
     event_bus_pump_run(nullptr);   // sleeps until a publish; never returns
 }
 
+// The 1 MB `zhac_data` NVS partition, where zap_store keeps the device pool
+// and the shadow cache (review 2026-09 WC-04). partitions.csv has it; a hub
+// flashed with the table before gets the same region, unused there,
+// registered at run time, so a network update is enough. IDF refuses a
+// region that overlaps the table or runs past the flash, and the store then
+// stays on nvs. These numbers must match partitions.csv and never change.
+static void data_partition_register() {
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "zhac_data")) return;
+    const esp_err_t e = esp_partition_register_external(nullptr, 0xE40000, 0x100000, "zhac_data",
+                                                        ESP_PARTITION_TYPE_DATA,
+                                                        ESP_PARTITION_SUBTYPE_DATA_NVS, nullptr);
+    if (e == ESP_OK) ESP_LOGI(TAG, "zhac_data registered (partition table without it)");
+    else ESP_LOGE(TAG, "zhac_data not available (%s): the device store stays on nvs", esp_err_to_name(e));
+}
+
+// Pending store writes at any deliberate restart: rules, then the shadow, then
+// the device store (the order the three separate handlers ran in: IDF calls
+// them last-registered first). One handler, not three: IDF has five slots, its
+// clock and Wi-Fi take some, and a registration past the fifth fails (fix
+// review M-5). Each flush returns at once until its store is up.
+static void flush_stores() {
+    rule_store_flush_now();
+    device_shadow_flush_now();
+    zap_store_flush_now();
+}
+
 extern "C" void app_main() {
     ESP_LOGI(TAG, "boot -- zhac-wired-core (%s, wired Ethernet)", CONFIG_IDF_TARGET);
 
@@ -172,6 +200,9 @@ extern "C" void app_main() {
     sys_state_init();
     log_cloud_boot();   // takes the previous run's restart tail out of no-init RAM before the hook writes it
     log_ring_init();   // PSRAM log ring + esp_log vprintf hook (capture early)
+    // Three early crashes in a row: roll back, or boot without the parts that
+    // run other people's input (scripts, MQTT, the cloud link). Review PB-04.
+    const bool safe_mode = ota_update_boot_guard();
 
     log_chip_info();
     log_psram_info();
@@ -187,12 +218,18 @@ extern "C" void app_main() {
     event_bus_init();
     status_led_start();   // the board's RGB LED: green = join open, blue = Zigbee traffic
     heap_mark("status_led");
+    data_partition_register();
     zap_store_init();
+    // Shut, not wiped (PB-01): status says storage_error and Settings offers
+    // the reset, as for an unusable NVS above.
+    if (!zap_store_is_ready()) sys_set_storage_error(true);
     dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
     zap_store_flush_init();
-    esp_register_shutdown_handler(zap_store_flush_now);   // as on the P4: pending device-store writes survive a reboot
+    // Pending device-store writes, rule edits and the attribute states the 5-min
+    // sweep has not written yet all survive a reboot.
+    if (esp_register_shutdown_handler(flush_stores) != ESP_OK)
+        ESP_LOGW(TAG, "no shutdown slot left -- pending store writes are lost at a restart");
     device_shadow_init();
-    esp_register_shutdown_handler(device_shadow_flush_now);   // attr states the 5-min sweep has not written yet
     zhac_adapter_init();
     heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
@@ -237,6 +274,21 @@ extern "C" void app_main() {
     // Re-apply persisted per-device options now that device_shadow and the
     // device pool are up. A no-op while the pool is empty.
     device_options_restore_all();
+    // Group-mirror rows of devices hard-removed before a delete cleared them
+    // (review PB-08) go too -- only when the pool came from a working store,
+    // as the options restore decides.
+    zigbee_pool_lock();
+    const bool pool_trusted = zap_store_is_ready() && pool_count() > 0;
+    zigbee_pool_unlock();
+    if (pool_trusted) {
+        const uint8_t gm_dropped = dgm_prune([](uint64_t ieee) {
+            zigbee_pool_lock();
+            const bool paired = pool_find_by_ieee(ieee) != nullptr;   // a soft-removed device keeps its rows
+            zigbee_pool_unlock();
+            return paired;
+        });
+        if (gm_dropped) ESP_LOGI(TAG, "group mirror: dropped %u row(s) of devices no longer paired", gm_dropped);
+    }
 
     // ── Rules + Lua ──────────────────────────────────────────────────
     // simple_rules first (NVS-backed store + rule cache), then lua_engine
@@ -252,7 +304,6 @@ extern "C" void app_main() {
     rule_store_init();
     rule_store_flush_init();
     grp_store_init();   // groups store mutex, before any server task exists
-    esp_register_shutdown_handler(rule_store_flush_now);
     simple_rules_init();
     // What follows a device rename, in one place: rules re-resolve names and
     // Home Assistant sees the new one (device_cmd cannot call either itself).
@@ -260,7 +311,13 @@ extern "C" void app_main() {
         simple_rules_reload();
         ha_bridge_device_changed(ieee);
     });
-    const bool lua_ok = lua_engine_init();
+    // And what a hard remove must take with it from this core's own stores: the
+    // device's options and its group-mirror rows (review PB-08).
+    device_cmd_set_removed_hook([](uint64_t ieee) {
+        device_options_forget(ieee);
+        dgm_forget(ieee);
+    });
+    const bool lua_ok = !safe_mode && lua_engine_init();
     heap_mark("lua");
     // lua_engine_init() installs the rules' script.run hook itself when it
     // succeeds. Installing it after a failure sent rule actions to a scheduler
@@ -284,11 +341,17 @@ extern "C" void app_main() {
     // every /api/* route still works.
     spa_mount();
 
+    // ota.update + keep a fresh image once it proves healthy. Before the web
+    // server and the cloud link, so no request comes before this boot knows
+    // whether its image is on trial (fix re-review N3).
+    ota_update_init();
+
     // ── HTTP + WS ────────────────────────────────────────────────────
     // ws_server owns the httpd instance; everything else registers against its
     // handle. Unlike mono there is no placeholder "/" handler -- it would
     // shadow the SPA's index, and spa_register()'s catchall already serves "/".
     ws_server_init();
+    ws_server_set_upgrade_filter(auth_request_allowed);   // no WS for other sites' pages (HS-01)
     heap_mark("ws_server");
     httpd_handle_t hd = ws_server_get_handle();
     if (hd) {
@@ -331,18 +394,21 @@ extern "C" void app_main() {
             if (s_remote_evt) xEventGroupSetBits(s_remote_evt, 1 << 3);
         }, nullptr);
 #endif
-    remote_client_init();   // no-op stub when remote disabled; reads NVS
-    heap_mark("remote_client");
-    log_cloud_start();  // the uploader: log.batch / log.tail once the cloud link is ready
+    // Safe mode leaves these unstarted; every call into them is a no-op then.
+    if (!safe_mode) {
+        remote_client_init();   // no-op stub when remote disabled; reads NVS
+        heap_mark("remote_client");
+        log_cloud_start();  // the uploader: log.batch / log.tail once the cloud link is ready
 
-    // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
-    // inbound messages feed rules / Lua / Home Assistant. With no broker
-    // configured it idles. Boots cleanly either way.
-    mqtt_glue_start();
-    heap_mark("mqtt_glue");
-    ota_update_init();   // ota.update + keep a fresh image once it proves healthy
-    metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
+        // MQTT: settings from NVS mqtt_cfg, client starts on Ethernet link-up,
+        // inbound messages feed rules / Lua / Home Assistant. With no broker
+        // configured it idles. Boots cleanly either way.
+        mqtt_glue_start();
+        heap_mark("mqtt_glue");
+    }
+    if (!safe_mode) metrics_mqtt_publisher_start();   // the <root>/bridge/metrics stream, if it is on
     heap_mark("metrics");
+    supervisor_start(hd);   // restarts the hub if the web server or the Zigbee stack stops answering
 
     if (lua_ok) {
         // Safe now: every subsystem a script might call into is initialised.

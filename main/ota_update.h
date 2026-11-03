@@ -11,6 +11,13 @@
 // trial (see ota_update.cpp). Call once the web server and radio are up.
 void ota_update_init();
 
+// Early in app_main (NVS and the log ring up): counts boots that crashed within
+// two minutes of starting. After three in a row it rolls back to the other
+// image when it can (does not return; the old image shows why), else returns
+// true: safe mode, no Lua, MQTT or cloud link this boot (review 2026-10-24 PB-04).
+bool ota_update_boot_guard();
+bool ota_update_safe_mode();
+
 // "pending" while a fresh image is being checked, "verified" once it is kept
 // (or was never on trial), "rolling_back" for the seconds before the reboot.
 const char* ota_update_state();
@@ -18,11 +25,18 @@ const char* ota_update_state();
 // Why the previous update was undone, or nullptr. Cleared when an update starts.
 const char* ota_update_rollback_reason();
 
+// The device store's move to zhac_data could not be marked final yet (storage full?):
+// retried from 5 s backing off to hourly; the old copy stays on nvs until then, and an
+// older version is refused. A restart meanwhile loses nothing while nvs reads back whole
+// (review 2026-10-28 R-03, fix review N4; 2026-10-29 N-05, fix review M-1, M-3, M-4).
+bool ota_update_store_unconfirmed();
+
 // The same flag read straight from NVS, for boot code that runs before ota_update_init() (cloud logs). Set
 // when the health deadline undid an update; it stays set until the next update starts or an image is kept.
 // Reads NVS: main task only.
 bool ota_update_rolled_back();
 
 // False (and `*err` set) when an update is already running or the URL is
-// not https://.
-bool ota_update_start(const char* url, const char** err);
+// not https://. The download is refused (ota.complete with err) when it is not
+// this firmware, or an older release and `allow_older` is false (ota_image.h).
+bool ota_update_start(const char* url, bool allow_older, const char** err);

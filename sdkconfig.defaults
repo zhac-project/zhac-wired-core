@@ -35,6 +35,9 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+# A starved IDLE1 or a hung TaskSupervisor resets the hub instead of only
+# logging (review 2026-10-24 PB-05); main/supervisor.cpp watches the rest.
+CONFIG_ESP_TASK_WDT_PANIC=y
 
 CONFIG_FREERTOS_ISR_STACKSIZE=4192
 # Renamed in IDF v6.0 (was CONFIG_MAIN_TASK_STACK_SIZE; kconfgen still
@@ -76,6 +79,9 @@ CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 # Socket pool: 3 internal httpd + 9 user WS + 2 REST + 2 MQTT = 16.
 CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_HTTPD_WS_SUPPORT=y
+# Lets the cross-site filter refuse a WebSocket upgrade before the 101 (review
+# 2026-10-24 HS-01, ws_server_set_upgrade_filter).
+CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
 
 # Internal EMAC. This is the only Ethernet Kconfig symbol that is real here:
 # the RMII/RGMII interface selection and the REF_CLK direction are runtime
@@ -100,6 +106,9 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 CONFIG_LWIP_TCP_WND_DEFAULT=11520
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# Certificate validity dates (review 2026-10-24 HS-11). zhac-components zap_tls leaves them out until
+# the clock is set (the boards keep no time over a power cut) and checks them from then on.
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 
 # --- Radio ------------------------------------------------------------------
 # No radio in Phase 0. Deliberately absent: CONFIG_ZHAC_NCP_ZNP / _EZSP / _C6.

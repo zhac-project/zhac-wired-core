@@ -141,12 +141,14 @@ bool grp_delete(uint16_t id) {
     // CODEX M-06: propagate NVS failures instead of reporting only the final
     // commit — a failed blob erase or bitmap write otherwise leaves the bitmap
     // and blobs divergent while the call still returns success.
-    esp_err_t err = nvs_erase_key(h, key);
-    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   // already absent — delete is idempotent
+    // The bitmap bit goes first: a power cut before the erase leaves a record
+    // nothing refers to, which the next create of this id overwrites. Record
+    // first left a set bit with no record, and that slot was never handed out
+    // again (review PB-08).
+    esp_err_t err = nvs_set_u32(h, "bmp", grp_get_bmp(h) & ~(1u << (id - 1)));
     if (err == ESP_OK) {
-        uint32_t bmp = grp_get_bmp(h);
-        bmp &= ~(1u << (id - 1));
-        err = nvs_set_u32(h, "bmp", bmp);
+        err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   // already absent — delete is idempotent
     }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -160,8 +162,11 @@ bool grp_find(uint16_t id, GrpRecord& out) {
     char key[8]; grp_key(key, id);
     size_t sz = sizeof(out);
     esp_err_t err = nvs_get_blob(h, key, &out, &sz);
+    // Only a record the bitmap marks is a group (a save or delete cut by a
+    // power loss can leave one it does not), as in grp_load_all.
+    const bool marked = id >= 1 && id <= GRP_MAX_GROUPS && (grp_get_bmp(h) & (1u << (id - 1)));
     nvs_close(h);
-    return err == ESP_OK && out.id == id;
+    return err == ESP_OK && out.id == id && marked;
 }
 
 size_t grp_to_json(const GrpRecord& r, char* buf, size_t cap) {

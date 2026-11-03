@@ -48,6 +48,9 @@ uint8_t dgm_tbl_list(const DgmTable& t, uint64_t ieee, uint16_t* out, uint8_t ma
 bool dgm_tbl_set(DgmTable& t, uint64_t ieee, uint8_t ep, const uint16_t* gids, uint8_t count);
 // Drop a device entirely, every endpoint (on device delete). Returns true iff present.
 bool dgm_tbl_forget(DgmTable& t, uint64_t ieee);
+// Drop every row of a device `paired` says the hub no longer has (hard-removed
+// before a delete cleared its rows, review PB-08). Returns how many rows went.
+uint8_t dgm_tbl_prune(DgmTable& t, bool (*paired)(uint64_t ieee));
 // The pre-endpoint table, every entry on endpoint 1 (what the UI defaulted to).
 void dgm_tbl_from_v1(const DgmTableV1& old, DgmTable& out);
 
@@ -58,6 +61,8 @@ bool    dgm_remove(uint64_t ieee, uint8_t ep, uint16_t gid);
 uint8_t dgm_list(uint64_t ieee, uint16_t* out, uint8_t max);
 bool    dgm_set(uint64_t ieee, uint8_t ep, const uint16_t* gids, uint8_t count);
 bool    dgm_forget(uint64_t ieee);
+// Boot: dgm_tbl_prune on the stored mirror, saved when a row went. Returns how many.
+uint8_t dgm_prune(bool (*paired)(uint64_t ieee));
 
 // ── Global by-gid view (increment 3: the SPA "Groups" tab) ───────────────────
 // Max distinct group ids the global view enumerates in one response.

@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "zap_store.h"
 #include "zigbee_pool.h"
 
 static const char* TAG = "device_options";
@@ -34,6 +35,20 @@ static nvs_handle_t opts_nvs() {
 
 // The whole 64-bit address (device_options_key.h, review F19).
 static void key_for(uint64_t ieee, char out[16]) { opt_key(ieee, out); }
+
+// In the pool; `active` also wants it not soft-removed. Options exist only for
+// such devices (review 2026-10-24 HS-02): every caller -- the web UI, REST,
+// the cloud -- passes an address it was given, and an unknown one used to get
+// a shadow entry and an NVS record that every boot restored, until the table
+// and the 64 KB NVS were full.
+static bool in_pool(uint64_t ieee, bool active) {
+    if (!ieee) return false;
+    zigbee_pool_lock();
+    const ZapDevice* d = pool_find_by_ieee(ieee);
+    const bool ok = d && !(active && zap_dev_is_removed(d));
+    zigbee_pool_unlock();
+    return ok;
+}
 
 // Option ranges. Out of range is refused, not wrapped: a negative throttle
 // used to become 4294967295 ms -- updates suppressed for weeks (review F26).
@@ -92,6 +107,10 @@ static bool apply_opts(uint64_t ieee, const JsonDocument& doc) {
 }
 
 bool device_options_set(uint64_t ieee, const char* json, size_t len) {
+    if (!in_pool(ieee, /*active=*/true)) {
+        ESP_LOGW(TAG, "options for %016llx refused: not a paired device", (unsigned long long)ieee);
+        return false;
+    }
     JsonDocument doc;
     if (deserializeJson(doc, json, len) || !doc.is<JsonObject>()) {
         ESP_LOGW(TAG, "bad options json");
@@ -129,6 +148,14 @@ bool device_options_set(uint64_t ieee, const char* json, size_t len) {
         if (!persisted) ESP_LOGW(TAG, "persist failed for %s", key);
     }
     return applied && persisted;
+}
+
+void device_options_forget(uint64_t ieee) {
+    nvs_handle_t h = opts_nvs();
+    if (!h) return;
+    char key[16];
+    key_for(ieee, key);
+    if (nvs_erase_key(h, key) == ESP_OK) nvs_commit(h);
 }
 
 size_t device_options_get_json(uint64_t ieee, char* out, size_t cap) {
@@ -211,6 +238,19 @@ void device_options_restore_all() {
     if (!h) return;
     migrate_old_keys(h);
 
+    // A record of a device not in the pool is never applied: that made up a
+    // shadow entry (HS-02). It is dropped only when the pool was restored from
+    // a working store (hard-removed, or written for an address that never
+    // joined); an empty pool -- a storage error, a radio backend that never
+    // started -- says nothing, so then it is kept. A soft-removed device keeps
+    // its options for when it rejoins.
+    constexpr int kMaxStale = 32;
+    static char stale[kMaxStale][16];   // static: one boot-time pass on app_main
+    int n_stale = 0;
+    zigbee_pool_lock();
+    const bool prune = zap_store_is_ready() && pool_count() > 0;
+    zigbee_pool_unlock();
+
     nvs_iterator_t it = nullptr;
     esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, kNamespace,
                                  NVS_TYPE_STR, &it);
@@ -219,7 +259,12 @@ void device_options_restore_all() {
         nvs_entry_info_t info;
         nvs_entry_info(it, &info);
         uint64_t ieee = 0;
-        if (opt_key_parse(info.key, &ieee) && ieee) {
+        if (!opt_key_parse(info.key, &ieee) || !ieee) {
+            // not an options key
+        } else if (!in_pool(ieee, /*active=*/false)) {
+            if (prune && n_stale < kMaxStale)
+                std::snprintf(stale[n_stale++], sizeof(stale[0]), "%.15s", info.key);
+        } else {
             char blob[192];
             size_t sz = sizeof(blob);
             if (nvs_get_str(h, info.key, blob, &sz) == ESP_OK) {
@@ -233,5 +278,8 @@ void device_options_restore_all() {
         e = nvs_entry_next(&it);
     }
     if (it) nvs_release_iterator(it);
-    ESP_LOGI(TAG, "restored options for %u device(s)", (unsigned)restored);
+    for (int i = 0; i < n_stale; i++) nvs_erase_key(h, stale[i]);
+    if (n_stale) nvs_commit(h);
+    ESP_LOGI(TAG, "restored options for %u device(s), dropped %d of unknown devices",
+             (unsigned)restored, n_stale);
 }
