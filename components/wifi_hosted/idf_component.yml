@@ -11,20 +11,12 @@
 #
 # esp_wifi_remote only on the P4: IDF 6.1 (the S31's) ships it inside
 # esp_wifi, and the registry copy then registers as an empty component.
-#
-# No esp_hosted with ZHAC_WIFI_NATIVE (S31 on its own radio): its constructor
-# would start the SPI link before app_main. Two traps in that rule:
-# - the component manager (3.0.3) reads `a && b && c` as `a && b` and drops c,
-#   so every group of three is parenthesised;
-# - ZHAC_WIFI_NATIVE exists in sdkconfig only on the S31 with Wi-Fi on (its
-#   prompt is hidden elsewhere, and a hidden n is not written), and a missing
-#   name stops the build, so the P4 half never reaches it.
 dependencies:
   idf: ">=6.0"
   espressif/esp_hosted:
     version: "==2.12.13"
     rules:
-      - if: '(target == "esp32p4" && $CONFIG{ZHAC_WIFI_HOSTED} == True) || (target == "esp32s31" && ($CONFIG{ZHAC_WIFI_HOSTED} == True && $CONFIG{ZHAC_WIFI_NATIVE} == False))'
+      - if: 'target in [esp32p4, esp32s31] && $CONFIG{ZHAC_WIFI_HOSTED} == True'
   espressif/esp_wifi_remote:
     version: ">=0.10,<2.0"
     rules:

@@ -8,9 +8,6 @@
 #   tools/build-p4-wifi-hosted.sh          P4 silicon v1.x -> build.wifi/zhac-wired-p4-wifi.bin
 #   tools/build-p4-wifi-hosted.sh rev3x    P4 silicon v3.x -> build.wifi-rev3x/zhac-wired-p4-rev3x-wifi.bin
 #   tools/build-p4-wifi-hosted.sh s31      ESP32-S31       -> build.wifi-s31/zhac-wired-s31-wifi.bin
-#   tools/build-p4-wifi-hosted.sh s31-native
-#       ESP32-S31, own radio for Wi-Fi, Zigbee on an external ot_rcp (no C5 image)
-#                                          -> build.wifi-s31-native/zhac-wired-s31-wifi-native.bin
 #
 # and, for the two P4 builds, the ESP32-C5 co-processor:
 #   build.c5cp/build/c5-wifi-cp-merged.bin
@@ -42,35 +39,16 @@ elif [ "$1" = s31 ]; then
     B="$ROOT/build.wifi-s31"
     OUT=zhac-wired-s31-wifi.bin
     PREVIEW=--preview   # esp32s31 is still a preview target in IDF 6.1
-elif [ "$1" = s31-native ]; then
-    export IDF_TARGET=esp32s31
-    B="$ROOT/build.wifi-s31-native"
-    OUT=zhac-wired-s31-wifi-native.bin
-    PREVIEW=--preview
 fi
 # IDF also loads <file>.<target> right after each file named here, so the S31
 # picks up sdkconfig.defaults.esp32s31 and sdkconfig.defaults.wifi-hosted.esp32s31.
-if [ "$1" = s31-native ]; then
-    DEFAULTS="$DEFAULTS;$ROOT/sdkconfig.defaults.wifi-native-s31"
-else
-    DEFAULTS="$DEFAULTS;$ROOT/sdkconfig.defaults.wifi-hosted"
-fi
+DEFAULTS="$DEFAULTS;$ROOT/sdkconfig.defaults.wifi-hosted"
 
 hub() {
     idf.py $PREVIEW -C "$ROOT" -B "$B" -D SDKCONFIG="$B/sdkconfig" -D SDKCONFIG_DEFAULTS="$DEFAULTS" "$@"
 }
 hub build
 hub merge-bin -o "$OUT"
-if [ "$1" = s31-native ]; then
-    for c in ZHAC_WIFI_NATIVE=y ZB_RADIO_SPINEL_UART=y LOG_MAXIMUM_LEVEL_VERBOSE=y; do
-        grep -qx "CONFIG_$c" "$B/sdkconfig" || { echo "FAIL: $B/sdkconfig did not resolve $c" >&2; exit 1; }
-    done
-    if grep -q '^CONFIG_ESP_HOSTED' "$B/sdkconfig"; then
-        echo "FAIL: esp_hosted is in the native-Wi-Fi build" >&2; exit 1
-    fi
-    echo "OK: $B/$OUT (Zigbee radio: ot_rcp on UART, not built here)"
-    exit 0
-fi
 grep -qx 'CONFIG_ZHAC_WIFI_HOSTED=y' "$B/sdkconfig" || {
     echo "FAIL: $B/sdkconfig did not resolve ZHAC_WIFI_HOSTED=y" >&2; exit 1; }
 grep -qx 'CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE=y' "$B/sdkconfig" || {

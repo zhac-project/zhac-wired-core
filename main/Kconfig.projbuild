@@ -187,19 +187,7 @@ menu "ZHAC wired-core board"
             rule in main/idf_component.yml; with this off the image has no
             Wi-Fi code at all. Pins and wiring: sdkconfig.defaults.wifi-hosted
             (P4) and sdkconfig.defaults.wifi-hosted.esp32s31 (S31).
-            Build with tools/build-p4-wifi-hosted.sh [rev3x|s31|s31-native].
-
-    # Read by components/wifi_hosted/idf_component.yml, on the S31 only: the
-    # component manager stops on a name missing from sdkconfig, and a hidden
-    # bool left at n is not written there.
-    config ZHAC_WIFI_NATIVE
-        bool "S31: Wi-Fi on the S31's own radio, Zigbee on an external RCP (test)" if ZHAC_WIFI_HOSTED && IDF_TARGET_ESP32S31
-        default n
-        help
-            Test variant S-B: the same Wi-Fi code drives the S31's own radio
-            instead of an ESP-Hosted C5 (no esp_hosted in the image), and
-            Zigbee moves to an ot_rcp radio chip on UART, so the S31's radio
-            does Wi-Fi only. Settings in sdkconfig.defaults.wifi-native-s31.
+            Build with tools/build-p4-wifi-hosted.sh [rev3x|s31].
 
     config ZHAC_TEST_CRASH_CMD
         bool "Test builds only: the debug.crash command"
