@@ -22,7 +22,17 @@
 // serial). A small DNS responder points every name at the hub, so phones show
 // the web UI as a sign-in page (the SPA fallback answers their probe URLs);
 // Settings > WiFi then scans and joins as usual. The AP closes once the hub has
-// held a network for 2 min, and opens at most once per boot.
+// held a network for 2 min, or after 30 min in any case, and opens at most once
+// per boot; once a network has held 2 min, it does not open again until the next
+// boot, so an outage or a jammed Wi-Fi later on opens nothing.
+//
+// Only a fresh hub gets it after 30 s. A hub that is set up (a stored Wi-Fi
+// network, or Ethernet held an address once) keeps retrying its network and
+// opens the AP only after 15 min without any network, as a way back in when
+// the network itself changed. So a power cut where the router boots slower
+// than the hub opens nothing, and the AP never overlaps the 10-min password
+// set-up window on a set-up hub. `ap_disabled` (sys_state) keeps it shut
+// (review 2026-11-09 WN-01, WN-02).
 //
 // Every call goes to the esp_wifi_remote_* twin and every event arrives on
 // WIFI_REMOTE_EVENT. On the P4, which has no radio, the plain esp_wifi_*
@@ -48,6 +58,7 @@
 #include "ntp_cfg.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "zap_setup_window.h"
 #include "zhac_task.h"
 
 #include <cstdio>
@@ -63,8 +74,26 @@ static constexpr int kRoutePrio = 20;
 static constexpr uint32_t kRetryMs = 5000;
 static constexpr EventBits_t kRetryBit   = BIT0;
 static constexpr EventBits_t kRestartBit = BIT1;   // the co-processor booted
-static constexpr TickType_t kApAfter = pdMS_TO_TICKS(30 * 1000);    // no network this long -> AP
-static constexpr TickType_t kApGrace = pdMS_TO_TICKS(120 * 1000);   // network held this long -> AP off
+
+// ap-policy begin -- cut out by test/host/ap_policy/run.sh
+static constexpr uint32_t kApAfterMs      = 30 * 1000;        // fresh hub: no network this long -> AP
+static constexpr uint32_t kApAfterSetUpMs = 15 * 60 * 1000;   // set-up hub: only after this long
+static constexpr uint32_t kApGraceMs      = 120 * 1000;       // network held this long -> AP off
+static constexpr uint32_t kApMaxMs        = 30 * 60 * 1000;   // AP off after this, used or not
+
+// +1 open the AP, -1 close it, 0 leave it. down_ms / up_ms: how long the hub
+// has been without / with a network (0 while the other holds); open_ms: how
+// long the AP has been up. settled: a network has held kApGraceMs this boot,
+// after which a lost network (an outage, a jammed Wi-Fi) opens nothing until
+// the next boot.
+static int ap_step(bool ap_up, bool disabled, bool set_up, bool settled, uint32_t down_ms, uint32_t up_ms,
+                   uint32_t open_ms) {
+    if (!ap_up) return !disabled && !settled && down_ms >= (set_up ? kApAfterSetUpMs : kApAfterMs) ? 1 : 0;
+    return disabled || up_ms >= kApGraceMs || open_ms >= kApMaxMs ? -1 : 0;
+}
+// ap-policy end
+static_assert(kApAfterSetUpMs > kZapSetupWindowS * 1000u,
+              "a set-up hub's AP must not open inside the password set-up window");
 
 #if CONFIG_ESP_WIFI_ENABLED
 // ── S31: Wi-Fi remote beside a native radio ─────────────────────────
@@ -134,6 +163,8 @@ static volatile bool s_connected = false;
 static volatile bool s_warned    = false;   // one log line per failure streak
 static char s_ssid[33] = {};
 static char s_pass[65] = {};
+static bool s_eth_seen = false;             // Ethernet held an address once (NVS, never cleared)
+static bool (*s_ap_disabled)() = nullptr;   // sys_ap_disabled, read at every decision
 
 static void load_creds() {
     nvs_handle_t h;
@@ -142,6 +173,17 @@ static void load_creds() {
     if (nvs_get_str(h, "ssid", s_ssid, &n) != ESP_OK) s_ssid[0] = '\0';
     n = sizeof(s_pass);
     if (nvs_get_str(h, "pass", s_pass, &n) != ESP_OK) s_pass[0] = '\0';
+    uint8_t eth = 0;
+    s_eth_seen = nvs_get_u8(h, "eth_seen", &eth) == ESP_OK && eth;
+    nvs_close(h);
+}
+
+// Once per hub: from then on it counts as set up, cable or not.
+static void remember_eth() {
+    s_eth_seen = true;
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_u8(h, "eth_seen", 1) == ESP_OK) nvs_commit(h);
     nvs_close(h);
 }
 
@@ -204,8 +246,7 @@ static void on_ip(void*, esp_event_base_t, int32_t id, void* data) {
 }
 
 // ── Setup access point ──────────────────────────────────────────────
-static bool has_uplink() {
-    if (s_connected) return true;
+static bool eth_has_ip() {
     esp_netif_t* eth = esp_netif_get_handle_from_ifkey("ETH_DEF");
     esp_netif_ip_info_t ip{};
     return eth && esp_netif_is_netif_up(eth) &&
@@ -292,11 +333,10 @@ static void ap_open() {
     }
 }
 
-static void ap_close() {
+static void ap_close(const char* why) {
     s_ap = false;   // dns_task sees it within a second
     esp_wifi_remote_set_mode(WIFI_MODE_STA);   // the station stays joined
-    ESP_LOGI(TAG, "network held for %u s -- access point closed",
-             (unsigned)(pdTICKS_TO_MS(kApGrace) / 1000));
+    ESP_LOGI(TAG, "access point closed (%s) -- not again until the next boot", why);
 }
 
 // ── Co-processor (re)start ──────────────────────────────────────────
@@ -365,12 +405,12 @@ static void wifi_task(void*) {
     s_first_try_done = true;
 
     // Once a second: redo the set-up after a co-processor restart, retry the
-    // station when asked, and decide the setup AP -- opened once if there is
-    // no network kApAfter after Wi-Fi first started, closed after the network
-    // has held for kApGrace.
-    TickType_t started = s_ready ? xTaskGetTickCount() : 0;
-    TickType_t up_since = 0;
-    bool ap_decided = false;
+    // station when asked, and decide the setup AP (ap_step above), counting
+    // from the moment Wi-Fi first started. Since-stamps use 0 for "not now".
+    bool started = s_ready;
+    TickType_t down_since = 0, up_since = 0, opened = 0;
+    bool ap_done = false;   // the AP opens at most once per boot
+    bool settled = false;   // a network held kApGraceMs this boot
     for (;;) {
         const EventBits_t bits = xEventGroupWaitBits(s_evt, kRetryBit | kRestartBit, pdTRUE, pdFALSE,
                                                      pdMS_TO_TICKS(1000));
@@ -380,24 +420,36 @@ static void wifi_task(void*) {
             vTaskDelay(pdMS_TO_TICKS(kRetryMs));
             if (s_ready && s_ssid[0] && !s_connected) esp_wifi_remote_connect();
         }
-        if (!started && s_ready) started = xTaskGetTickCount() | 1;   // 0 means "not yet"
-        if (!started || ap_decided) continue;
+        const bool eth = eth_has_ip();
+        if (eth && !s_eth_seen) remember_eth();
+        started = started || s_ready;
+        if (!started || ap_done) continue;
         const TickType_t now = xTaskGetTickCount();
-        if (!s_ap) {
-            if (now - started < kApAfter) continue;
-            if (has_uplink()) ap_decided = true;
-            else              ap_open();
-            if (!s_ap) ap_decided = true;   // uplink, or the AP failed: no second try
-            continue;
+        if (s_connected || eth) { down_since = 0; if (!up_since) up_since = now | 1; }
+        else                    { up_since = 0; if (!down_since) down_since = now | 1; }
+        const auto held = [now](TickType_t since) {
+            return since ? static_cast<uint32_t>(pdTICKS_TO_MS(now - since)) : 0u;
+        };
+        settled = settled || held(up_since) >= kApGraceMs;
+        const bool disabled = s_ap_disabled && s_ap_disabled();
+        const int step = ap_step(s_ap, disabled, s_ssid[0] || s_eth_seen, settled, held(down_since),
+                                 held(up_since), held(opened));
+        if (step > 0) {
+            ap_open();
+            opened = now | 1;
+            if (!s_ap) ap_done = true;   // the AP failed: no second try
+        } else if (step < 0) {
+            ap_close(disabled                      ? "turned off in settings"
+                     : held(up_since) >= kApGraceMs ? "network held"
+                                                    : "open too long");
+            ap_done = true;
         }
-        if (!has_uplink())                     up_since = 0;
-        else if (!up_since)                    up_since = now | 1;   // 0 means "down"
-        else if (now - up_since >= kApGrace) { ap_close(); ap_decided = true; }
     }
 }
 
-void wifi_hosted_start() {
+void wifi_hosted_start(bool (*ap_disabled)()) {
     if (s_evt) return;   // idempotent
+    s_ap_disabled = ap_disabled;
     s_evt = xEventGroupCreate();
     load_creds();
 

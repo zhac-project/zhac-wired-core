@@ -11,7 +11,9 @@
 // Call once after eth_start() (esp_netif and the event loop exist by then).
 // Brings the station up on its own task and returns at once: a missing or
 // silent co-processor logs an error and leaves Wi-Fi off, never stalls boot.
-void wifi_hosted_start();
+// `ap_disabled` (may be null) is asked before the setup access point opens and
+// while it is up; true keeps it shut.
+void wifi_hosted_start(bool (*ap_disabled)());
 
 struct WifiStatus {
     bool   ready;        // co-processor answered, station started
