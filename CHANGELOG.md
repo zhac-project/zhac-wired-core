@@ -13,6 +13,14 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **A power cut no longer opens the setup access point on a hub that is already set up** (`wifi_hosted`, review 2026-11-09 WN-01, WN-02).
+  - **Before:** the open setup AP came up 30 s after boot whenever no network was up yet, so a router that booted slower than the hub left it open. The "Disable AP" setting was ignored on wired builds.
+  - **Fresh hub:** still opens the AP after 30 s without a network.
+  - **Set-up hub** (Wi-Fi saved, or Ethernet seen once, kept in NVS): opens it only after 15 min without a network, as a way back in after a router change.
+  - **Closing:** the AP closes once a network has held for 2 min, or after 30 min in any case. It opens at most once per boot, and never after a network has held 2 min in that boot, so a later outage or a jammed Wi-Fi opens nothing (power-cycle the hub to get it back after a router change).
+  - **"Disable AP":** keeps the AP shut, and closes it if open.
+  - Host test: `test/host/ap_policy/run.sh`.
+
 - **A build with certificate dates off now fails** (review 2026-11-03 K-04). `sdkconfig.defaults` turns on `CONFIG_MBEDTLS_HAVE_TIME_DATE` (a764fb8), but menuconfig or a custom sdkconfig could turn it off again, and `check_resolved_config.sh` runs only in CI and the build scripts. `ota_update.cpp` now stops every such build with an error, so no image ships that accepts expired certificates.
 - **Lua's `telegram_*` say plainly that this hub has no Telegram gateway** (`tg_gw_stub`, review 2026-10-28). The P4 build linked the dual-chip half, whose HAP send to nowhere failed with a HAP error; the stub now answers on every target (false, and a log line). The cloud's Telegram bot is the way to Telegram from a wired hub. The P4 image is 3.8 KB smaller.
 - **`rule.create` can create a rule Off** (`ws_bridge`, `api_rules`, review 2026-10-28 R-08). Optional `enabled` (absent or null: On; anything but a boolean is refused); the answer echoes `"enabled"`. `POST /api/rules` takes it too. The new capability `rules.v2` (next to `rules.v1`) tells the cloud before it sends, so it can create a rule Off in one step, or refuse to on older firmware rather than create it live.
