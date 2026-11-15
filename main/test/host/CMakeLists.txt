@@ -44,3 +44,10 @@ add_test(NAME log_cloud_core COMMAND log_cloud_core_tests)
 add_executable(req_filter_tests test_req_filter.cpp)
 target_include_directories(req_filter_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 add_test(NAME req_filter COMMAND req_filter_tests)
+
+# Hub pin configuration: PUT /api/io validation, defaults, lookups (spec 2026-11-15 GPIO control).
+add_executable(user_io_config_tests test_user_io_config.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../user_io_config.cpp)
+target_include_directories(user_io_config_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    "${ZHAC_COMPONENTS}/components/arduinojson/src")
+add_test(NAME user_io_config COMMAND user_io_config_tests)
