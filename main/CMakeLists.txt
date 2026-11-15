@@ -57,6 +57,10 @@ idf_component_register(
         "api_scripts.cpp"
         "api_system.cpp"
         "status_led.cpp"
+        "user_io_config.cpp"
+        "user_io.cpp"
+        "api_io.cpp"
+        "lua_io.cpp"
     INCLUDE_DIRS "."
     # Moves zhc_adapter's ~105 KB of lookup-table .bss to PSRAM. Without it the
     # esp32s31 build has too little internal DRAM left for EMAC DMA descriptors
@@ -91,6 +95,9 @@ idf_component_register(
         # now comes from esp_driver_gpio. Requiring `driver` builds but the
         # header is not on the include path.
         esp_driver_gpio
+        # user_io.cpp: the owner's pins (PWM, ADC; WS2812 through led_strip).
+        esp_driver_ledc
+        esp_adc
         mdns
         # -- local components/ --------------------------------------------
         hap_master

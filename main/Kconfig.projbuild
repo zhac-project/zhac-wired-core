@@ -189,6 +189,21 @@ menu "ZHAC wired-core board"
             (P4) and sdkconfig.defaults.wifi-hosted.esp32s31 (S31).
             Build with tools/build-p4-wifi-hosted.sh [rev3x|s31].
 
+    config ZHAC_IO_PINS
+        string "GPIOs the owner may configure (Settings > I/O)"
+        default "21,22,23,26,27,45,46,47,48,53" if IDF_TARGET_ESP32P4 && ZHAC_WIFI_HOSTED
+        default "2,3,4,5,20,21,22,23,26,27,32,33,45,46,47,48,53" if IDF_TARGET_ESP32P4
+        default "2,3,4,35,36,37,38,39,40,42,43,44,45,46,48,49" if IDF_TARGET_ESP32S31 && ZHAC_WIFI_HOSTED
+        default "2,3,4,20,21,22,23,24,25,35,36,37,38,39,40,42,43,44,45,46,47,48,49" if IDF_TARGET_ESP32S31
+        default ""
+        help
+            Comma list. Only these pins can be set to out/pwm/in/adc/strip on
+            the hub page, and only configured pins can be touched by rules, Lua,
+            the cloud or Home Assistant. Pins this build uses itself (Ethernet,
+            radio UART/reset, status LED, ESP-Hosted SPI, console) and pins IDF
+            reserves (flash, PSRAM, USB) are dropped at boot whatever this says.
+            Defaults leave out every pin not verified free on the board schematics.
+
     config ZHAC_TEST_CRASH_CMD
         bool "Test builds only: the debug.crash command"
         default n

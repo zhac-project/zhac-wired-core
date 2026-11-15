@@ -11,6 +11,10 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Added
+
+- **Hub pins (GPIO control).** Settings › I/O (`GET`/`PUT /api/io`) configures up to 16 free pins as `out`, `pwm`, `in`, `adc` or `strip` (WS2812). Only configured pins can be used, by rules (`gpio.set`, `gpio.toggle`, `pwm.set`), Lua (`zhac.gpio_write`, `gpio_toggle`, `gpio_read`, `pwm_write`, `adc_read`, `ws_write`), the hub page, the cloud and Home Assistant. They show as one **Hub I/O** device whose attributes are the pin names: outputs and PWM are writable, inputs (debounced) and ADC readings (every `interval` s, when moved by `delta`) are published and work as rule triggers. Outputs can start `off`, `on` or at their `last` level after a restart. The pins offered come from `CONFIG_ZHAC_IO_PINS` (per board, narrower on Wi-Fi co-processor builds) minus every pin the build uses itself. Zigbee-only commands (bind, configure, re-interview, groups) refuse the Hub I/O device; the bind-repair pass and a Zigbee reset leave it alone. Docs: zhac-docs `GPIO.md`.
+
 ### Fixed
 
 - **A power cut no longer opens the setup access point on a hub that is already set up** (`wifi_hosted`, review 2026-11-09 WN-01, WN-02).

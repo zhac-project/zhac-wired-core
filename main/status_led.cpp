@@ -9,12 +9,14 @@
 #if CONFIG_ZHAC_STATUS_LED_GPIO >= 0
 
 #include <cstdint>
+#include <cstring>
 
 #include "device_cmd.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "event_bus.h"
 #include "led_strip.h"
+#include "user_io.h"
 
 static const char* TAG = "status_led";
 
@@ -52,7 +54,12 @@ void on_tick(void*) {
     show(0, 0, 0);
 }
 
-void on_traffic(const Event&) { s_flash_until_ms = now_ms() + kFlashMs; }
+void on_traffic(const Event& e) {
+    uint64_t ieee;
+    std::memcpy(&ieee, e.data, sizeof(ieee));   // every subscribed payload starts with the ieee
+    if (ieee == kHubIoIeee) return;              // the hub's own pins are not radio traffic
+    s_flash_until_ms = now_ms() + kFlashMs;
+}
 
 }  // namespace
 

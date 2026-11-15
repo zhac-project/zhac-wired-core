@@ -17,6 +17,7 @@
 // dispatch() — the same shape is used by net-core's full WS bridge,
 // so SPA code that targets net-core sees identical wire formats.
 
+#include "user_io.h"
 #include "ws_bridge.h"
 #include "edit_lock.h"
 #include "ws_server.h"
@@ -676,6 +677,7 @@ static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
         o["lqi"]          = d.link_quality;
         o["battery"]      = d.battery_pct;
         o["ep_count"]     = d.endpoint_count;
+        if (d.protocol == PROTO_LOCAL) o["local"] = true;   // Hub I/O: UIs hide the Zigbee buttons
     }
     zigbee_pool_unlock();
 
@@ -742,6 +744,7 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
     D["lqi"]         = dev->link_quality;
     D["bat_pct"]     = dev->battery_pct;
     D["ep_count"]    = dev->endpoint_count;
+    if (dev->protocol == PROTO_LOCAL) D["local"] = true;
 
     JsonArray eps = D["eps"].to<JsonArray>();
     for (uint8_t i = 0; i < dev->endpoint_count && i < 8; i++) {
@@ -1766,6 +1769,15 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         return;
     }
     if (std::strcmp(cmd, "auth")               == 0) { reply_ok_or_err(fd, id, true, nullptr); return; }
+    // The Hub I/O device has no radio: Zigbee-only commands refuse it (spec §2).
+    static constexpr const char* kZigbeeOnly[] = {"device.bind", "device.reinterview", "device.configure",
+                                                  "device.groups.add", "device.groups.remove", "device.groups.refresh"};
+    for (const char* z : kZigbeeOnly) {
+        if (std::strcmp(cmd, z) == 0 && parse_ieee(doc["args"]["ieee"] | "") == kHubIoIeee) {
+            send_err(fd, id, "hub I/O device: not a Zigbee device");
+            return;
+        }
+    }
     if (std::strcmp(cmd, "ping")               == 0) { cmd_ping(fd, id);   return; }
     if (std::strcmp(cmd, "status")             == 0) { cmd_status(fd, id); return; }
     if (std::strcmp(cmd, "status.get")         == 0) { cmd_status(fd, id); return; }

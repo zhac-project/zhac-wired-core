@@ -706,7 +706,8 @@ static uint16_t forget_all_devices() {
     for (; n <= ZAP_MAX_DEVICES; n++) {   // bound: a record that would not go
         uint64_t ieee = 0;
         zigbee_pool_lock();
-        for (uint16_t i = 0; i < pool_count() && !ieee; i++) ieee = pool_all()[i].ieee_addr;
+        for (uint16_t i = 0; i < pool_count() && !ieee; i++)   // Hub I/O goes with its pin config, not here
+            if (pool_all()[i].protocol != PROTO_LOCAL) ieee = pool_all()[i].ieee_addr;
         zigbee_pool_unlock();
         if (!ieee) break;
         zb_interview_forget(ieee);
@@ -783,7 +784,7 @@ static void coordinator_rebind_once() {
     ZapDevice* all = pool_all();
     for (uint16_t i = 0; i < pool_count() && n < ZAP_MAX_DEVICES; i++) {
         ZapDevice& d = all[i];
-        if (zap_dev_is_removed(&d) ||
+        if (zap_dev_is_removed(&d) || d.protocol == PROTO_LOCAL ||   // Hub I/O: no binds
             d.support_state != static_cast<uint8_t>(SupportState::MATCHED)) continue;
         d.configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
         d.configure_attempts = 0;

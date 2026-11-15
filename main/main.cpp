@@ -48,6 +48,8 @@
 #include "api_net.h"
 #include "api_remote.h"
 #include "api_rules.h"
+#include "api_io.h"
+#include "user_io.h"
 #include "api_scripts.h"
 #include "api_status.h"
 #include "api_system.h"
@@ -236,6 +238,9 @@ extern "C" void app_main() {
     zhac_adapter_init();
     heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
+    // The owner's pins: boot levels now, hooks before simple_rules/lua_engine load.
+    user_io_early_init();
+    lua_io_register();
 
     // ── Radio ────────────────────────────────────────────────────────
     // Registers esp-zigbee-lib as a DeviceBackend, then brings the stack up
@@ -268,6 +273,7 @@ extern "C" void app_main() {
     // hours after a reboot or a firmware flash. main-core has always done this;
     // this SKU never inherited the call, for the same reason it never inherited
     // the pool init and the shadow sink: they all live inside zigbee_mgr_init().
+    user_io_attach_device();   // the Hub I/O device: after the pool restore, before its shadow
     zigbee_pool_lock();
     const uint16_t shadow_n =
         device_shadow_restore_from_pool(pool_all(), pool_count());
@@ -367,6 +373,7 @@ extern "C" void app_main() {
         api_devices_register(hd);
         api_net_register(hd);      // replaces mono's api_wifi_register
         api_rules_register(hd);
+        api_io_register(hd);
         api_scripts_register(hd);
         api_system_register(hd);
         api_groups_register(hd);
@@ -422,6 +429,7 @@ extern "C" void app_main() {
         lua_engine_load_all();
         ESP_LOGI(TAG, "lua_engine: scripts loaded");
     }
+    user_io_start();   // pin values onto the Hub I/O device, then input/ADC polling
 
     // Start the pump LAST: every service its subscribers reach (ws_server,
     // remote_client, mqtt) is initialised, so a drained event cannot call into
