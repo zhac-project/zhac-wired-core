@@ -44,8 +44,10 @@ struct UserIoCaps {
 // Parses and validates a whole config ({"pins":[...]}); fields left out take
 // the defaults, unknown fields are ignored. False with the first problem in
 // `err` ("row 2: gpio 21 is used twice"); `out` is then unspecified.
+// skip_bad_rows (the stored config at boot): a row this build refuses is dropped
+// and the rest kept; `err` names the first dropped row, "" when none was.
 bool user_io_cfg_from_json(const char* json, size_t len, const UserIoCaps& caps,
-                           UserIoConfig* out, char* err, size_t cap);
+                           UserIoConfig* out, char* err, size_t cap, bool skip_bad_rows = false);
 
 // One pin's config fields as a JSON object (no runtime state). Bytes written, 0 if it did not fit.
 size_t user_io_cfg_pin_json(const UserIoPin& p, char* buf, size_t cap);
@@ -59,5 +61,9 @@ bool user_io_parse_level(const char* s, bool* on);
 
 // "2, 3,4" -> {2,3,4}: the Kconfig pin list. Entries that are not 0-63 are skipped. Returns the count.
 uint8_t user_io_parse_pins(const char* csv, uint8_t* out, uint8_t cap);
+
+// Same pin with the same hardware setup (gpio, mode, invert, pull, freq, leds): a
+// config save keeps it running as it is. Name, boot and ADC publishing are not hardware.
+bool user_io_pin_same_hw(const UserIoPin& a, const UserIoPin& b);
 
 const char* user_io_mode_name(UserIoMode m);

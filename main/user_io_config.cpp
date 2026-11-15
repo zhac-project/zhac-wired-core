@@ -59,8 +59,71 @@ const char* user_io_mode_name(UserIoMode m) {
     return i < sizeof(kModes) / sizeof(kModes[0]) ? kModes[i] : "?";
 }
 
+// One row, checked against the caps and the rows already taken. False with the reason in `err`.
+static bool parse_row(JsonVariantConst item, unsigned row, const UserIoCaps& caps, const UserIoConfig& sofar,
+                      UserIoPin* out, char* err, size_t cap) {
+    JsonObjectConst o = item.as<JsonObjectConst>();
+    if (o.isNull()) { std::snprintf(err, cap, "row %u: not an object", row); return false; }
+    UserIoPin& p = *out;
+    p = UserIoPin{};
+
+    JsonVariantConst g = o["gpio"];
+    if (!g.is<long>() || g.as<long>() < 0 || g.as<long>() > 63) {
+        std::snprintf(err, cap, "row %u: gpio must be a number", row);
+        return false;
+    }
+    p.gpio = static_cast<uint8_t>(g.as<long>());
+    bool allowed = false;
+    for (uint8_t i = 0; i < caps.n_allowed; i++) allowed |= caps.allowed[i] == p.gpio;
+    if (!allowed) { std::snprintf(err, cap, "row %u: gpio %u is not allowed on this hub", row, p.gpio); return false; }
+
+    const int mode = o["mode"].is<const char*>() ? word_index(o["mode"].as<const char*>(), kModes) : -1;
+    if (mode < 0) { std::snprintf(err, cap, "row %u: mode must be out, pwm, in, adc or strip", row); return false; }
+    p.mode = static_cast<UserIoMode>(mode);
+    if (p.mode == UserIoMode::ADC && !(caps.adc_mask & (1ULL << p.gpio))) {
+        std::snprintf(err, cap, "row %u: gpio %u has no ADC", row, p.gpio);
+        return false;
+    }
+
+    const char* name = o["name"].is<const char*>() ? o["name"].as<const char*>() : nullptr;
+    if (!name_ok(name)) {
+        std::snprintf(err, cap, "row %u: name must be a letter, then up to 14 of a-z 0-9 _", row);
+        return false;
+    }
+    std::snprintf(p.name, sizeof(p.name), "%s", name);
+
+    JsonVariantConst inv = o["invert"];
+    if (!inv.isNull() && !inv.is<bool>()) { std::snprintf(err, cap, "row %u: invert must be true or false", row); return false; }
+    p.invert = inv.as<bool>();
+
+    int w = 0;
+    if (!word_field(o, "pull", kPulls, &w)) { std::snprintf(err, cap, "row %u: pull must be none, up or down", row); return false; }
+    p.pull = static_cast<UserIoPull>(w);
+    if (!word_field(o, "boot", kBoots, &w)) { std::snprintf(err, cap, "row %u: boot must be off, on or last", row); return false; }
+    p.boot = static_cast<UserIoBoot>(w);
+
+    long x = 0;
+    if (!int_field(o, "freq", 1, 40000, 1000, &x)) { std::snprintf(err, cap, "row %u: freq must be 1-40000", row); return false; }
+    p.freq = static_cast<uint32_t>(x);
+    if (!int_field(o, "interval", 0, 3600, 5, &x)) { std::snprintf(err, cap, "row %u: interval must be 0-3600", row); return false; }
+    p.interval = static_cast<uint16_t>(x);
+    if (!int_field(o, "delta", 0, 4095, 50, &x)) { std::snprintf(err, cap, "row %u: delta must be 0-4095", row); return false; }
+    p.delta = static_cast<uint16_t>(x);
+    if (!int_field(o, "leds", 1, 1024, 30, &x)) { std::snprintf(err, cap, "row %u: leds must be 1-1024", row); return false; }
+    p.leds = static_cast<uint16_t>(x);
+
+    for (uint8_t i = 0; i < sofar.count; i++) {
+        if (sofar.pins[i].gpio == p.gpio) { std::snprintf(err, cap, "row %u: gpio %u is used twice", row, p.gpio); return false; }
+        if (std::strcmp(sofar.pins[i].name, p.name) == 0) {
+            std::snprintf(err, cap, "row %u: name '%s' is used twice", row, p.name);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool user_io_cfg_from_json(const char* json, size_t len, const UserIoCaps& caps,
-                           UserIoConfig* out, char* err, size_t cap) {
+                           UserIoConfig* out, char* err, size_t cap, bool skip_bad_rows) {
     JsonDocument doc;
     if (!json || deserializeJson(doc, json, len) || !doc["pins"].is<JsonArrayConst>()) {
         std::snprintf(err, cap, "body must be {\"pins\":[...]}");
@@ -72,64 +135,18 @@ bool user_io_cfg_from_json(const char* json, size_t len, const UserIoCaps& caps,
         return false;
     }
     *out = UserIoConfig{};
+    if (cap) err[0] = '\0';
     unsigned row = 0;
+    bool dropped = false;
     for (JsonVariantConst item : arr) {
         row++;
-        JsonObjectConst o = item.as<JsonObjectConst>();
-        if (o.isNull()) { std::snprintf(err, cap, "row %u: not an object", row); return false; }
         UserIoPin p{};
-
-        JsonVariantConst g = o["gpio"];
-        if (!g.is<long>() || g.as<long>() < 0 || g.as<long>() > 63) {
-            std::snprintf(err, cap, "row %u: gpio must be a number", row);
-            return false;
-        }
-        p.gpio = static_cast<uint8_t>(g.as<long>());
-        bool allowed = false;
-        for (uint8_t i = 0; i < caps.n_allowed; i++) allowed |= caps.allowed[i] == p.gpio;
-        if (!allowed) { std::snprintf(err, cap, "row %u: gpio %u is not allowed on this hub", row, p.gpio); return false; }
-
-        const int mode = o["mode"].is<const char*>() ? word_index(o["mode"].as<const char*>(), kModes) : -1;
-        if (mode < 0) { std::snprintf(err, cap, "row %u: mode must be out, pwm, in, adc or strip", row); return false; }
-        p.mode = static_cast<UserIoMode>(mode);
-        if (p.mode == UserIoMode::ADC && !(caps.adc_mask & (1ULL << p.gpio))) {
-            std::snprintf(err, cap, "row %u: gpio %u has no ADC", row, p.gpio);
-            return false;
-        }
-
-        const char* name = o["name"].is<const char*>() ? o["name"].as<const char*>() : nullptr;
-        if (!name_ok(name)) {
-            std::snprintf(err, cap, "row %u: name must be a letter, then up to 14 of a-z 0-9 _", row);
-            return false;
-        }
-        std::snprintf(p.name, sizeof(p.name), "%s", name);
-
-        JsonVariantConst inv = o["invert"];
-        if (!inv.isNull() && !inv.is<bool>()) { std::snprintf(err, cap, "row %u: invert must be true or false", row); return false; }
-        p.invert = inv.as<bool>();
-
-        int w = 0;
-        if (!word_field(o, "pull", kPulls, &w)) { std::snprintf(err, cap, "row %u: pull must be none, up or down", row); return false; }
-        p.pull = static_cast<UserIoPull>(w);
-        if (!word_field(o, "boot", kBoots, &w)) { std::snprintf(err, cap, "row %u: boot must be off, on or last", row); return false; }
-        p.boot = static_cast<UserIoBoot>(w);
-
-        long x = 0;
-        if (!int_field(o, "freq", 1, 40000, 1000, &x)) { std::snprintf(err, cap, "row %u: freq must be 1-40000", row); return false; }
-        p.freq = static_cast<uint32_t>(x);
-        if (!int_field(o, "interval", 0, 3600, 5, &x)) { std::snprintf(err, cap, "row %u: interval must be 0-3600", row); return false; }
-        p.interval = static_cast<uint16_t>(x);
-        if (!int_field(o, "delta", 0, 4095, 50, &x)) { std::snprintf(err, cap, "row %u: delta must be 0-4095", row); return false; }
-        p.delta = static_cast<uint16_t>(x);
-        if (!int_field(o, "leds", 1, 1024, 30, &x)) { std::snprintf(err, cap, "row %u: leds must be 1-1024", row); return false; }
-        p.leds = static_cast<uint16_t>(x);
-
-        for (uint8_t i = 0; i < out->count; i++) {
-            if (out->pins[i].gpio == p.gpio) { std::snprintf(err, cap, "row %u: gpio %u is used twice", row, p.gpio); return false; }
-            if (std::strcmp(out->pins[i].name, p.name) == 0) {
-                std::snprintf(err, cap, "row %u: name '%s' is used twice", row, p.name);
-                return false;
-            }
+        char e[96];
+        if (!parse_row(item, row, caps, *out, &p, e, sizeof(e))) {
+            if (!skip_bad_rows) { std::snprintf(err, cap, "%s", e); return false; }
+            if (!dropped) std::snprintf(err, cap, "%s", e);
+            dropped = true;
+            continue;
         }
         out->pins[out->count++] = p;
     }
@@ -144,6 +161,11 @@ size_t user_io_cfg_pin_json(const UserIoPin& p, char* buf, size_t cap) {
         kPulls[static_cast<size_t>(p.pull) % 3], kBoots[static_cast<size_t>(p.boot) % 3],
         static_cast<unsigned long>(p.freq), p.interval, p.delta, p.leds);
     return (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+}
+
+bool user_io_pin_same_hw(const UserIoPin& a, const UserIoPin& b) {
+    return a.gpio == b.gpio && a.mode == b.mode && a.invert == b.invert && a.pull == b.pull &&
+           a.freq == b.freq && a.leds == b.leds;
 }
 
 int user_io_cfg_find(const UserIoConfig& c, const char* ref) {

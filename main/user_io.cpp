@@ -209,18 +209,18 @@ int32_t last_value(uint8_t gpio) {
     return 0;
 }
 
-// Caller holds s_mu.
-void save_last_locked() {
-    LastRec recs[kUserIoMaxPins];
+// Caller holds s_mu. The `last` records of the current config, also kept as s_last;
+// the caller writes them to NVS after unlocking (a flash write must not stall pin writes).
+uint8_t collect_last_locked(LastRec* recs) {
     uint8_t n = 0;
     for (uint8_t i = 0; i < s_cfg.count; i++) {
         const UserIoPin& p = s_cfg.pins[i];
         if (p.boot != UserIoBoot::LAST || (p.mode != UserIoMode::OUT && p.mode != UserIoMode::PWM)) continue;
         recs[n++] = {p.gpio, 0, static_cast<int16_t>(s_rt[i].value)};
     }
-    if (!nvs_put("last", recs, n * sizeof(LastRec))) ESP_LOGW(TAG, "could not save the pin levels");
     std::memcpy(s_last, recs, n * sizeof(LastRec));
     s_last_n = n;
+    return n;
 }
 
 // ── Hardware ──
@@ -585,7 +585,9 @@ void reconcile_device(bool announce) {
         Lock l;
         want = s_cfg.count > 0;
     }
-    ZapDevice snap{};
+    // Static: called from app_main at boot (tight stack) and from the one /api/io PUT at a time.
+    static ZapDevice snap, before;
+    snap = ZapDevice{};
     bool save = false, removed = false;
     zigbee_pool_lock();
     ZapDevice* d = pool_find_by_ieee(kHubIoIeee);
@@ -598,7 +600,7 @@ void reconcile_device(bool announce) {
         }
         if (d) {
             // What the hub expects of it, also over an older or soft-removed record.
-            const ZapDevice before = *d;
+            before = *d;
             d->protocol        = PROTO_LOCAL;
             d->nwk_addr        = 0xFFFE;   // "no network address"
             d->device_type     = 1;        // mains powered, always there
@@ -617,7 +619,9 @@ void reconcile_device(bool announce) {
                    before.configure_state != d->configure_state;
             snap = *d;
         }
-    } else if (d) {
+    } else if (d && announce) {
+        // Only a save that empties the config removes it. At boot an empty config may be
+        // a stored one this build refused: the record (and its name) stays for the owner.
         pool_remove(static_cast<uint16_t>(d - pool_all()));
         removed = true;
     }
@@ -651,9 +655,12 @@ size_t current_pubs_locked(Pub* pubs) {
 
 void io_task(void*) {
     int64_t next_seen_us = 0;
+    bool stack_logged = false;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(kPollMs));
         Pub pubs[kUserIoMaxPins];
+        LastRec recs[kUserIoMaxPins];
+        int n_last = -1;   // >= 0: write these `last` records
         size_t n = 0;
         const int64_t now = esp_timer_get_time();
         {
@@ -681,7 +688,16 @@ void io_task(void*) {
             }
             if (s_last_dirty_us && now - s_last_dirty_us >= kLastSaveDelayUs) {
                 s_last_dirty_us = 0;
-                save_last_locked();
+                n_last = collect_last_locked(recs);
+            }
+        }
+        // The only writer of `last`, so an older set never lands after a newer one.
+        if (n_last >= 0) {
+            if (!nvs_put("last", recs, static_cast<size_t>(n_last) * sizeof(LastRec)))
+                ESP_LOGW(TAG, "could not save the pin levels");
+            if (!stack_logged) {   // for the hardware check: the NVS path is this task's deepest
+                stack_logged = true;
+                ESP_LOGI(TAG, "poll task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
         }
         publish(pubs, n);
@@ -717,16 +733,18 @@ void user_io_early_init() {
     char* json = static_cast<char*>(std::malloc(kCfgJsonMax));
     const size_t len = json ? nvs_get("cfg", json, kCfgJsonMax) : 0;
     char err[96] = "";
-    UserIoConfig cfg{};
-    if (len && !user_io_cfg_from_json(json, len, s_caps, &cfg, err, sizeof(err))) {
-        // Kept in NVS: a firmware that allows those pins again brings it back.
-        ESP_LOGE(TAG, "stored pin config refused (%s): no pins this boot", err);
-        cfg = UserIoConfig{};
+    // No hooks are registered yet, so nothing else reads s_cfg: parse straight into it
+    // (a UserIoConfig is ~600 B, too much for app_main's stack).
+    if (len && !user_io_cfg_from_json(json, len, s_caps, &s_cfg, err, sizeof(err), true)) {
+        ESP_LOGE(TAG, "stored pin config unreadable (%s): no pins this boot", err);
+        s_cfg = UserIoConfig{};
+    } else if (err[0]) {
+        // The NVS copy stays until the next save: a build that allows the pin brings the row back.
+        ESP_LOGW(TAG, "stored pin config: %s; that row is off on this build, the others are on", err);
     }
     std::free(json);
     {
         Lock l;
-        s_cfg = cfg;
         for (uint8_t i = 0; i < s_cfg.count; i++) {
             const UserIoPin& p = s_cfg.pins[i];
             const int32_t full = p.mode == UserIoMode::PWM ? 100 : 1;
@@ -737,12 +755,25 @@ void user_io_early_init() {
     device_cmd_set_local_handler(local_cmd);
     zhac_adapter_set_local_exposes_fn(local_exposes);
     simple_rules_set_io_hooks(rules_check, rules_run);
-    ESP_LOGI(TAG, "%u pin(s) configured, %u allowed (%s)", cfg.count, s_caps.n_allowed, CONFIG_ZHAC_IO_PINS);
+    ESP_LOGI(TAG, "%u pin(s) configured, %u allowed (%s)", s_cfg.count, s_caps.n_allowed, CONFIG_ZHAC_IO_PINS);
 }
 
 void user_io_attach_device() { reconcile_device(false); }
 
 void user_io_start() {
+    // Values restored for pins that are not configured now (a row dropped at boot) leave the device.
+    if (auto* attrs = static_cast<ShadowAttr*>(std::malloc(32 * sizeof(ShadowAttr)))) {
+        const uint8_t na = device_shadow_get_attrs(kHubIoIeee, attrs, 32);
+        for (uint8_t k = 0; k < na; k++) {
+            bool configured;
+            {
+                Lock l;
+                configured = user_io_cfg_find(s_cfg, attrs[k].key) >= 0;
+            }
+            if (!configured) device_shadow_remove_attr(kHubIoIeee, attrs[k].key);
+        }
+        std::free(attrs);
+    }
     Pub pubs[kUserIoMaxPins];
     size_t n;
     {
@@ -750,7 +781,9 @@ void user_io_start() {
         n = current_pubs_locked(pubs);
     }
     publish(pubs, n);
-    if (xTaskCreate(io_task, "user_io", 4096, nullptr, 2, nullptr) != pdPASS)
+    // 6 KB like the other tasks that commit NVS (zhac::stack::kZapFlush: ~3 KB used by the commit path).
+    // Internal RAM (xTaskCreate): it writes flash, so its stack cannot sit in PSRAM.
+    if (xTaskCreate(io_task, "user_io", 6144, nullptr, 2, nullptr) != pdPASS)
         ESP_LOGE(TAG, "poll task not started: inputs and ADC are not read");
 }
 
@@ -767,17 +800,34 @@ bool user_io_apply(const UserIoConfig& next, char* err, size_t cap) {
     uint8_t n_gone = 0;
     {
         Lock l;
-        const UserIoConfig old = s_cfg;
-        int32_t old_value[kUserIoMaxPins];
-        for (uint8_t i = 0; i < old.count; i++) { old_value[i] = s_rt[i].value; release_locked(i); }
+        // Static: ~2 KB, and saves are one at a time (EditLock in api_io).
+        static UserIoConfig old;
+        static PinRt old_rt[kUserIoMaxPins];
+        old = s_cfg;
+        std::memcpy(old_rt, s_rt, sizeof(s_rt));
+        // A pin whose hardware setup is unchanged keeps running untouched (a relay does not
+        // drop, a strip keeps its colours); only the others are released and set up again.
+        int8_t keep_from[kUserIoMaxPins];
+        bool kept_old[kUserIoMaxPins] = {};
+        for (uint8_t i = 0; i < next.count; i++) {
+            keep_from[i] = -1;
+            for (uint8_t k = 0; k < old.count && keep_from[i] < 0; k++) {
+                if (kept_old[k] || !old_rt[k].ready || !user_io_pin_same_hw(old.pins[k], next.pins[i])) continue;
+                keep_from[i] = static_cast<int8_t>(k);
+                kept_old[k] = true;
+            }
+        }
+        for (uint8_t k = 0; k < old.count; k++) if (!kept_old[k]) release_locked(k);   // s_cfg is still the old list
         s_cfg = next;
+        for (uint8_t i = 0; i < kUserIoMaxPins; i++) { s_rt[i] = PinRt{}; s_rt[i].ledc_ch = s_rt[i].ledc_tmr = -1; }
         for (uint8_t i = 0; i < s_cfg.count; i++) {
             const UserIoPin& p = s_cfg.pins[i];
-            // A pin that stays as it was keeps its level; a new one starts as `boot` says.
+            if (keep_from[i] >= 0) { s_rt[i] = old_rt[keep_from[i]]; continue; }
+            // Same pin and mode with other settings (a new frequency) keeps its level; a new pin starts as `boot` says.
             int32_t initial = p.boot == UserIoBoot::ON ? (p.mode == UserIoMode::PWM ? 100 : 1)
                             : p.boot == UserIoBoot::LAST ? last_value(p.gpio) : 0;
             for (uint8_t k = 0; k < old.count; k++)
-                if (old.pins[k].gpio == p.gpio && old.pins[k].mode == p.mode) initial = old_value[k];
+                if (old.pins[k].gpio == p.gpio && old.pins[k].mode == p.mode) initial = old_rt[k].value;
             if (!setup_locked(i, initial)) ESP_LOGW(TAG, "GPIO %u (%s): %s", p.gpio, p.name, s_rt[i].err);
         }
         for (uint8_t k = 0; k < old.count; k++) {
@@ -785,7 +835,7 @@ bool user_io_apply(const UserIoConfig& next, char* err, size_t cap) {
             for (uint8_t i = 0; i < s_cfg.count; i++) kept |= std::strcmp(old.pins[k].name, s_cfg.pins[i].name) == 0;
             if (!kept) std::memcpy(gone[n_gone++], old.pins[k].name, kUserIoNameMax);
         }
-        save_last_locked();
+        s_last_dirty_us = esp_timer_get_time();   // the poll task rewrites `last` for the new pin list
         n = current_pubs_locked(pubs);
     }
     for (uint8_t k = 0; k < n_gone; k++) device_shadow_remove_attr(kHubIoIeee, gone[k]);

@@ -97,6 +97,40 @@ int main() {
         CHECK(refuses(many, "too many pins (max 16)"), "more than 16 pins");
     }
 
+    // ── boot: rows this build no longer allows are dropped, the rest kept ──
+    {
+        const char* stored = R"({"pins":[{"gpio":7,"mode":"out","name":"gone"},{"gpio":21,"mode":"out","name":"relay"},)"
+                             R"({"gpio":22,"mode":"adc","name":"lvl"},{"gpio":4,"mode":"in","name":"btn"}]})";
+        char err[160] = "";
+        UserIoConfig b{};
+        CHECK(user_io_cfg_from_json(stored, std::strlen(stored), caps(), &b, err, sizeof(err), true) && b.count == 2 &&
+              std::strcmp(b.pins[0].name, "relay") == 0 && std::strcmp(b.pins[1].name, "btn") == 0 &&
+              std::strstr(err, "row 1: gpio 7 is not allowed") != nullptr,
+              "skip_bad_rows keeps the valid rows and names the first dropped one");
+        CHECK(!parse(stored, &b), "strict (PUT) still refuses the whole body");
+        CHECK(!user_io_cfg_from_json("garbage", 7, caps(), &b, err, sizeof(err), true), "skip_bad_rows still refuses a broken body");
+        err[0] = 'x';
+        CHECK(user_io_cfg_from_json(R"({"pins":[{"gpio":21,"mode":"out","name":"relay"}]})", 51, caps(), &b, err, sizeof(err), true) &&
+              b.count == 1 && err[0] == '\0', "nothing dropped: err is empty");
+    }
+
+    // ── a save leaves pins whose hardware did not change alone ──
+    {
+        UserIoPin a{};
+        a.gpio = 21; a.mode = UserIoMode::PWM; a.freq = 1000; a.leds = 30; a.interval = 5; a.delta = 50;
+        std::snprintf(a.name, sizeof(a.name), "fan");
+        UserIoPin b = a;
+        std::snprintf(b.name, sizeof(b.name), "cooler");
+        b.boot = UserIoBoot::LAST; b.interval = 9; b.delta = 7;
+        CHECK(user_io_pin_same_hw(a, b), "name, boot and adc publishing are not hardware");
+        b = a; b.freq = 2000;              CHECK(!user_io_pin_same_hw(a, b), "freq is hardware");
+        b = a; b.invert = true;            CHECK(!user_io_pin_same_hw(a, b), "invert is hardware");
+        b = a; b.gpio = 22;                CHECK(!user_io_pin_same_hw(a, b), "gpio is hardware");
+        b = a; b.mode = UserIoMode::OUT;   CHECK(!user_io_pin_same_hw(a, b), "mode is hardware");
+        b = a; b.pull = UserIoPull::UP;    CHECK(!user_io_pin_same_hw(a, b), "pull is hardware");
+        b = a; b.leds = 60;                CHECK(!user_io_pin_same_hw(a, b), "strip length is hardware");
+    }
+
     // ── lookups the rules and Lua use ──
     parse(R"({"pins":[{"gpio":21,"mode":"out","name":"relay"},{"gpio":4,"mode":"in","name":"b4"}]})", &c);
     CHECK(user_io_cfg_find(c, "relay") == 0 && user_io_cfg_find(c, "21") == 0 && user_io_cfg_find(c, "4") == 1 &&
