@@ -5,11 +5,11 @@
     "esp32s31": "v6.1"
   },
   "siblings": {
-    "zhac-components": "ea959150564cd896058c7b4642d8f52b8a164204",
+    "zhac-components": "7c40f8285490df4b9b0f0380d41e52470f20b0e5",
     "zhac-net-core": "a9a115c3f9dd0b850d307f793bc6cca953cb90e2",
     "embedded-zhc": "40d330662534014b6000887b4f77c9b79d5ee7b9",
-    "zhac-main-core": "3525b662db5ec2577ceb4fdf45cb0f0de94348c4",
-    "www-spa": "23e059c994ca864e610cda0dd757ab88def1f17b",
-    "zhac-docs": "7051207280baa9b758b363aede063b09d81a4ce2"
+    "zhac-main-core": "60369e5235ecf82177204f279654d6d44aa51254",
+    "www-spa": "4d26d0fd671303bfbfe1c50cc32d38fb9f090f59",
+    "zhac-docs": "f3d31a5c4b47503aef9ff9dc8f2a8fcf981ea076"
   }
 }
