@@ -11,6 +11,10 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Changed
+
+- **TLS buffers in PSRAM on the P4 too** (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, as the S31 since 2026-09-21). The cloud link held about 25 KB of internal RAM, and every extra HTTPS session (OTA, Telegram) needed a free 16 KB internal block beside it; the P4 had about 60 KB internal free after boot. `tools/check_resolved_config.sh` now fails a build whose sdkconfig still allocates TLS internally. Espressif prefers internal RAM for TLS keys; without flash encryption the flash holding the Zigbee key and tokens is just as readable.
+
 ### Fixed
 
 - **A power cut no longer opens the setup access point on a hub that is already set up** (`wifi_hosted`, review 2026-11-09 WN-01, WN-02).

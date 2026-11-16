@@ -109,6 +109,11 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # Certificate validity dates (review 2026-10-24 HS-11). zhac-components zap_tls leaves them out until
 # the clock is set (the boards keep no time over a power cut) and checks them from then on.
 CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+# TLS buffers in PSRAM on every target (the S31 has done so since 2026-09-21). On the P4 the cloud
+# link held ~25 KB of internal RAM, and each extra HTTPS session (OTA, Telegram) needed a free 16 KB
+# internal block next to it. Espressif prefers internal for TLS keys; these boards run without flash
+# encryption, so the flash holding the Zigbee key and tokens is just as readable.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # --- Radio ------------------------------------------------------------------
 # No radio in Phase 0. Deliberately absent: CONFIG_ZHAC_NCP_ZNP / _EZSP / _C6.

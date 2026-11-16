@@ -49,6 +49,8 @@ TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
 # built with another offset cannot find its partitions.
 expect CONFIG_PARTITION_TABLE_OFFSET 0xC000 \
     "Moved from 0x8000 to give the bootloader room (see sdkconfig.defaults). An old local sdkconfig keeps 0x8000: delete it or run idf.py reconfigure."
+expect CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC y \
+    "TLS buffers live in PSRAM (sdkconfig.defaults). An old local sdkconfig keeps them in internal RAM, where the P4 has ~60 KB left after boot: delete it so sdkconfig.defaults applies."
 expect CONFIG_MBEDTLS_HAVE_TIME_DATE y \
     "TLS certificate dates are checked once the clock is set (review 2026-10-24 HS-11, zhac-components zap_tls). Depends on MBEDTLS_HAVE_TIME: a build that drops it silently drops this too."
 expect CONFIG_APP_COMPILE_TIME_DATE y \
