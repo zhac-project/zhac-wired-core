@@ -100,9 +100,7 @@ idf_component_register(
         lua_cjson
         zigbee_mgr
         esp_zigbee_backend
-        # Empty on p4/s3 where the sibling tg_gw supplies real sources; carries
-        # the stubs on targets it does not cover. See its CMakeLists.
-        tg_gw_stub
+        tg_gw
         # Must be required EXPLICITLY. With set(COMPONENTS main) a component
         # that nothing requires is not built -- and a component that is not
         # built contributes no Kconfig, so CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
