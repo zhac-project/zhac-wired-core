@@ -88,6 +88,7 @@
 #include "ws_bridge.h"
 #include "ws_server.h"
 #include "zap_common.h"
+#include "tg_gw.h"
 #include "zap_store.h"
 #include "zhc_adapter.h"
 #include "zigbee_diagnostics.h"
@@ -326,6 +327,7 @@ extern "C" void app_main() {
         device_options_forget(ieee);
         dgm_forget(ieee);
     });
+    tg_gw_init();   // Lua's telegram_*: bot token + default chat from NVS
     const bool lua_ok = !safe_mode && lua_engine_init();
     heap_mark("lua");
     // lua_engine_init() installs the rules' script.run hook itself when it

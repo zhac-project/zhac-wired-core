@@ -17,6 +17,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **Lua's `zhac.telegram_settoken`, `telegram_setchat` and `telegram_send` work** (P4 and S31). They returned `false` on every wired build (`tg_gw_stub`); the hub now sends with your own bot through zhac-components' single-chip `tg_gw`, and `tg_gw_init()` loads the saved token and chat at boot. The sender task (16 KB stack: internal RAM on the P4, PSRAM on the S31) starts on the first message, so a hub that never sends pays nothing.
 - **A power cut no longer opens the setup access point on a hub that is already set up** (`wifi_hosted`, review 2026-11-09 WN-01, WN-02).
   - **Before:** the open setup AP came up 30 s after boot whenever no network was up yet, so a router that booted slower than the hub left it open. The "Disable AP" setting was ignored on wired builds.
   - **Fresh hub:** still opens the AP after 30 s without a network.

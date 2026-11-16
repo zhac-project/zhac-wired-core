@@ -21,7 +21,7 @@
 #
 # Compile-time gating belongs in the SOURCE (#if CONFIG_ZHAC_ESP_ZIGBEE), where
 # the symbol genuinely exists. Same rule applies to zigbee_mgr/radio_stubs.cpp.
-# Gating on IDF_TARGET is fine -- that IS available early (see tg_gw_stub).
+# Gating on IDF_TARGET is fine -- that IS available early.
 idf_component_register(
     SRCS "esp_zigbee_backend.cpp" "esp_zb_interview.cpp" "esp_zb_configure.cpp" "esp_zb_groups.cpp"
          "esp_zb_netmap.cpp" "esp_zb_netmap_walk.cpp" "esp_zb_netmap_json.cpp"
