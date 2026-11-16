@@ -15,6 +15,10 @@ contents become the release-tag annotation at `just release`.
 
 - **Hub pins (GPIO control).** Settings › I/O (`GET`/`PUT /api/io`) configures up to 16 free pins as `out`, `pwm`, `in`, `adc` or `strip` (WS2812). Only configured pins can be used, by rules (`gpio.set`, `gpio.toggle`, `pwm.set`), Lua (`zhac.gpio_write`, `gpio_toggle`, `gpio_read`, `pwm_write`, `adc_read`, `ws_write`), the hub page, the cloud and Home Assistant. They show as one **Hub I/O** device whose attributes are the pin names: outputs and PWM are writable, inputs (debounced) and ADC readings (every `interval` s, when moved by `delta`) are published and work as rule triggers. Outputs can start `off`, `on` or at their `last` level after a restart. The pins offered come from `CONFIG_ZHAC_IO_PINS` (per board, narrower on Wi-Fi co-processor builds) minus every pin the build uses itself. Zigbee-only commands (bind, configure, re-interview, groups) refuse the Hub I/O device; the bind-repair pass and a Zigbee reset leave it alone. Docs: zhac-docs `GPIO.md`.
 
+### Changed
+
+- **TLS buffers in PSRAM on the P4 too** (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, as the S31 since 2026-09-21). The cloud link held about 25 KB of internal RAM, and every extra HTTPS session (OTA, Telegram) needed a free 16 KB internal block beside it; the P4 had about 60 KB internal free after boot. `tools/check_resolved_config.sh` now fails a build whose sdkconfig still allocates TLS internally. Espressif prefers internal RAM for TLS keys; without flash encryption the flash holding the Zigbee key and tokens is just as readable.
+
 ### Fixed
 
 - **Lua's `zhac.telegram_settoken`, `telegram_setchat` and `telegram_send` work** (P4 and S31). They returned `false` on every wired build (`tg_gw_stub`); the hub now sends with your own bot through zhac-components' single-chip `tg_gw`, and `tg_gw_init()` loads the saved token and chat at boot. The sender task (16 KB stack: internal RAM on the P4, PSRAM on the S31) starts on the first message, so a hub that never sends pays nothing.
