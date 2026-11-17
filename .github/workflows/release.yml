@@ -24,6 +24,16 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # One runner holds two IDF images (v6.0 and v6.1, 4-5 GB compressed each)
+      # and six builds; v2026111701 died 18 s into the C6 installer build, five
+      # builds in. Drop the preinstalled SDKs no step here uses. The notices are
+      # annotations, which GitHub shows without a sign-in (step logs need one).
+      - name: Free runner disk
+        run: |
+          echo "::notice title=disk at start::$(df -h / | tail -1)"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "::notice title=disk after cleanup::$(df -h / | tail -1)"
+
       - uses: actions/checkout@v4
         with:
           path: zhac-wired-core
@@ -151,13 +161,21 @@ jobs:
           command: >-
             RCP_EXTRA_DEFAULTS=$PWD/tools/c6-rcp-installer/rcp-ota.defaults
             tools/build-rcp.sh build.rcp-ota/merged-unused.bin build.rcp-ota
+      - name: Disk before the C6 radio installer
+        run: echo "::notice title=disk before installer::$(df -h / | tail -1)"
+      # The action wraps the command in single quotes: none inside it. A failure
+      # also lands as an annotation, readable without a sign-in.
       - name: Build the C6 radio installer (ESP32-P4 app)
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v6.0
           target: esp32p4
           path: zhac-wired-core/tools/c6-rcp-installer
-          command: idf.py build && idf.py merge-bin -o c6-rcp-installer-merged.bin
+          command: >-
+            (idf.py build && idf.py merge-bin -o c6-rcp-installer-merged.bin) > installer-build.log 2>&1;
+            rc=$?; cat installer-build.log;
+            if [ $rc -ne 0 ]; then grep -m8 -iE "error|no space|fatal" installer-build.log | sed "s/^/::error title=installer::/"; fi;
+            exit $rc
 
       # The hub and the installer again for ESP32-P4 silicon v3.x: the two P4
       # families cannot run each other's binaries. Same sources, plus
