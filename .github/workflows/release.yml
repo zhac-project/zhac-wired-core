@@ -24,16 +24,6 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # One runner holds two IDF images (v6.0 and v6.1, 4-5 GB compressed each)
-      # and six builds; v2026111701 died 18 s into the C6 installer build, five
-      # builds in. Drop the preinstalled SDKs no step here uses. The notices are
-      # annotations, which GitHub shows without a sign-in (step logs need one).
-      - name: Free runner disk
-        run: |
-          echo "::notice title=disk at start::$(df -h / | tail -1)"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          echo "::notice title=disk after cleanup::$(df -h / | tail -1)"
-
       - uses: actions/checkout@v4
         with:
           path: zhac-wired-core
@@ -161,8 +151,10 @@ jobs:
           command: >-
             RCP_EXTRA_DEFAULTS=$PWD/tools/c6-rcp-installer/rcp-ota.defaults
             tools/build-rcp.sh build.rcp-ota/merged-unused.bin build.rcp-ota
-      - name: Disk before the C6 radio installer
-        run: echo "::notice title=disk before installer::$(df -h / | tail -1)"
+      # idf-component-manager 3.0.0 (in the v6.0 image) reads esp_hosted 3.1.0's
+      # $CONFIG{ESP_HOSTED_HOST_USB_*} rules through esp_wifi_remote's ">=2.11",
+      # though 2.12.13 is pinned, and stops on "Missing required kconfig option"
+      # (v2026111701, v2026111702). 3.0.3 resolves the same six components.
       # The action wraps the command in single quotes: none inside it. A failure
       # also lands as an annotation, readable without a sign-in.
       - name: Build the C6 radio installer (ESP32-P4 app)
@@ -172,6 +164,7 @@ jobs:
           target: esp32p4
           path: zhac-wired-core/tools/c6-rcp-installer
           command: >-
+            pip install -q "idf-component-manager==3.0.3" &&
             (idf.py build && idf.py merge-bin -o c6-rcp-installer-merged.bin) > installer-build.log 2>&1;
             rc=$?; cat installer-build.log;
             if [ $rc -ne 0 ]; then grep -m8 -iE "error|no space|fatal" installer-build.log | sed "s/^/::error title=installer::/"; fi;
@@ -187,7 +180,8 @@ jobs:
           esp_idf_version: v6.0
           target: esp32p4
           path: zhac-wired-core
-          command: tools/build-p4-rev3x.sh
+          # The installer again: same component-manager fix as above.
+          command: pip install -q "idf-component-manager==3.0.3" && tools/build-p4-rev3x.sh
       - name: The v3.x image carries the web UI too
         run: |
           size=$(stat -c %s zhac-wired-core/build.p4rev3x/spa.pack)
