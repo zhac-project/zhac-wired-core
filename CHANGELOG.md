@@ -17,6 +17,16 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **More free internal RAM** (P4 and S31, research 2026-11-18 A7/A8):
+  - all Lua allocations in PSRAM on the P4 (`LUA_ENGINE_INTERNAL_SMALL_THRESHOLD` 0, as on the S31);
+  - `malloc` above 4 KB goes to PSRAM (`SPIRAM_MALLOC_ALWAYSINTERNAL` 16384 → 4096, review XC-02);
+  - lwIP IRAM optimisation off (~14 KB);
+  - MQTT buffers and outbox in PSRAM on the P4;
+  - one-slot event queues for the status LED;
+  - the groups list, the options-key migration and the coordinator address check take heap scratch per call instead of ~15 KB of statics (review WC-10);
+  - the pin poll task (6 KB stack, 20 ms wake-ups) starts only with the first configured pin.
+- **Smaller firmware image** (research A14): the common CA bundle instead of the full one (a server on a rare root CA fails TLS), and mbedTLS client-only.
+- **The heap log line adds `main-largest`** (research A8): the largest block of the main internal heap, which the overall largest block (LP RAM, TCM) can hide.
 - **The hub asks DHCP for its last address after a restart** (`LWIP_DHCP_RESTORE_LAST_IP`, research 2026-11-18 A9), so its IP no longer wanders between reboots. The cloud hello carries `lan_ip` (the Wi-Fi address on a hub without a cable).
 - **TLS buffers in PSRAM on the P4 too** (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, as the S31 since 2026-09-21). The cloud link held about 25 KB of internal RAM, and every extra HTTPS session (OTA, Telegram) needed a free 16 KB internal block beside it; the P4 had about 60 KB internal free after boot. `tools/check_resolved_config.sh` now fails a build whose sdkconfig still allocates TLS internally. Espressif prefers internal RAM for TLS keys; without flash encryption the flash holding the Zigbee key and tokens is just as readable.
 
