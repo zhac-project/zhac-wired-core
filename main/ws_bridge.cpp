@@ -1186,7 +1186,8 @@ static const char* log_level_now() { return logcloud::level_name(logcloud::level
 static_assert(sizeof("{\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
 static_assert(sizeof(",\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
-                     "\"log_to_cloud\":\"everything\"") <= 160, "remote_hello_extra outgrew remote_client's extra[160]");
+                     "\"log_to_cloud\":\"everything\",\"lan_ip\":\"255.255.255.255\"") <= 160,
+              "remote_hello_extra outgrew remote_client's extra[160]");
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
@@ -1912,8 +1913,13 @@ extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
 // remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default
 // (none), which dual-chip and mono keep, so the cloud treats those as read-only.
 extern "C" size_t remote_hello_extra(char* out, size_t cap) {
-    const int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"", kRemoteCapsJson,
-                           sys_remote_scripts() ? "true" : "false", log_level_now());
+    int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"", kRemoteCapsJson,
+                     sys_remote_scripts() ? "true" : "false", log_level_now());
+    // The LAN address, so the cloud knows where the local web UI is (research 2026-11-18 A9). A new address
+    // breaks the link, and the reconnect sends it again.
+    NetStatus net{};
+    eth_get_status(&net);
+    if (n > 0 && (size_t)n < cap && net.ip[0]) n += snprintf(out + n, cap - n, ",\"lan_ip\":\"%s\"", net.ip);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 #endif
