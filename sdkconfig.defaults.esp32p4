@@ -66,3 +66,10 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
 # its file will likely lean on these harder, not less.
 CONFIG_SPIRAM_RODATA=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# --- Lua heap ----------------------------------------------------------------
+# Every Lua allocation in PSRAM, as on the S31. At 512 the small objects took
+# internal RAM and the internal heap swung 30-40 KB with script activity
+# (research 2026-11-18 A7). Only tasks touch Lua data, never with the cache
+# off, so this needs no XIP.
+CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=0
