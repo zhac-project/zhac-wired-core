@@ -21,7 +21,7 @@ cp "$R/groups_store.h" "$R/json_buf.h" "$H/harness.cpp" "$DC/include/device_cmd.
    "$DC/device_cmd_json.cpp" "$W/"
 echo '#pragma once' > "$W/nvs.h"
 { echo '#include "groups_store.h"'; echo '#include "json_buf.h"'; echo '#include "device_cmd_json.h"'
-  echo '#include <cstdio>'; echo '#include <cstring>'; echo 'bool grp_find(uint16_t id, GrpRecord& out);'
+  echo '#include <cstdio>'; echo '#include <cstring>'; echo '#include <memory>'; echo '#include <new>'; echo 'bool grp_find(uint16_t id, GrpRecord& out);'
   sed -n '/^size_t grp_to_json/,/^}/p' "$R/groups_store.cpp"
   sed -n '/^size_t group_list_json/,/^}/p' "$R/api_groups.cpp"
   sed -n '/^size_t group_cmd/,/^}/p' "$R/api_groups.cpp"; } > "$W/slice_tu.cpp"

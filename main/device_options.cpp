@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "ArduinoJson.h"
 #include "device_shadow.h"
@@ -178,14 +180,19 @@ size_t device_options_get_json(uint64_t ieee, char* out, size_t cap) {
 // shared cannot be told apart and is dropped, as is one of a device that is
 // gone (restoring it made up a phantom device).
 //
-// Runs on app_main, whose stack is 4 KB: every buffer here is static (one
-// boot-time pass, never re-entered) and the function is kept out of line so
-// its frame exists only while it runs. With the key list on the stack the
-// first boot that had something to move overflowed the main task.
+// Runs on app_main, whose stack is 4 KB: every buffer here is on the heap for
+// this one boot-time pass (statics held 2.7 KB of internal RAM for good,
+// research 2026-11-18 A8), and the function is kept out of line so its frame
+// exists only while it runs. With the key list on the stack the first boot
+// that had something to move overflowed the main task.
 __attribute__((noinline)) static void migrate_old_keys(nvs_handle_t h) {
     constexpr int kMaxOld = 32;
-    static char old_keys[kMaxOld][16];
-    static char blob[192];
+    struct Scratch { char old_keys[kMaxOld][16]; char blob[192]; uint64_t known[256]; };
+    const std::unique_ptr<Scratch> s(new (std::nothrow) Scratch);
+    if (!s) { ESP_LOGW(TAG, "no memory to move old options keys -- next boot tries again"); return; }
+    auto& old_keys = s->old_keys;
+    auto& blob = s->blob;
+    auto& known = s->known;
     int n_old = 0;
     nvs_iterator_t it = nullptr;
     esp_err_t e = nvs_entry_find(NVS_DEFAULT_PART_NAME, kNamespace, NVS_TYPE_STR, &it);
@@ -201,7 +208,6 @@ __attribute__((noinline)) static void migrate_old_keys(nvs_handle_t h) {
     if (it) nvs_release_iterator(it);
     if (!n_old) return;
 
-    static uint64_t known[256];   // static: one boot-time pass, keep it off the stack
     int n_known = 0;
     zigbee_pool_lock();
     const ZapDevice* all = pool_all();

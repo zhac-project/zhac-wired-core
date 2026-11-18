@@ -18,8 +18,6 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap);
 
 GrpRecord g_store[GRP_MAX_GROUPS];
 uint16_t  g_count = 0;
-void grp_store_lock() {}
-void grp_store_unlock() {}
 uint16_t grp_load_all(GrpRecord* out, uint16_t max) {
     const uint16_t n = g_count < max ? g_count : max;
     std::memcpy(out, g_store, n * sizeof(GrpRecord));

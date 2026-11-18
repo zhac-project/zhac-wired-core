@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "ArduinoJson.h"
 #include "esp_heap_caps.h"
@@ -46,11 +48,13 @@ static void parse_members(const char* body, size_t len, GrpRecord& r) {
 // 0 when the list does not fit `cap` (GRP_LIST_JSON_MAX always does): a
 // caller must never send a partial or overrun list (review F10).
 size_t group_list_json(char* out, size_t cap) {
-    static GrpRecord all[GRP_MAX_GROUPS];
-    static char row[GRP_JSON_MAX];
-    // Shared static buffers: hold the store lock across load + serialise so a
-    // concurrent group.list on another task cannot refill them mid-read.
-    grp_store_lock();
+    // ~10 KB used only while a list is built: heap per call, not statics that held internal RAM for good (research
+    // 2026-11-18 A8, review WC-10). Private to the call, so no store lock is held while serialising.
+    struct Scratch { GrpRecord all[GRP_MAX_GROUPS]; char row[GRP_JSON_MAX]; };
+    const std::unique_ptr<Scratch> s(new (std::nothrow) Scratch);
+    if (!s) return 0;
+    auto& all = s->all;
+    auto& row = s->row;
     const uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
     JsonWriter w(out, cap);
     w.raw("{\"groups\":[");
@@ -64,7 +68,6 @@ size_t group_list_json(char* out, size_t cap) {
     }
     w.raw("]}");
     const size_t len = w.finish();
-    grp_store_unlock();
     if (len < cap) out[len] = '\0';
     return len;
 }

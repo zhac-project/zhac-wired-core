@@ -39,15 +39,6 @@ struct GrpLockGuard {
 };
 }  // namespace
 
-// Public lock accessors so a caller that loads into a SHARED scratch buffer
-// (api_group_list's file-static `all[]`, reachable from both httpd and
-// task_remote) can hold the store lock across BOTH the grp_load_all and the
-// serialise-from-the-buffer loop — otherwise a second group.list on the other
-// task could refill the same static mid-serialisation (torn read). Recursive,
-// so the grp_load_all inside the held region re-takes cheaply.
-void grp_store_lock()   { grp_lock_init(); if (s_grp_mtx) xSemaphoreTakeRecursive(s_grp_mtx, portMAX_DELAY); }
-void grp_store_unlock() { if (s_grp_mtx) xSemaphoreGiveRecursive(s_grp_mtx); }
-
 static nvs_handle_t grp_open(nvs_open_mode_t mode) {
     nvs_handle_t h = 0;
     nvs_open(GRP_NVS_NS, mode, &h);
