@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
+#include <new>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -74,6 +76,7 @@ PinRt        s_rt[kUserIoMaxPins]{};
 LastRec      s_last[kUserIoMaxPins]{};
 uint8_t      s_last_n = 0;
 int64_t      s_last_dirty_us = 0;
+TaskHandle_t s_task = nullptr;   // the poll task, created with the first pin
 uint32_t     s_tmr_freq[SOC_LEDC_TIMER_NUM]{};
 uint8_t      s_tmr_bits[SOC_LEDC_TIMER_NUM]{};
 uint8_t      s_tmr_users[SOC_LEDC_TIMER_NUM]{};
@@ -711,6 +714,18 @@ void io_task(void*) {
     }
 }
 
+// The poll task exists only once a pin does: most hubs have none, and it costs a 6 KB internal stack and a wake
+// every 20 ms (research 2026-11-18 A8). Pins removed later leave it running until the next boot. Lock held.
+void start_task_locked() {
+    if (s_task || !s_cfg.count) return;
+    // 6 KB like the other tasks that commit NVS (zhac::stack::kZapFlush: ~3 KB used by the commit path).
+    // Internal RAM (xTaskCreate): it writes flash, so its stack cannot sit in PSRAM.
+    if (xTaskCreate(io_task, "user_io", 6144, nullptr, 2, &s_task) != pdPASS) {
+        s_task = nullptr;
+        ESP_LOGE(TAG, "poll task not started: inputs and ADC are not read");
+    }
+}
+
 }  // namespace
 
 // ── Public ──
@@ -781,13 +796,16 @@ void user_io_start() {
         n = current_pubs_locked(pubs);
     }
     publish(pubs, n);
-    // 6 KB like the other tasks that commit NVS (zhac::stack::kZapFlush: ~3 KB used by the commit path).
-    // Internal RAM (xTaskCreate): it writes flash, so its stack cannot sit in PSRAM.
-    if (xTaskCreate(io_task, "user_io", 6144, nullptr, 2, nullptr) != pdPASS)
-        ESP_LOGE(TAG, "poll task not started: inputs and ADC are not read");
+    Lock l;
+    start_task_locked();
 }
 
 bool user_io_apply(const UserIoConfig& next, char* err, size_t cap) {
+    // The previous list, kept while the new one is set up: ~2 KB on the heap, not held as statics for good
+    // (research 2026-11-18 A8). Taken before the save, so a failure leaves the stored config as it was.
+    struct Old { UserIoConfig cfg; PinRt rt[kUserIoMaxPins]; };
+    const std::unique_ptr<Old> prev(new (std::nothrow) Old);
+    if (!prev) { std::snprintf(err, cap, "out of memory"); return false; }
     char* json = static_cast<char*>(std::malloc(kCfgJsonMax));
     const size_t len = json ? cfg_json(next, json, kCfgJsonMax) : 0;
     const bool saved = len && nvs_put("cfg", json, len);
@@ -800,9 +818,8 @@ bool user_io_apply(const UserIoConfig& next, char* err, size_t cap) {
     uint8_t n_gone = 0;
     {
         Lock l;
-        // Static: ~2 KB, and saves are one at a time (EditLock in api_io).
-        static UserIoConfig old;
-        static PinRt old_rt[kUserIoMaxPins];
+        UserIoConfig& old = prev->cfg;
+        PinRt* const old_rt = prev->rt;
         old = s_cfg;
         std::memcpy(old_rt, s_rt, sizeof(s_rt));
         // A pin whose hardware setup is unchanged keeps running untouched (a relay does not
@@ -841,6 +858,10 @@ bool user_io_apply(const UserIoConfig& next, char* err, size_t cap) {
     for (uint8_t k = 0; k < n_gone; k++) device_shadow_remove_attr(kHubIoIeee, gone[k]);
     reconcile_device(true);   // hub page, cloud and HA re-read the device: its exposes changed
     publish(pubs, n);
+    {
+        Lock l;
+        start_task_locked();
+    }
     simple_rules_reload();    // gpio verbs re-check their pins
     ESP_LOGI(TAG, "pin config applied: %u pin(s)", next.count);
     return true;
