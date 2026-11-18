@@ -20,6 +20,7 @@
 #include "ha_bridge.h"
 #include "mqtt_gw.h"
 #include "mqtt_gw_cfg.h"
+#include "mqtt_payload.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "ws_bridge.h"
@@ -194,24 +195,36 @@ void on_device_leave(const Event& e) {
     if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) > 0) mqtt_gw_publish(topic, "", 0, 0, true);
 }
 
-// Everything under <root>/# that is not a Home Assistant command goes to the
-// rule engine (Mqtt# triggers) and Lua (zhac.on_mqtt), as the dual-chip S3
-// forwards MQTT_MSG_IN to the P4. Our own state echoes are skipped.
+// What the hub itself publishes under the root, back from the broker: device
+// state, logs, metrics, availability. Never news to the rule engine or Lua --
+// and a script that logs on every message would feed itself (research
+// 2026-11-18 A12). Rule and script publishes are the user's: they come back.
+bool own_echo(const char* topic, size_t len, const char* root) {
+    static constexpr const char* kOwn[] = {"/devices/", "/log/", "/bridge/", "/availability"};
+    const size_t rl = strlen(root);
+    if (len <= rl || strncmp(topic, root, rl) != 0) return false;
+    for (const char* o : kOwn) {
+        const size_t ol = strlen(o);
+        if (len - rl >= ol && strncmp(topic + rl, o, ol) == 0) return o[ol - 1] == '/' || len - rl == ol;
+    }
+    return false;
+}
+
+// Everything under <root>/# that is neither a command (ha_bridge takes /set)
+// nor the hub's own echo goes to the rule engine (Mqtt# triggers) and Lua
+// (zhac.on_mqtt), as the dual-chip S3 forwards MQTT_MSG_IN to the P4. A
+// payload past the event's 31 bytes travels as its start plus the id of its
+// whole text (mqtt_payload.h), which Lua reads.
 void on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len) {
     if (ha_bridge_on_mqtt_rx(topic, topic_len, data, data_len)) return;
-    char own[48];
-    const int ol = snprintf(own, sizeof(own), "%s/devices/", mqtt_gw_get_root_topic());
-    if (ol > 0 && topic_len >= ol && strncmp(topic, own, (size_t)ol) == 0) return;
+    if (own_echo(topic, (size_t)topic_len, mqtt_gw_get_root_topic())) return;
     Event ev{};
     ev.type = EventType::MQTT_MSG;
     auto& m = *reinterpret_cast<MqttMsgEvent*>(ev.data);
     const size_t tn = (size_t)topic_len < sizeof(m.topic) - 1 ? (size_t)topic_len : sizeof(m.topic) - 1;
-    const size_t pn = (size_t)(data_len > 0 ? data_len : 0) < sizeof(m.payload) - 1
-                          ? (size_t)(data_len > 0 ? data_len : 0) : sizeof(m.payload) - 1;
     memcpy(m.topic, topic, tn);
     m.topic[tn] = '\0';
-    if (pn) memcpy(m.payload, data, pn);
-    m.payload[pn] = '\0';
+    mqtt_msg_set_payload(m, data, data_len > 0 ? (size_t)data_len : 0);
     event_bus_publish(ev);
 }
 
