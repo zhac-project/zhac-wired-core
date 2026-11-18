@@ -73,3 +73,10 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # (research 2026-11-18 A7). Only tasks touch Lua data, never with the cache
 # off, so this needs no XIP.
 CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=0
+
+# --- MQTT --------------------------------------------------------------------
+# Client buffers and the outbox in PSRAM, as on the S31; the task stack stays
+# internal (no XIP on the P4) (research 2026-11-18 A8).
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY=y
+CONFIG_MQTT_OUTBOX_DATA_ON_EXTERNAL_MEMORY=y

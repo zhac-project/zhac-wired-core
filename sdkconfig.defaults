@@ -53,6 +53,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # BSS, speed, mode) are per-target: which of them exist and what they cost
 # differs by SoC, so they live in the per-target files.
 CONFIG_SPIRAM=y
+# malloc() tries internal RAM first only up to 4 KB (IDF default 16 KB); bigger
+# blocks go to PSRAM. Code that needs internal or DMA memory asks heap_caps for
+# it, and esp_flash bounces PSRAM buffers itself (research 2026-11-18 A8,
+# review XC-02).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 
 # --- Storage ----------------------------------------------------------------
 # Both current boards are 16 MB. Flash MODE and FREQUENCY are per-target --
@@ -102,10 +107,19 @@ CONFIG_ETH_USE_ESP32_EMAC=y
 # --- Performance ------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_MBEDTLS_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
+# lwIP runs from flash: ~14 KB of internal RAM back, at packet rates a hub never
+# reaches (research 2026-11-18 A8).
+# CONFIG_LWIP_IRAM_OPTIMIZATION is not set
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
 CONFIG_LWIP_TCP_WND_DEFAULT=11520
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# The common CA bundle (the roots behind ~99 % of sites: Let's Encrypt,
+# DigiCert, GlobalSign, Sectigo, Amazon, Go Daddy ...) instead of the full one,
+# ~45 KB of flash; a host on a rarer root fails TLS. The hub is only ever a TLS
+# client (cloud link, OTA, MQTT, Telegram), so no server code either
+# (research 2026-11-18 A14).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
 # Certificate validity dates (review 2026-10-24 HS-11). zhac-components zap_tls leaves them out until
 # the clock is set (the boards keep no time over a power cut) and checks them from then on.
 CONFIG_MBEDTLS_HAVE_TIME_DATE=y

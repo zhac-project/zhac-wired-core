@@ -43,6 +43,18 @@ expect() {
     fi
 }
 
+expect CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 \
+    "malloc above 4 KB goes to PSRAM (research 2026-11-18 A8). An old local sdkconfig keeps 16384: delete it so sdkconfig.defaults applies."
+expect CONFIG_LWIP_IRAM_OPTIMIZATION "" \
+    "lwIP runs from flash to give ~14 KB of internal RAM back (A8). An old local sdkconfig keeps it in IRAM."
+expect CONFIG_MBEDTLS_TLS_CLIENT_ONLY y \
+    "The hub is only a TLS client (A14). An old local sdkconfig keeps the server code."
+expect CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN y \
+    "The common CA bundle saves ~45 KB of flash (A14). An old local sdkconfig keeps the full one."
+expect CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY y \
+    "MQTT buffers live in PSRAM on every target (A8). Without MQTT_USE_CUSTOM_CONFIG the option is dropped silently."
+expect CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD 0 \
+    "Every Lua allocation in PSRAM on every target (A7). An old local sdkconfig keeps 512 on the P4."
 TARGET=$(grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" | cut -d= -f2- | tr -d '"')
 
 # Both targets. Release images and OTA updates assume the table here; an app
