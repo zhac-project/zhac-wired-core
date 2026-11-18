@@ -794,7 +794,15 @@ static void coordinator_rebind_once() {
     // store shut: next boot), or done already.
     if (mac.u64 == coord || !zap_store_is_ready() || zap_store_flag_get(kRepairFlag)) return;
 
-    static uint64_t marked[ZAP_MAX_DEVICES];   // boot-time pass: off app_main's stack
+    // Boot-time pass, run once: its scratch lives on the heap for the call instead of 2 KB of internal .bss for
+    // the whole run (research 2026-11-18 A8). Nothing is marked yet, so a failed allocation just waits a boot.
+    struct Scratch { uint64_t marked[ZAP_MAX_DEVICES]; ZapDevice snap; };
+    const std::unique_ptr<Scratch> scratch(new (std::nothrow) Scratch);
+    if (!scratch) {
+        ESP_LOGW(TAG, "coordinator address check: no memory -- next boot tries again");
+        return;
+    }
+    uint64_t* const marked = scratch->marked;
     uint16_t n = 0;
     zigbee_pool_lock();
     ZapDevice* all = pool_all();
@@ -811,7 +819,7 @@ static void coordinator_rebind_once() {
     zigbee_pool_unlock();
     // Saved directly, not through the 64-slot dirty table (more devices would
     // overflow it into immediate saves with extra copies on this stack).
-    static ZapDevice snap;
+    ZapDevice& snap = scratch->snap;
     bool saved = true;
     for (uint16_t i = 0; i < n; i++)
         if (zigbee_pool_snapshot(marked[i], &snap)) saved = zap_store_save_device(&snap) && saved;

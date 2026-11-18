@@ -122,9 +122,12 @@ static void log_psram_info() {
 }
 
 static void log_heap_info() {
-    ESP_LOGI(TAG, "heap internal: free=%u largest=%u",
+    // main-largest: the DMA-capable internal RAM only (L2MEM on the P4, SRAM on the S31). The overall largest
+    // block can sit in the LP-RAM or TCM region and hide a fragmented main heap (research 2026-11-18 A8).
+    ESP_LOGI(TAG, "heap internal: free=%u largest=%u main-largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
     ESP_LOGI(TAG, "heap spiram:   free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
