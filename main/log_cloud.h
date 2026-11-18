@@ -28,3 +28,12 @@ void log_cloud_planned_restart(logcloud::Planned p);
 
 // Lines handed to the cloud link, and lines the backlog dropped, since the hub started.
 void log_cloud_stats(uint32_t* sent, uint32_t* dropped);
+
+// Why this boot started ("power_on", "panic", "task_wdt", "sw", ... see logcloud::reset_name), and the core dump
+// summary (a JSON object) when this boot follows a crash, else nullptr. For /api/status.
+const char* log_cloud_reset_reason();
+const char* log_cloud_last_crash();
+
+// On the main task, every few seconds: once log.tail has carried the crash to the link, marks it reported in NVS
+// (the uploader may run on a PSRAM stack, which must not touch flash).
+void log_cloud_tick();

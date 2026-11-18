@@ -143,6 +143,14 @@ struct PrevRun {
 };
 PrevRun prev_run(bool tail_valid, uint32_t tail_planned, bool new_image, Reset reason, bool rolled_back);
 
+// A core dump found at boot, by its id (its SHA-256's first 4 bytes, never 0) against the last id the cloud got
+// (NVS sys_cfg/cd_sent). The dump stays in flash until the next crash replaces it.
+struct CrashUse {
+    bool show;     // this boot follows the crash (panic, interrupt or task watchdog): status shows it
+    bool report;   // the cloud has not had it, whatever ended the runs since: log.tail carries it
+};
+CrashUse crash_use(Reset reason, uint32_t dump_id, uint32_t reported_id);
+
 const char* riscv_cause_name(uint32_t mcause);   // "load access fault", …; "interrupt"; "unknown cause"
 
 // {"task":"…","pc":"0x…","cause":"…","elf":"…"}, NUL-terminated. 0 (and "") when it does not fit.

@@ -175,6 +175,21 @@ void test_ring_knows_its_image() {
     CHECK(r.valid(kMagic, 0xA1B2C3D4));       // clear keeps the image
 }
 
+// A core dump found at boot (research 2026-11-18 A2): status shows it on the boot right after the crash, task
+// watchdog included; the cloud gets it while it has not had it, whatever ended the run since.
+void test_crash_use() {
+    const auto is = [](CrashUse u, bool show, bool report) { return u.show == show && u.report == report; };
+    CHECK(is(crash_use(Reset::Panic, 7, 0), true, true));
+    CHECK(is(crash_use(Reset::IntWdt, 7, 3), true, true));
+    CHECK(is(crash_use(Reset::TaskWdt, 7, 3), true, true));
+    // Cloud logs were off, or the link never came up, in the crash's run: a later run still reports it.
+    CHECK(is(crash_use(Reset::Sw, 7, 3), false, true));
+    CHECK(is(crash_use(Reset::PowerOn, 7, 3), false, true));
+    // Reported already: an old dump a later crash failed to replace is neither shown nor sent again.
+    CHECK(is(crash_use(Reset::Panic, 7, 7), false, false));
+    CHECK(is(crash_use(Reset::Sw, 7, 7), false, false));
+}
+
 void test_prev_run() {
     const auto P  = [](Planned p) { return static_cast<uint32_t>(p); };
     const auto is = [](PrevRun r, bool use, Planned p) {
@@ -358,6 +373,7 @@ int main() {
     test_ring_survives_a_copy_and_rejects_garbage();
     test_ring_knows_its_image();
     test_prev_run();
+    test_crash_use();
     test_ring_clear_keeps_identity();
     test_ring_unsealed();
     test_line_json();

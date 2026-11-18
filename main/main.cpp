@@ -462,6 +462,7 @@ extern "C" void app_main() {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
         if (tick % 30 == 29) eth_ntp_reconcile();   // every 5 min
+        log_cloud_tick();   // marks a crash the cloud got as reported
         NetStatus net{};
         eth_get_status(&net);
         ESP_LOGI(TAG,

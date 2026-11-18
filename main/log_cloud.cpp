@@ -6,12 +6,13 @@
 // The log hook calls log_cloud_capture() for every line. It copies the line into the PSRAM backlog when the
 // hub's level lets it through, and always into the restart tail: a 4 KB ring in no-init RAM that the next run
 // of the same firmware reads. A low-priority task sends the backlog as log.batch events. Once per run it sends
-// log.tail: the reset reason, a fresh crash's summary, and the previous run's lines the cloud never got.
+// log.tail: the reset reason, a crash summary the cloud has not had, and the previous run's lines it never got.
 //
 // Rules this file keeps:
 // - The capture only copies under a spinlock: it never sends, logs, allocates or blocks.
 // - The uploader's stack may be in PSRAM (zhac_task_create on the S31), so it never touches NVS or flash.
-//   The core dump and its NVS marker are read in log_cloud_boot(), on the main task.
+//   The core dump and its NVS marker are read in log_cloud_boot(), and the marker written in log_cloud_tick(),
+//   both on the main task.
 // - This file's own tag, "log_cloud", is on the link-tag list: its lines never feed the upload.
 #include "log_cloud.h"
 
@@ -75,7 +76,11 @@ uint32_t s_seq     = 0;                // the last backlog sequence number given
 uint8_t* s_prev_block = nullptr;       // PSRAM copy of its tail; nullptr when none survived
 TailHead s_prev{};                     // prev_boot, prev_sent, prev_clock_base_ms, planned
 Reset    s_reason = Reset::Other;
-char     s_crash[200] = "";            // crash_json() of a fresh core dump, or ""
+char     s_crash[200] = "";            // crash_json() of the core dump, or "" (see read_crash)
+bool     s_crash_show   = false;       // this boot follows that crash: status shows it
+[[maybe_unused]] bool s_crash_report = false;       // the cloud has not had it: log.tail carries it
+[[maybe_unused]] uint32_t s_crash_id = 0;
+[[maybe_unused]] std::atomic<bool> s_crash_handed{false};   // log.tail with the crash went to the link; log_cloud_tick saves that
 [[maybe_unused]] bool s_tail_due = true;   // log.tail not sent yet in this run
 
 std::atomic<uint32_t> s_sent{0};       // lines handed to the cloud link since start
@@ -103,35 +108,40 @@ Reset map_reset(esp_reset_reason_t r) {
 }
 
 #ifdef LOG_CLOUD_CRASH_SUMMARY
-// A fresh dump exists after a panic or an interrupt watchdog (both go through the panic handler). It is
-// reported once: NVS sys_cfg/cd_sent holds the first 4 bytes of the reported dump's SHA-256 (the image's last
-// 32 bytes). An older dump that a later crash failed to replace has the same id, so it is not reported twice.
+// A dump exists after a panic, an interrupt watchdog or a task watchdog (all go through the panic handler). It
+// is read at every boot: status shows it on the boot right after the crash, and the cloud gets it at the first
+// log.tail that can carry it -- cloud logs off or no link in the crash's run only delay it (research 2026-11-18
+// A2). NVS sys_cfg/cd_sent holds the id of the last dump the cloud got: the first 4 bytes of its SHA-256 (the
+// image's last 32 bytes), written by log_cloud_tick() once the tail went out. An older dump that a later crash
+// failed to replace has the same id, so it is not reported twice.
 void read_crash() {
-    if (s_reason != Reset::Panic && s_reason != Reset::IntWdt) return;
     if (esp_core_dump_image_check() != ESP_OK) return;
     size_t addr = 0, size = 0;
     if (esp_core_dump_image_get(&addr, &size) != ESP_OK || size < 32) return;
     uint32_t id = 0;
     if (esp_flash_read(nullptr, &id, addr + size - 32, sizeof(id)) != ESP_OK) return;
     if (id == 0) id = 1;
-    nvs_handle_t h;
-    if (nvs_open("sys_cfg", NVS_READWRITE, &h) != ESP_OK) return;
     uint32_t seen = 0;
-    nvs_get_u32(h, "cd_sent", &seen);
-    if (seen != id) {
-        auto* sum = static_cast<esp_core_dump_summary_t*>(
-            heap_caps_malloc(sizeof(esp_core_dump_summary_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        if (sum && esp_core_dump_get_summary(sum) == ESP_OK) {
-            char why[96] = "";
-            if (esp_core_dump_get_panic_reason(why, sizeof(why)) != ESP_OK || !why[0])
-                std::snprintf(why, sizeof(why), "%s", riscv_cause_name(sum->ex_info.mcause));
-            crash_json(s_crash, sizeof(s_crash), sum->exc_task, sum->exc_pc, why,
-                       reinterpret_cast<const char*>(sum->app_elf_sha256));
-            if (nvs_set_u32(h, "cd_sent", id) == ESP_OK) nvs_commit(h);
-        }
-        heap_caps_free(sum);
+    nvs_handle_t h;
+    if (nvs_open("sys_cfg", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, "cd_sent", &seen);
+        nvs_close(h);
     }
-    nvs_close(h);
+    const CrashUse use = crash_use(s_reason, id, seen);
+    if (!use.show && !use.report) return;
+    auto* sum = static_cast<esp_core_dump_summary_t*>(
+        heap_caps_malloc(sizeof(esp_core_dump_summary_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (sum && esp_core_dump_get_summary(sum) == ESP_OK) {
+        char why[96] = "";
+        if (esp_core_dump_get_panic_reason(why, sizeof(why)) != ESP_OK || !why[0])
+            std::snprintf(why, sizeof(why), "%s", riscv_cause_name(sum->ex_info.mcause));
+        crash_json(s_crash, sizeof(s_crash), sum->exc_task, sum->exc_pc, why,
+                   reinterpret_cast<const char*>(sum->app_elf_sha256));
+        s_crash_show   = use.show && s_crash[0];
+        s_crash_report = use.report && s_crash[0];
+        s_crash_id     = id;
+    }
+    heap_caps_free(sum);
 }
 #endif
 
@@ -148,7 +158,7 @@ void send_tail(char* out) {
     h.up_ms      = static_cast<uint64_t>(esp_timer_get_time()) / 1000u;
     h.clock_ms   = clock_ms();
     h.reason     = reset_name(s_reason);
-    h.crash_json = s_crash[0] ? s_crash : nullptr;
+    h.crash_json = s_crash_report ? s_crash : nullptr;
     size_t n = 0;
     if (s_prev_block) {
         const Ring prev(s_prev_block, kTailBytes);
@@ -156,7 +166,10 @@ void send_tail(char* out) {
     } else {
         n = tail_json(out, kBatchBytes, h, nullptr);
     }
-    if (n) remote_client_publish_event("log.tail", out, n);
+    if (n) {
+        remote_client_publish_event("log.tail", out, n);
+        if (h.crash_json) s_crash_handed = true;
+    }
     heap_caps_free(s_prev_block);
     s_prev_block = nullptr;
 }
@@ -319,6 +332,20 @@ void log_cloud_planned_restart(Planned p) {
     s_tail.hdr().planned = static_cast<uint32_t>(p);
     s_tail.seal();
     portEXIT_CRITICAL(&s_mux);
+}
+
+const char* log_cloud_reset_reason() { return reset_name(s_reason); }
+
+const char* log_cloud_last_crash() { return s_crash_show ? s_crash : nullptr; }
+
+void log_cloud_tick() {
+#ifdef LOG_CLOUD_CRASH_SUMMARY
+    if (!s_crash_handed.exchange(false)) return;
+    nvs_handle_t h;
+    if (nvs_open("sys_cfg", NVS_READWRITE, &h) != ESP_OK) return;   // reported again next boot: harmless
+    if (nvs_set_u32(h, "cd_sent", s_crash_id) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+#endif
 }
 
 void log_cloud_stats(uint32_t* sent, uint32_t* dropped) {

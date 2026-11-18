@@ -285,6 +285,12 @@ const char* planned_name(uint32_t p) {
     }
 }
 
+CrashUse crash_use(Reset reason, uint32_t dump_id, uint32_t reported_id) {
+    const bool unsent  = dump_id != reported_id;
+    const bool crashed = reason == Reset::Panic || reason == Reset::IntWdt || reason == Reset::TaskWdt;
+    return {crashed && unsent, unsent};
+}
+
 PrevRun prev_run(bool tail_valid, uint32_t tail_planned, bool new_image, Reset reason, bool rolled_back) {
     constexpr auto code = [](Planned p) { return static_cast<uint32_t>(p); };
     // On trial, the previous run was always another image: whatever sits at this address is not ours to read.

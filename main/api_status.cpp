@@ -34,6 +34,7 @@
 #include "ws_server.h"
 #include "zigbee_pool.h"
 #include "log_ring.h"
+#include "log_cloud.h"
 #include "log_cloud_core.h"
 #include "lua_engine.h"   // lua_engine_scripts_held
 #include "remote_client.h"
@@ -88,6 +89,8 @@ void api_status_fill(JsonObject doc) {
     if (const char* why = ota_update_rollback_reason()) doc["ota_rollback_reason"] = why;
     if (ota_update_store_unconfirmed()) doc["ota_store_unconfirmed"] = true;   // see ota_update.h
     if (ota_update_safe_mode()) doc["safe_mode"] = true;   // early crashes: no Lua, MQTT or cloud link this boot
+    doc["reset_reason"] = log_cloud_reset_reason();   // why this boot started
+    if (const char* c = log_cloud_last_crash()) doc["last_crash"] = serialized(c);   // {task, pc, cause, elf}
 
     // Chip / build
     esp_chip_info_t info{};
