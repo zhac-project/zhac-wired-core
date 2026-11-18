@@ -53,6 +53,7 @@
 #include "zigbee_mgr.h"      // zigbee_mgr_coordinator_ieee
 #include "zigbee_pool.h"
 
+#include <cstdio>
 #include <cstring>
 
 static const char* TAG = "esp_zb_cfg";
@@ -75,6 +76,17 @@ SemaphoreHandle_t s_bind_op  = nullptr;
 ReqGen            s_bind_gen;          // a reply after its timeout is not the next bind's
 bool              s_bind_ok  = false;
 uint8_t           s_bind_status = 0xFF;   // ZDP status of the last response, 0xFF = none
+
+// The answer to one Configure Reporting at a time (research 2026-11-18 A5).
+// Armed under the stack lock and fed on the stack task with it held, like the
+// groups query, so no answer lands between draining and arming.
+SemaphoreHandle_t s_rep_sem     = nullptr;
+SemaphoreHandle_t s_rep_op      = nullptr;   // one request from send to answer
+uint16_t          s_rep_nwk     = 0;         // 0 = nobody waiting
+uint16_t          s_rep_cluster = 0;
+uint16_t          s_rep_attr    = 0;
+uint8_t           s_rep_tsn     = 0;
+int               s_rep_status  = -1;
 
 // Resolve a device's current short address. Snapshot rather than holding a
 // pool pointer -- pool_remove()'s swap-with-last can retarget the slot.
@@ -224,9 +236,10 @@ bool cfg_report(uint64_t ieee, uint8_t ep, uint16_t cluster, uint16_t attr_id,
     uint16_t nwk = 0;
     if (!nwk_of(ieee, &nwk)) return false;
 
+    const uint8_t tsn = zcl_seq_next();
     uint8_t f[kZclMax];
     const size_t p = zhc_zcl::configure_report(
-        f, sizeof(f), zcl_seq_next(), attr_id, attr_type,
+        f, sizeof(f), tsn, attr_id, attr_type,
         min_interval, max_interval, reportable_change, manu);
     if (p == 0) {
         ESP_LOGW(TAG, "report: unsupported attr type 0x%02x on cluster 0x%04x "
@@ -234,15 +247,53 @@ bool cfg_report(uint64_t ieee, uint8_t ep, uint16_t cluster, uint16_t attr_id,
         return false;
     }
 
-    // Fire and forget, like z2m's reporting.* helpers. The device's Configure
-    // Reporting Response carries per-attribute status and arrives later as a
-    // normal inbound frame through the decode pipeline.
-    const bool ok = esp_zb_af_send(nwk, ep, cluster, f, p);
-    ESP_LOGI(TAG, "report %016llx ep %u cluster 0x%04x attr 0x%04x "
-                  "min=%us max=%us chg=%lu: %s",
-             (unsigned long long)ieee, ep, cluster, attr_id,
-             min_interval, max_interval,
-             (unsigned long)reportable_change, ok ? "sent" : "FAILED");
+    // A converter answering an inbound frame sends on the stack task, where
+    // the answer could only be fed after this returns: send and do not wait.
+    if (xTaskGetCurrentTaskHandle() == zb_lock::stack_task()) return esp_zb_af_send(nwk, ep, cluster, f, p);
+
+    // Like z2m, wait for the device's answer (research 2026-11-18 A5): a
+    // refusal or no answer fails this report. run_configure then stops the
+    // configure (the retry queue runs it again) unless the definition marks
+    // the report optional, as z2m's converters catch it.
+    if (xSemaphoreTake(s_rep_op, pdMS_TO_TICKS(2 * kBindTimeoutMs)) != pdTRUE) {
+        ESP_LOGW(TAG, "report 0x%04x: another report setup did not finish", nwk);
+        return false;
+    }
+    bool armed = false;
+    {
+        zb_lock::Guard g;
+        if (g) {
+            xSemaphoreTake(s_rep_sem, 0);   // drain a stale post
+            s_rep_status = -1;
+            s_rep_tsn = tsn;
+            s_rep_cluster = cluster;
+            s_rep_attr = attr_id;
+            s_rep_nwk = nwk;
+            armed = true;
+        }
+    }
+    // Sent outside the lock: esp_zb_af_send may sleep while the stack's
+    // buffers drain, and the stack task needs the lock to drain them.
+    const bool sent = armed && esp_zb_af_send(nwk, ep, cluster, f, p);
+    const bool got = sent && xSemaphoreTake(s_rep_sem, pdMS_TO_TICKS(kBindTimeoutMs)) == pdTRUE;
+    { zb_lock::Guard g; s_rep_nwk = 0; }   // a late answer is nobody's
+    const int status = s_rep_status;
+    xSemaphoreGive(s_rep_op);
+
+    const bool ok = got && status == 0;
+    char res[24] = "ok";
+    if (!sent)       std::snprintf(res, sizeof(res), "FAILED to send");
+    else if (!got)   std::snprintf(res, sizeof(res), "no answer");
+    else if (!ok)    std::snprintf(res, sizeof(res), "refused (0x%02x)", status);
+    if (ok) {
+        ESP_LOGI(TAG, "report %016llx ep %u cluster 0x%04x attr 0x%04x min=%us max=%us chg=%lu: ok",
+                 (unsigned long long)ieee, ep, cluster, attr_id, min_interval, max_interval,
+                 (unsigned long)reportable_change);
+    } else {
+        ESP_LOGW(TAG, "report %016llx ep %u cluster 0x%04x attr 0x%04x min=%us max=%us chg=%lu: %s",
+                 (unsigned long long)ieee, ep, cluster, attr_id, min_interval, max_interval,
+                 (unsigned long)reportable_change, res);
+    }
     return ok;
 }
 
@@ -285,10 +336,25 @@ void cfg_sleep(uint16_t wait_ms) {
 
 }  // namespace
 
+// Fed every inbound ZCL frame by the APS hook, on the stack task with the
+// lock held. Consumes only the answer cfg_report() is waiting for.
+bool esp_zb_cfg_feed_zcl(uint16_t nwk, uint16_t cluster_id, uint8_t /*src_ep*/,
+                         const uint8_t* zcl, uint8_t zcl_len) {
+    if (s_rep_nwk == 0 || nwk != s_rep_nwk || cluster_id != s_rep_cluster) return false;
+    const int status = zhc_zcl::configure_report_status(zcl, zcl_len, s_rep_tsn, s_rep_attr);
+    if (status < 0) return false;
+    s_rep_status = status;
+    s_rep_nwk = 0;                       // answered: nothing may overwrite it now
+    xSemaphoreGive(s_rep_sem);
+    return true;
+}
+
 void esp_zb_configure_register() {
     if (!s_bind_sem) s_bind_sem = xSemaphoreCreateBinary();
     if (!s_bind_op)  s_bind_op  = xSemaphoreCreateMutex();
-    if (!s_bind_sem || !s_bind_op) {
+    if (!s_rep_sem)  s_rep_sem  = xSemaphoreCreateBinary();
+    if (!s_rep_op)   s_rep_op   = xSemaphoreCreateMutex();
+    if (!s_bind_sem || !s_bind_op || !s_rep_sem || !s_rep_op) {
         ESP_LOGE(TAG, "sem alloc failed -- bindings will not be created");
         return;
     }

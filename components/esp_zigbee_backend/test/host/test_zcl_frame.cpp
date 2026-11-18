@@ -205,6 +205,34 @@ int main() {
                   parse_group_membership(two, sizeof(two), ids, 1, &cnt) && cnt == 1 && ids[0] == 101, true);
     }
 
+    // ── The answer to our Configure Reporting (research 2026-11-18 A5): the status for the one attribute we asked
+    // for, or -1 for any other frame.
+    {
+        const uint8_t ok_all[] = {0x18, 0x21, 0x07, 0x00};
+        expect_eq("cfg-report rsp: lone success", configure_report_status(ok_all, sizeof(ok_all), 0x21, 0x0400), 0);
+        const uint8_t refused[] = {0x18, 0x21, 0x07, 0x86};
+        expect_eq("cfg-report rsp: lone failure", configure_report_status(refused, sizeof(refused), 0x21, 0x0400), 0x86);
+        const uint8_t recs[] = {0x18, 0x21, 0x07, 0x8C, 0x00, 0x00, 0x04, 0x86, 0x00, 0x21, 0x00};
+        expect_eq("cfg-report rsp: our record", configure_report_status(recs, sizeof(recs), 0x21, 0x0400), 0x8C);
+        expect_eq("cfg-report rsp: the other record", configure_report_status(recs, sizeof(recs), 0x21, 0x0021), 0x86);
+        expect_eq("cfg-report rsp: only others failed = ours succeeded",
+                  configure_report_status(recs, sizeof(recs), 0x21, 0x0000), 0);
+        const uint8_t each_ok[] = {0x18, 0x21, 0x07, 0x00, 0x00, 0x00, 0x04};
+        expect_eq("cfg-report rsp: a success record", configure_report_status(each_ok, sizeof(each_ok), 0x21, 0x0400), 0);
+        const uint8_t mfg[] = {0x1C, 0x5F, 0x11, 0x21, 0x07, 0x00};
+        expect_eq("cfg-report rsp: manufacturer-specific header", configure_report_status(mfg, sizeof(mfg), 0x21, 0x00F7), 0);
+        const uint8_t dflt[] = {0x18, 0x21, 0x0B, 0x06, 0x82};
+        expect_eq("cfg-report rsp: default response to it", configure_report_status(dflt, sizeof(dflt), 0x21, 0x0400), 0x82);
+        const uint8_t dflt_other[] = {0x18, 0x21, 0x0B, 0x00, 0x82};
+        expect_eq("cfg-report rsp: default response to another command",
+                  configure_report_status(dflt_other, sizeof(dflt_other), 0x21, 0x0400), -1);
+        expect_eq("cfg-report rsp: another transaction", configure_report_status(ok_all, sizeof(ok_all), 0x22, 0x0400), -1);
+        const uint8_t specific[] = {0x19, 0x21, 0x07, 0x00};
+        expect_eq("cfg-report rsp: a cluster command 0x07 is not it",
+                  configure_report_status(specific, sizeof(specific), 0x21, 0x0400), -1);
+        expect_eq("cfg-report rsp: no status is not an answer", configure_report_status(ok_all, 3, 0x21, 0x0400), -1);
+    }
+
     n = write_cie_address(b, sizeof(b), 0x41, 0x30EDA0FFFEF43DD6ull);
     expect_bytes("write IAS_CIE_Address", b, n,
                  {0x00, 0x41, 0x02, 0x10, 0x00, 0xF0, 0xD6, 0x3D, 0xF4, 0xFE, 0xFF, 0xA0, 0xED, 0x30});

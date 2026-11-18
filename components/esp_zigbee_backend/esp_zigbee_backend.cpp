@@ -489,6 +489,8 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
                           ind->asdu, static_cast<uint8_t>(ind->asdu_length));
     zb_groups_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint, ind->asdu,
                        static_cast<uint8_t>(ind->asdu_length));
+    esp_zb_cfg_feed_zcl(nwk, ind->cluster_id, ind->src_endpoint, ind->asdu,
+                        static_cast<uint8_t>(ind->asdu_length));
     feed_late_identity(nwk, ind->cluster_id, ind->asdu, ind->asdu_length);
 
     // Identity strings for the matcher, straight from the pool snapshot (the

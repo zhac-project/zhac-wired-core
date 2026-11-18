@@ -175,6 +175,25 @@ inline bool parse_header(const uint8_t* zcl, size_t len, Header* out) {
     return true;
 }
 
+// The device's answer to our Configure Reporting (cmd 0x06) for attribute `attr_id`, sent with `tsn` (ZCL
+// §2.5.8, §2.5.12). A Configure Reporting Response (profile-wide 0x07) is a lone status when every record
+// succeeded, else [status | direction | attr_id LE] records, often only the failed ones. A Default Response
+// (0x0B) to command 0x06 is [cmd | status]: an error, or no support for the command. Returns that attribute's
+// status (0x00 = success), or -1 when the frame is not such an answer.
+inline int configure_report_status(const uint8_t* zcl, size_t len, uint8_t tsn, uint16_t attr_id) {
+    Header h;
+    if (!parse_header(zcl, len, &h) || h.cluster_specific || h.tsn != tsn || len <= h.hdr_len) return -1;
+    const uint8_t* b = zcl + h.hdr_len;
+    const size_t   n = len - h.hdr_len;
+    if (h.cmd == 0x0B) return n >= 2 && b[0] == 0x06 ? b[1] : -1;
+    if (h.cmd != 0x07) return -1;
+    if (n < 4) return b[0];   // the lone status (a shorter record is read the same way)
+    for (size_t i = 0; i + 4 <= n; i += 4) {
+        if (static_cast<uint16_t>(b[i + 2] | (b[i + 3] << 8)) == attr_id) return b[i];
+    }
+    return 0;   // only the failed records are listed, and ours is not one
+}
+
 // IAS Zone (0x0500) enrollment, the ZNP path's handshake (zigbee_mgr.cpp
 // zcl_maybe_respond_ias_enroll): a sensor that is not enrolled sends Zone
 // Enroll Request (cluster command 0x01) and stays silent until it gets a Zone
