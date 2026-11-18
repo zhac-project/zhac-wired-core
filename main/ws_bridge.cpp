@@ -1730,6 +1730,10 @@ static void cmd_debug_crash(int fd, uint32_t id) {
 // reply is already on the wire. esp_restart() still runs the registered
 // shutdown handler (main.cpp's flush_stores: rule store, shadow, device
 // store), so device states and last_seen are saved same as any other reboot.
+// Those flushes write NVS on this task's stack: 2 KB could overflow and turn a
+// clean restart into a crash that loses the writes (research 2026-11-18 A3);
+// TaskSupervisor gets 4 KB for the same work.
+static constexpr uint32_t kRestartStack = 6144;
 static void restart_task(void*) {
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -1738,7 +1742,7 @@ static void cmd_system_restart(int fd, uint32_t id) {
     ESP_LOGI(TAG, "restart requested from the web UI");
     log_cloud_planned_restart(logcloud::Planned::Restart);
     reply_ok_or_err(fd, id, true, nullptr);
-    if (xTaskCreate(restart_task, "restart", 2048, nullptr, 2, nullptr) != pdPASS) {
+    if (xTaskCreate(restart_task, "restart", kRestartStack, nullptr, 2, nullptr) != pdPASS) {
         vTaskDelay(pdMS_TO_TICKS(500));   // task create (OOM) failed -- still honor the request
         esp_restart();
     }
