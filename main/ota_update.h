@@ -12,9 +12,10 @@
 void ota_update_init();
 
 // Early in app_main (NVS and the log ring up): counts boots that crashed within
-// two minutes of starting. After three in a row it rolls back to the other
-// image when it can (does not return; the old image shows why), else returns
-// true: safe mode, no Lua, MQTT or cloud link this boot (review 2026-10-24 PB-04).
+// two minutes of starting. From three in a row it returns true: safe mode, no
+// Lua, MQTT or cloud link this boot (review 2026-10-24 PB-04). From five, an
+// image that has not yet run a day rolls back to the other one when it can
+// (does not return; the old image shows why). See boot_guard_rule.h.
 bool ota_update_boot_guard();
 bool ota_update_safe_mode();
 

@@ -4,6 +4,7 @@
 // ota_update.cpp — see ota_update.h. Mirrors net-core's task_ota (S3 side of
 // the dual-chip build), with target "self".
 #include "ota_update.h"
+#include "boot_guard_rule.h"
 #include "ota_image.h"
 #include "ota_redirect.h"
 
@@ -15,6 +16,7 @@
 #include <strings.h>
 
 #include "ArduinoJson.h"
+#include "esp_app_desc.h"
 #include "esp_attr.h"      // __NOINIT_ATTR: the early-crash counter
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
@@ -384,20 +386,52 @@ void task(void*) {
     vTaskDelete(nullptr);
 }
 
-// ── Early-crash guard (review 2026-10-24 PB-04) ───────────────────────────
+// ── Early-crash guard (review 2026-10-24 PB-04, research 2026-11-18 A1) ──
 // The bootloader rolls back only an image on trial, so a kept image that
-// crashes soon after every boot loops for ever. Three boots in a row that end
-// in a crash within kEarlyUs of starting roll back to the other slot when it
-// holds a bootable image; otherwise the hub runs in safe mode (no Lua, MQTT or
-// cloud link: the web UI stays up, the radio keeps its own guard) until a boot
-// lasts kEarlyUs. No-init RAM: it survives the resets it counts.
+// crashes soon after every boot loops for ever. Boots in a row that end in a
+// crash within kEarlyUs of starting are counted; boot_guard_rule.h turns the
+// count into safe mode (no Lua, MQTT or cloud link: the web UI stays up, the
+// radio keeps its own guard) and, for an image that keeps crashing in safe
+// mode and has not yet run a day, a rollback to the other slot. A boot that
+// lasts kEarlyUs ends the run. No-init RAM: it survives the resets it counts.
 constexpr uint32_t kEarlyMagic   = 0x5AFE0B07;
 constexpr int64_t  kEarlyUs      = 2 * 60 * 1000000LL;
-constexpr uint32_t kEarlyCrashes = 3;
+constexpr char     kEarlyWhy[]   = "it crashed within 2 min of starting five times in a row";
+static_assert(boot_guard::kRollbackAt == 5, "kEarlyWhy names the count");
+static_assert(sizeof(kEarlyWhy) <= sizeof(s_rollback_why), "ota_update_init() reads the reason into s_rollback_why");
 __NOINIT_ATTR uint32_t s_early_magic;
 __NOINIT_ATTR uint32_t s_early_armed;   // 1 from boot until kEarlyUs of uptime
 __NOINIT_ATTR uint32_t s_early_count;   // boots in a row that crashed early
 bool s_safe_mode = false;
+
+// Hours the running image has run over all its boots, safe-mode boots left out.
+constexpr const char* kNvsImgId    = "img_sha4";   // u32: first 4 bytes of that image's ELF SHA-256
+constexpr const char* kNvsImgHours = "img_up_h";   // u8: its hours, up to boot_guard::kProvenHours
+uint32_t s_image_id    = 0;
+uint8_t  s_image_hours = 0;
+
+// NVS unreadable: 0 hours, so the image counts as new (the guard's old behaviour).
+void image_hours_load() {
+    std::memcpy(&s_image_id, esp_app_get_description()->app_elf_sha256, sizeof(s_image_id));
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
+    uint32_t id = 0;
+    uint8_t  hours = 0;
+    if (nvs_get_u32(h, kNvsImgId, &id) == ESP_OK && nvs_get_u8(h, kNvsImgHours, &hours) == ESP_OK)
+        s_image_hours = boot_guard::image_hours(id, hours, s_image_id);
+    nvs_close(h);
+}
+
+void image_hour_tick(void*) {
+    const uint8_t next = boot_guard::next_hour(s_image_hours);
+    if (next == s_image_hours) return;
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_u32(h, kNvsImgId, s_image_id) == ESP_OK && nvs_set_u8(h, kNvsImgHours, next) == ESP_OK &&
+        nvs_commit(h) == ESP_OK)
+        s_image_hours = next;
+    nvs_close(h);
+}
 
 bool crash_reset(esp_reset_reason_t r) {
     return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
@@ -422,13 +456,24 @@ bool ota_update_boot_guard() {
     a.callback = [](void*) { s_early_armed = 0; s_early_count = 0; };   // this boot lasted
     a.name = "early_guard";
     if (!disarm && esp_timer_create(&a, &disarm) == ESP_OK) esp_timer_start_once(disarm, kEarlyUs);
+    image_hours_load();
     const uint32_t n = s_early_count;
-    if (n < kEarlyCrashes) return false;
-    if (esp_ota_check_rollback_is_possible()) {
-        ESP_LOGE(TAG, "%" PRIu32 " boots in a row crashed within %d s -- rolling back to the other image",
-                 n, static_cast<int>(kEarlyUs / 1000000));
+    const boot_guard::Verdict v = boot_guard::verdict(n, s_image_hours, esp_ota_check_rollback_is_possible());
+    if (v == boot_guard::Verdict::Run) {
+        static esp_timer_handle_t hourly = nullptr;
+        esp_timer_create_args_t t{};
+        t.callback = image_hour_tick;
+        t.name = "img_hours";
+        if (s_image_hours < boot_guard::kProvenHours && !hourly && esp_timer_create(&t, &hourly) == ESP_OK)
+            esp_timer_start_periodic(hourly, 3600ULL * 1000000ULL);
+        return false;
+    }
+    if (v == boot_guard::Verdict::Rollback) {
+        ESP_LOGE(TAG, "%" PRIu32 " boots in a row crashed within %d s, the last ones in safe mode, and this image "
+                      "has run only %u h -- rolling back to the other image",
+                 n, static_cast<int>(kEarlyUs / 1000000), (unsigned)s_image_hours);
         s_early_count = 0;
-        nvs_put_str(kNvsRollback, "it crashed three times in a row within two minutes of starting");
+        nvs_put_str(kNvsRollback, kEarlyWhy);
         log_cloud_planned_restart(logcloud::Planned::Rollback);
         esp_ota_mark_app_invalid_rollback_and_reboot();   // returns only if it could not
     }
