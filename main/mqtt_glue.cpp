@@ -49,6 +49,21 @@ bool value_json(uint8_t type, int32_t int_val, const char* str_val, char* out, s
     }
 }
 
+// The shadow's values as members of `obj`, without "_" bookkeeping keys and,
+// with `state_only`, without what a retained state must not hold: secrets and
+// the momentary action (ha::state_retained).
+void add_attrs(JsonObject obj, const ShadowAttr* sa, uint8_t n, bool state_only) {
+    for (uint8_t j = 0; j < n; j++) {
+        char v[64];
+        char s[ATTR_STR_MAX + 1] = {};                 // str_val need not end in NUL
+        if (sa[j].val_type == VAL_STR) memcpy(s, sa[j].str_val, ATTR_STR_MAX);
+        if (sa[j].key[0] == '_' || (state_only && !ha::state_retained(sa[j].key)) ||
+            !value_json(sa[j].val_type, sa[j].int_val, s, v, sizeof(v)))
+            continue;
+        obj[sa[j].key] = serialized(v);
+    }
+}
+
 // Build one device's snapshot outside the pool lock (publishing can block on
 // the broker), then hand it to ha_bridge.
 bool with_device(uint64_t ieee, HaDeviceCb cb, void* ctx) {
@@ -69,15 +84,7 @@ bool with_device(uint64_t ieee, HaDeviceCb cb, void* ctx) {
     ShadowAttr sa[32];
     const uint8_t nsa = device_shadow_get_attrs(ieee, sa, 32);
     JsonDocument a;
-    JsonObject obj = a.to<JsonObject>();
-    for (uint8_t j = 0; j < nsa; j++) {
-        char v[64];
-        char s[ATTR_STR_MAX + 1] = {};                 // str_val need not end in NUL
-        if (sa[j].val_type == VAL_STR) memcpy(s, sa[j].str_val, ATTR_STR_MAX);
-        if (sa[j].key[0] == '_' || !value_json(sa[j].val_type, sa[j].int_val, s, v, sizeof(v)))
-            continue;
-        obj[sa[j].key] = serialized(v);
-    }
+    add_attrs(a.to<JsonObject>(), sa, nsa, false);
     if (serializeJson(a, attrs, kAttrs) >= kAttrs) snprintf(attrs, kAttrs, "{}");
 
     const HaDeviceSnapshot snap{ieee, dev.friendly_name, vendor[0] ? vendor : dev.manufacturer_name,
@@ -124,24 +131,67 @@ const HaBridgePlatform kPlatform = {
     set_attr,
 };
 
+// z2m's per-device message: {"ieee":"0x..","attrs":{...}} with the device's
+// whole retained-safe state, plus `key`=`val` (a press) when given. Length, or
+// 0 when it does not fit `cap`.
+size_t state_json(uint64_t ieee, const ShadowAttr* sa, uint8_t n, const char* key, const char* val,
+                  char* out, size_t cap) {
+    JsonDocument d;
+    char id[19];
+    snprintf(id, sizeof(id), "0x%016llX", (unsigned long long)ieee);
+    d["ieee"] = id;
+    JsonObject a = d["attrs"].to<JsonObject>();
+    add_attrs(a, sa, n, true);
+    if (key) a[key] = serialized(val);
+    const size_t len = serializeJson(d, out, cap);
+    return len < cap ? len : 0;
+}
+
+// <root>/devices/<IEEE>/state, read back from the shadow (research 2026-11-18
+// A12). 4 KB: 32 attrs of at most ~95 B. PSRAM, so not on the bus pump's stack.
+void publish_state(uint64_t ieee, const char* key, const char* val, bool retain) {
+    char suffix[48], topic[96];
+    snprintf(suffix, sizeof(suffix), "devices/%016llX/state", (unsigned long long)ieee);
+    if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) <= 0) return;
+    constexpr size_t kCap = 4096;
+    auto* sa  = static_cast<ShadowAttr*>(heap_caps_malloc(sizeof(ShadowAttr) * 32, MALLOC_CAP_SPIRAM));
+    auto* out = static_cast<char*>(heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM));
+    if (sa && out) {
+        const uint8_t n   = device_shadow_get_attrs(ieee, sa, 32);
+        const size_t  len = state_json(ieee, sa, n, key, val, out, kCap);
+        if (len) mqtt_gw_publish(topic, out, len, 0, retain);
+        else ESP_LOGW(TAG, "0x%016llX: state does not fit %u B", (unsigned long long)ieee, (unsigned)kCap);
+    }
+    heap_caps_free(sa);
+    heap_caps_free(out);
+}
+
+// The plain per-device state topic, discovery or not, as z2m publishes it:
+// the whole state once per report (the event with more == 0), retained, so a
+// subscriber starts from the current state; a press (or another value a
+// retained state must not hold) at once, with the state but not retained, so
+// the broker never replays it.
 void on_attr(const Event& e) {
     const auto& z = *reinterpret_cast<const ZclAttrEvent*>(e.data);
     char v[64];
     char s[ATTR_STR_MAX + 1] = {};
     if (z.val_type == VAL_STR) memcpy(s, z.str_val, ATTR_STR_MAX);
-    if (!value_json(z.val_type, z.int_val, s, v, sizeof(v))) return;
-    ha_bridge_publish_state(z.ieee, z.key, v);   // Home Assistant topics, only while discovery is on
-    // Plain per-device state topic, discovery or not -- what the dual-chip S3
-    // publishes from every HAP update: <root>/devices/<IEEE>/state with
-    // {"ieee":"0x..","attrs":{key:value}}. Without it a broker showed
-    // "connected" and then nothing unless Home Assistant discovery was on.
-    if (z.key[0] == '_' || !mqtt_gw_is_connected()) return;
-    char suffix[48], topic[96], payload[160];
-    snprintf(suffix, sizeof(suffix), "devices/%016llX/state", (unsigned long long)z.ieee);
-    if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) <= 0) return;
-    const int n = snprintf(payload, sizeof(payload), "{\"ieee\":\"0x%016llX\",\"attrs\":{\"%s\":%s}}",
-                           (unsigned long long)z.ieee, z.key, v);
-    if (n > 0 && (size_t)n < sizeof(payload)) mqtt_gw_publish(topic, payload, (size_t)n, 0, false);
+    const bool have = value_json(z.val_type, z.int_val, s, v, sizeof(v));
+    if (have) ha_bridge_publish_state(z.ieee, z.key, v);   // Home Assistant topics, only while discovery is on
+    if (!mqtt_gw_is_connected()) return;
+    if (have && z.key[0] != '_' && !ha::state_retained(z.key)) publish_state(z.ieee, z.key, v, false);
+    if (!z.more) publish_state(z.ieee, nullptr, nullptr, true);
+}
+
+// A removed device: its retained state goes too (an empty retained message),
+// as z2m does -- else every new subscriber still sees it.
+void on_device_leave(const Event& e) {
+    uint64_t ieee = 0;
+    memcpy(&ieee, e.data, sizeof(ieee));
+    ha_bridge_device_removed(ieee);
+    char suffix[48], topic[96];
+    snprintf(suffix, sizeof(suffix), "devices/%016llX/state", (unsigned long long)ieee);
+    if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) > 0) mqtt_gw_publish(topic, "", 0, 0, true);
 }
 
 // Everything under <root>/# that is not a Home Assistant command goes to the
@@ -194,11 +244,7 @@ void mqtt_glue_start() {
         memcpy(&ieee, e.data, sizeof(ieee));
         ha_bridge_device_changed(ieee);
     });
-    event_bus_subscribe(EventType::DEVICE_LEAVE, [](const Event& e) {
-        uint64_t ieee = 0;
-        memcpy(&ieee, e.data, sizeof(ieee));
-        ha_bridge_device_removed(ieee);
-    });
+    event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
 
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, on_got_ip, nullptr);
 #ifdef CONFIG_ZHAC_WIFI_HOSTED
