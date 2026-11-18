@@ -36,6 +36,7 @@
 #include "esp_zb_netmap.h"
 #include "sys_diag.h"
 #include "dgm_store.h"
+#include "api_devices.h"
 #include "zigbee_pool.h"
 #include "zhc_adapter.h"
 #include "zap_common.h"
@@ -499,52 +500,15 @@ static void cmd_device_reinterview(int fd, uint32_t id, JsonDocument& doc) {
 // + reports + config_steps). Faster than reinterview when the device's
 // (model_id, manufacturer_name) are already cached. Useful right after
 // a firmware update that added new `config_steps` for an existing
-// paired device.
-//
-// Releases the pool lock before invoking `zhac_adapter_configure` —
-// the call issues radio frames that can block on AF_DATA_CONFIRM for
-// ~2.5 s; holding the pool mutex through that would stall every other
-// device dispatching attrs simultaneously.
+// paired device. Queued to the configure worker, never run on this task
+// (api_devices.cpp device_configure_request): the reply means "started",
+// and the outcome shows in the device's configure state.
 static void cmd_device_configure(int fd, uint32_t id, JsonDocument& doc) {
     const char* ieee_s = doc["args"]["ieee"] | (const char*)nullptr;
     if (!ieee_s) { send_err(fd, id, "missing ieee"); return; }
     uint64_t ieee = parse_ieee(ieee_s);
     if (ieee == 0) { send_err(fd, id, "bad ieee"); return; }
-
-    zigbee_pool_lock();
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev || dev->model_id[0] == '\0') {
-        zigbee_pool_unlock();
-        send_err(fd, id, "device unknown or never interviewed");
-        return;
-    }
-    const uint64_t ieee_cp = dev->ieee_addr;
-    const uint16_t nwk_cp  = dev->nwk_addr;
-    char model_cp[64];
-    char manu_cp[64];
-    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
-    zigbee_pool_unlock();
-
-    const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp, model_cp, manu_cp);
-
-    // Record the outcome. Without this a successful manual retry leaves the
-    // row still showing FAILED, so the operator has no way to tell whether
-    // the button did anything.
-    ZapDevice cur{};
-    if (zigbee_pool_snapshot(ieee_cp, &cur)) {
-        cur.configure_state = static_cast<uint8_t>(
-            ok ? ConfigureState::DONE : ConfigureState::FAILED);
-        if (!ok && cur.configure_attempts < 0xFF) cur.configure_attempts++;
-        zigbee_pool_with_device(ieee_cp,
-            [](ZapDevice* d, void* ctx) {
-                const ZapDevice* src = static_cast<const ZapDevice*>(ctx);
-                d->configure_state    = src->configure_state;
-                d->configure_attempts = src->configure_attempts;
-            }, &cur);
-        zap_store_mark_dirty(&cur, ZAP_PERSIST_LOW);
-    }
-    reply_ok_or_err(fd, id, ok, "no def or transport down");
+    reply_ok_or_err(fd, id, device_configure_request(ieee), "device unknown or never interviewed");
 }
 
 // ── device.list ──────────────────────────────────────────────────────
@@ -1188,6 +1152,10 @@ static_assert(sizeof("{\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs
 static_assert(sizeof(",\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\",\"lan_ip\":\"255.255.255.255\"") <= 160,
               "remote_hello_extra outgrew remote_client's extra[160]");
+static_assert(sizeof(NetStatus::ip) <= sizeof("255.255.255.255"), "lan_ip above assumes a dotted quad");
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+static_assert(sizeof(WifiStatus::ip) <= sizeof("255.255.255.255"), "lan_ip above assumes a dotted quad");
+#endif
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
@@ -1685,12 +1653,8 @@ static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) 
 // (research 2026-11-18 A4). NVS is left shut, as the erase leaves it, so the
 // restart's store flush cannot write old rules or states back.
 static esp_err_t erase_storage_keeping_pin() {
-    uint64_t pin = 0;
-    nvs_handle_t h;
-    if (nvs_open("zb_coord", NVS_READONLY, &h) == ESP_OK) {
-        if (nvs_get_u64(h, "ieee", &pin) != ESP_OK) pin = 0;
-        nvs_close(h);
-    }
+    // From the partition bytes if NVS did not mount (full): the storage error this erase is offered for.
+    const uint64_t pin = esp_zigbee_backend_coordinator_pin();
     // zhac_data (the device store, WC-04) first: a cut between the two erases
     // then finds the store gone, never the old devices coming back.
     esp_err_t e = ESP_OK;
@@ -1700,6 +1664,7 @@ static esp_err_t erase_storage_keeping_pin() {
     if (e != ESP_OK || !pin) return e;
     bool kept = false;
     if (nvs_flash_init() == ESP_OK) {
+        nvs_handle_t h;
         if (nvs_open("zb_coord", NVS_READWRITE, &h) == ESP_OK) {
             kept = nvs_set_u64(h, "ieee", pin) == ESP_OK && nvs_commit(h) == ESP_OK;
             nvs_close(h);
@@ -1915,11 +1880,19 @@ extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
 extern "C" size_t remote_hello_extra(char* out, size_t cap) {
     int n = snprintf(out, cap, ",\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"", kRemoteCapsJson,
                      sys_remote_scripts() ? "true" : "false", log_level_now());
-    // The LAN address, so the cloud knows where the local web UI is (research 2026-11-18 A9). A new address
-    // breaks the link, and the reconnect sends it again.
+    // The LAN address, so the cloud knows where the local web UI is (research 2026-11-18 A9): the cable's,
+    // else Wi-Fi's (P1 review 2026-11-19 #4). A new address breaks the link, and the reconnect sends it again.
     NetStatus net{};
     eth_get_status(&net);
-    if (n > 0 && (size_t)n < cap && net.ip[0]) n += snprintf(out + n, cap - n, ",\"lan_ip\":\"%s\"", net.ip);
+    const char* ip = net.ip;
+#ifdef CONFIG_ZHAC_WIFI_HOSTED
+    WifiStatus w{};
+    if (!ip[0]) {
+        wifi_hosted_status(&w);
+        ip = w.ip;
+    }
+#endif
+    if (n > 0 && (size_t)n < cap && ip[0]) n += snprintf(out + n, cap - n, ",\"lan_ip\":\"%s\"", ip);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 #endif

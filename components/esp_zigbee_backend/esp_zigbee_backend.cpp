@@ -26,6 +26,8 @@
 // both SKUs in one repo.
 #include "esp_zigbee_backend.h"
 #include "esp_zb_boot_guard.h"
+#include "esp_zb_configure_kick.h"
+#include "nvs_raw.h"
 #include "esp_zb_interview.h"
 #include <ctime>
 #include "sdkconfig.h"
@@ -75,6 +77,8 @@ extern "C" void zhc_shadow_bridge_register(void);
 
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <new>
 
 static const char* TAG = "esp_zb";
 
@@ -534,23 +538,15 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
         dev.support_state = static_cast<uint8_t>(SupportState::MATCHED);
     }
 
-    // A frame from a device whose configure never completed means it is awake
-    // right now -- the only moment a bind / attribute write reaches a sleepy
-    // end-device (the cube's binds failed on every timed retry). Re-queue
-    // configure while it is listening; the queue skips devices already DONE.
-    // Rate-limited per device so a chatty sensor does not queue it per report.
-    if (have && dev.support_state == static_cast<uint8_t>(SupportState::MATCHED) &&
-        dev.configure_state != static_cast<uint8_t>(ConfigureState::DONE)) {
-        static uint64_t s_kick_ieee = 0;
-        static int64_t  s_kick_us   = 0;
-        const int64_t now_us = esp_timer_get_time();
-        if (ieee != s_kick_ieee || now_us - s_kick_us > 30 * 1000000LL) {
-            s_kick_ieee = ieee;
-            s_kick_us   = now_us;
-            ESP_LOGI(TAG, "%016llx is awake and not configured -- running configure now",
-                     (unsigned long long)ieee);
-            zigbee_configure_enqueue(ieee);
-        }
+    // An awake device whose configure never completed: queue it again while it
+    // listens, rate-limited and capped (esp_zb_configure_kick.h).
+    static ConfigureKick s_kick;
+    if (have && s_kick.due(ieee, dev.support_state == static_cast<uint8_t>(SupportState::MATCHED),
+                           dev.configure_state == static_cast<uint8_t>(ConfigureState::DONE),
+                           dev.configure_attempts, esp_timer_get_time())) {
+        ESP_LOGI(TAG, "%016llx is awake and not configured -- running configure now",
+                 (unsigned long long)ieee);
+        zigbee_configure_enqueue(ieee);
     }
 
     if (have && (dev.flags & (ZAP_DEV_FIX_BINDS | ZAP_DEV_FIX_CIE)))
@@ -660,13 +656,30 @@ static std::atomic<uint64_t> s_coord_ieee{0};
 // before the fix point there. 0 otherwise.
 static std::atomic<uint64_t> s_stale_bind_target{0};
 
-static void coordinator_address_apply() {
-    uint64_t pinned = 0;
+uint64_t esp_zigbee_backend_coordinator_pin(void) {
+    uint64_t pin = 0;
     nvs_handle_t h;
-    if (nvs_open(kPinNs, NVS_READONLY, &h) == ESP_OK) {
-        if (nvs_get_u64(h, kPinKey, &pinned) != ESP_OK) pinned = 0;
+    const esp_err_t e = nvs_open(kPinNs, NVS_READONLY, &h);
+    if (e == ESP_OK) {
+        if (nvs_get_u64(h, kPinKey, &pin) != ESP_OK) pin = 0;
         nvs_close(h);
+        return pin;
     }
+    if (e != ESP_ERR_NVS_NOT_INITIALIZED) return 0;   // mounted, no pin yet
+    const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS,
+                                                        NVS_DEFAULT_PART_NAME);
+    const std::unique_ptr<uint8_t[]> page(new (std::nothrow) uint8_t[nvs_raw::kPage]);
+    const bool found = p && page && nvs_raw::find_u64(
+        [](void* ctx, size_t off, void* dst, size_t n) {
+            return esp_partition_read(static_cast<const esp_partition_t*>(ctx), off, dst, n) == ESP_OK;
+        },
+        const_cast<void*>(static_cast<const void*>(p)), p->size, page.get(), kPinNs, kPinKey, &pin);
+    ESP_LOGW(TAG, "NVS is not mounted: coordinator address %s in its partition", found ? "read" : "NOT found");
+    return found ? pin : 0;
+}
+
+static void coordinator_address_apply() {
+    const uint64_t pinned = esp_zigbee_backend_coordinator_pin();
     if (pinned) {
         ezb_extaddr_t a{};
         a.u64 = pinned;

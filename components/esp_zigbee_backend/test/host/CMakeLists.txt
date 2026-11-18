@@ -40,6 +40,13 @@ add_test(NAME admit_gate COMMAND admit_gate_tests)
 add_executable(boot_guard_tests test_boot_guard.cpp)
 add_test(NAME boot_guard COMMAND boot_guard_tests)
 
+add_executable(configure_kick_tests test_configure_kick.cpp)
+add_test(NAME configure_kick COMMAND configure_kick_tests)
+
+add_executable(nvs_raw_tests test_nvs_raw.cpp)
+target_compile_definitions(nvs_raw_tests PRIVATE NVS_PIN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/nvs_pin.bin")
+add_test(NAME nvs_raw COMMAND nvs_raw_tests)
+
 # zap_common and ArduinoJson come from the sibling zhac-components checkout.
 set(ZHAC_COMPONENTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components"
     CACHE PATH "zhac-components checkout")

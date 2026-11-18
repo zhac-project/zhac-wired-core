@@ -33,6 +33,13 @@ const char* esp_zigbee_backend_last_error(void);
 // True once the stack runs and holds a network (formed, or restored at boot).
 bool esp_zigbee_backend_network_up(void);
 
+// The coordinator address pin (the address the network first ran with), 0 if
+// none. Read from NVS; while NVS cannot mount (full, or written by a newer
+// IDF) straight from the partition bytes, so the boot that found it so still
+// runs the network under its address and "Erase storage" keeps it (P1 review
+// 2026-11-19 #2).
+uint64_t esp_zigbee_backend_coordinator_pin(void);
+
 // Heartbeat of the Zigbee stack's own task (review 2026-10-24 PB-05): the
 // esp_timer_get_time() of the last stamp taken on that task, refreshed every
 // second while the stack's mainloop runs; a blocked mainloop stops it. 0 until

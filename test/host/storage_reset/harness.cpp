@@ -60,6 +60,13 @@ esp_err_t nvs_flash_erase_partition(const char* label) {
 esp_err_t nvs_flash_erase() { g_order.push_back("nvs"); g_nvs.clear(); g_nvs_init = false; return ESP_OK; }
 esp_err_t nvs_flash_init() { g_nvs_init = true; return ESP_OK; }
 esp_err_t nvs_flash_deinit() { g_nvs_init = false; return ESP_OK; }
+// esp_zigbee_backend's pin reader: NVS while mounted, else what the partition bytes hold (P1 review 2026-11-19 #2).
+static uint64_t g_raw_pin = 0;
+uint64_t esp_zigbee_backend_coordinator_pin(void) {
+    if (!g_nvs_init) return g_raw_pin;
+    const auto it = g_nvs.find("zb_coord/ieee");
+    return it == g_nvs.end() ? 0 : it->second;
+}
 
 #include "slice.inc"
 
@@ -70,7 +77,7 @@ static void expect(const char* what, bool ok) {
 }
 static void reset() {
     g_nvs.clear(); g_order.clear();
-    g_nvs_init = true; g_store_erased = false; g_store_erase_fails = false;
+    g_nvs_init = true; g_store_erased = false; g_store_erase_fails = false; g_raw_pin = 0;
 }
 // What the restart's flush handlers would manage to write after the erase.
 static bool late_write_lands() {
@@ -100,6 +107,14 @@ int main() {
     reset();
     g_nvs_init = false;   // the boot found NVS unusable (storage_error): nothing can be read first
     expect("unreadable NVS: erase still succeeds", erase_storage_keeping_pin() == ESP_OK && g_store_erased);
+    expect("  and leaves it shut", !late_write_lands());
+
+    reset();
+    g_nvs_init = false;                   // NVS full at boot (NO_FREE_PAGES): not mounted, Settings offers the erase
+    g_raw_pin  = 0x00124B0001020304ull;   // the pin is still in its bytes
+    expect("NVS not mounted: erase succeeds", erase_storage_keeping_pin() == ESP_OK);
+    expect("  and keeps the pin read from the partition",
+           g_nvs.count("zb_coord/ieee") && g_nvs["zb_coord/ieee"] == 0x00124B0001020304ull);
     expect("  and leaves it shut", !late_write_lands());
 
     reset();

@@ -22,6 +22,7 @@
 
 #include "radio_state.h"
 #include "zigbee_mgr.h"
+#include "zigbee_configure_queue.h"
 #include "zigbee_pool.h"
 #include "device_shadow.h"
 #include "zhc_adapter.h"
@@ -192,6 +193,28 @@ static esp_err_t handle_device_reinterview(httpd_req_t* req) {
     return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"unknown or sleepy\"}");
 }
 
+// ── Manual configure (WS device.configure, POST /api/device/configure) ──
+//
+// Queued to the configure worker, never run here: a configure waits up to
+// 10 s for each report's answer (research 2026-11-18 A5) and for each bind,
+// which on the web server's only task froze every page and could reach the
+// supervisor's 3-minute restart (P1 review 2026-11-19). The device starts
+// fresh -- PENDING, no failed tries -- so a configured device runs again and
+// one that gave up gets its tries back (esp_zb_configure_kick.h). The outcome
+// shows in its configure state. false: unknown, or never interviewed.
+bool device_configure_request(uint64_t ieee) {
+    zigbee_pool_lock();
+    ZapDevice* dev = pool_find_by_ieee(ieee);
+    const bool known = dev && dev->model_id[0] != '\0';
+    if (known) {
+        dev->configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
+        dev->configure_attempts = 0;
+    }
+    zigbee_pool_unlock();
+    if (known) zigbee_configure_enqueue(ieee);
+    return known;
+}
+
 // ── POST /api/device/configure ──────────────────────────────────────────
 //
 // Body: {"ieee":"0x..."}. Re-runs ONLY the configure pipeline (bindings +
@@ -219,37 +242,14 @@ static esp_err_t handle_device_configure(httpd_req_t* req) {
         return ESP_FAIL;
     }
     uint64_t ieee = parse_ieee(ieee_s);
-
-    zigbee_pool_lock();
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev || dev->model_id[0] == '\0') {
-        zigbee_pool_unlock();
+    if (!device_configure_request(ieee)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND,
                              "device unknown or never interviewed");
         return ESP_FAIL;
     }
-    // Snapshot — releasing the lock before the call since
-    // zhac_adapter_configure walks the def and issues radio frames
-    // (which may block on AF_DATA_CONFIRM up to a few seconds).
-    const uint64_t  ieee_cp = dev->ieee_addr;
-    const uint16_t  nwk_cp  = dev->nwk_addr;
-    // Buffers sized to exceed ZapDevice::{model_id, manufacturer_name}
-    // (~34 B each) — anything smaller trips -Werror=format-truncation.
-    char model_cp[64];
-    char manu_cp[64];
-    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
-    zigbee_pool_unlock();
-
-    const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp,
-                                            model_cp, manu_cp);
+    ESP_LOGI(TAG, "configure queued for 0x%016" PRIX64, ieee);
     httpd_resp_set_type(req, "application/json");
-    if (ok) {
-        ESP_LOGI(TAG, "configure re-fired for 0x%016" PRIX64, ieee_cp);
-        return httpd_resp_sendstr(req, "{\"ok\":true}");
-    }
-    return httpd_resp_sendstr(req,
-        "{\"ok\":false,\"err\":\"no def or transport down\"}");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"queued\":true}");
 }
 
 // ── POST /api/permit_join ───────────────────────────────────────────────
