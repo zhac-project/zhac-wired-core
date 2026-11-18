@@ -1677,16 +1677,44 @@ static void cmd_alerts_get(int fd, uint32_t id) {
 static void cmd_zigbee_settings_set(int fd, uint32_t id, JsonDocument& /*doc*/) {
     send_err(fd, id, "channel and network key settings are not available on this hub yet -- nothing was saved");
 }
-// Erase the hub's storage on the owner's explicit request -- the boot path
-// never does it by itself any more (see main.cpp). Gated like every command.
-static void cmd_storage_reset(int fd, uint32_t id) {
-    ESP_LOGW(TAG, "storage reset requested -- erasing NVS and restarting");
+// Erases the device store (zhac_data) and nvs. The Zigbee network (zb_storage)
+// stays, so the coordinator address it runs under stays too: joined devices
+// know the coordinator by it, and on a network moved to another board it is
+// the pin in nvs (esp_zigbee_backend.cpp kPinNs/kPinKey), not the radio's MAC
+// (research 2026-11-18 A4). NVS is left shut, as the erase leaves it, so the
+// restart's store flush cannot write old rules or states back.
+static esp_err_t erase_storage_keeping_pin() {
+    uint64_t pin = 0;
+    nvs_handle_t h;
+    if (nvs_open("zb_coord", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u64(h, "ieee", &pin) != ESP_OK) pin = 0;
+        nvs_close(h);
+    }
     // zhac_data (the device store, WC-04) first: a cut between the two erases
     // then finds the store gone, never the old devices coming back.
     esp_err_t e = ESP_OK;
     if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "zhac_data"))
         e = nvs_flash_erase_partition("zhac_data");
     if (e == ESP_OK) e = nvs_flash_erase();
+    if (e != ESP_OK || !pin) return e;
+    bool kept = false;
+    if (nvs_flash_init() == ESP_OK) {
+        if (nvs_open("zb_coord", NVS_READWRITE, &h) == ESP_OK) {
+            kept = nvs_set_u64(h, "ieee", pin) == ESP_OK && nvs_commit(h) == ESP_OK;
+            nvs_close(h);
+        }
+        nvs_flash_deinit();
+    }
+    if (!kept) ESP_LOGE(TAG, "storage erased, but the coordinator address could not be kept -- devices of a "
+                             "network moved from another board may have to pair again");
+    return ESP_OK;
+}
+
+// Erase the hub's storage on the owner's explicit request -- the boot path
+// never does it by itself any more (see main.cpp). Gated like every command.
+static void cmd_storage_reset(int fd, uint32_t id) {
+    ESP_LOGW(TAG, "storage reset requested -- erasing NVS and restarting");
+    const esp_err_t e = erase_storage_keeping_pin();
     reply_ok_or_err(fd, id, e == ESP_OK, esp_err_to_name(e));
     if (e != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(500));

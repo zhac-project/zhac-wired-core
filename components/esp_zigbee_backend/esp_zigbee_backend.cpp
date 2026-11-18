@@ -640,7 +640,7 @@ static bool esp_zb_adapter_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t clus
 // P4), or a P4 board with a replaced C6, would come up under a new address
 // and the devices' reports would go nowhere. The address the network first
 // ran with is therefore kept in NVS and set again before every start.
-static constexpr char kPinNs[]  = "zb_coord";
+static constexpr char kPinNs[]  = "zb_coord";   // also in ws_bridge.cpp erase_storage_keeping_pin()
 static constexpr char kPinKey[] = "ieee";
 // Set once the ZR-01 repair has marked the devices. A device-store flag, not
 // an NVS key of its own: it must roll back, move and reset with the records
