@@ -85,9 +85,10 @@ void status_led_start(void) {
         return;
     }
     led_strip_clear(s_strip);
-    event_bus_subscribe(EventType::ZCL_ATTR,    on_traffic);
-    event_bus_subscribe(EventType::ZCL_RAW,     on_traffic);
-    event_bus_subscribe(EventType::DEVICE_JOIN, on_traffic);
+    // One queued event is enough to flash; each slot is 104 B (research 2026-11-18 A8).
+    event_bus_subscribe(EventType::ZCL_ATTR,    on_traffic, nullptr, 1);
+    event_bus_subscribe(EventType::ZCL_RAW,     on_traffic, nullptr, 1);
+    event_bus_subscribe(EventType::DEVICE_JOIN, on_traffic, nullptr, 1);
     const esp_timer_create_args_t args = { .callback = on_tick, .arg = nullptr,
                                            .dispatch_method = ESP_TIMER_TASK, .name = "status_led",
                                            .skip_unhandled_events = true };
