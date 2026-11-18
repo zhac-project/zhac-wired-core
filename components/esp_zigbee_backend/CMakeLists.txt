@@ -39,4 +39,5 @@ idf_component_register(
         nvs_flash
         esp_timer
         freertos
+        esp_driver_gpio   # the RCP reset line (CONFIG_ZHAC_RCP_RESET_GPIO)
 )

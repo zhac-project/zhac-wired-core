@@ -54,6 +54,7 @@
 #include "ezbee/zcl/cluster/groups.h"
 #include "ezbee/zcl/cluster/groups_desc.h"
 #include "ezbee/platform/radio.h"
+#include "driver/gpio.h"   // the RCP reset line
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "zhac_task.h"
@@ -1222,6 +1223,25 @@ static bool zb_init() {
     ESP_LOGI(TAG, "radio: RCP over UART%d (tx=%d rx=%d @460800)",
              CONFIG_ZHAC_RCP_UART_PORT, CONFIG_ZHAC_RCP_UART_TX_GPIO,
              CONFIG_ZHAC_RCP_UART_RX_GPIO);
+#if CONFIG_ZHAC_RCP_RESET_GPIO >= 0
+    // A wedged C6 survived every P4 restart: its EN line was never driven, so
+    // after the radio guard's three trips the hub ran without Zigbee until
+    // someone cut the power (research 2026-11-18 A6). Hold EN low for 10 ms,
+    // release it (open drain: the board's pull-up, which kept the C6 running
+    // while this pin floated, takes it high) and let ot_rcp boot.
+    {
+        const auto en = static_cast<gpio_num_t>(CONFIG_ZHAC_RCP_RESET_GPIO);
+        gpio_config_t io{};
+        io.pin_bit_mask = 1ULL << CONFIG_ZHAC_RCP_RESET_GPIO;
+        io.mode         = GPIO_MODE_OUTPUT_OD;
+        if (gpio_set_level(en, 0) == ESP_OK && gpio_config(&io) == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            gpio_set_level(en, 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ESP_LOGI(TAG, "radio: C6 reset through GPIO%d", CONFIG_ZHAC_RCP_RESET_GPIO);
+        }
+    }
+#endif
 #endif
 
     esp_err_t err = esp_zigbee_init(&cfg);
