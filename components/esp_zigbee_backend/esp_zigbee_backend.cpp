@@ -608,23 +608,35 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
 static void on_nwk_addr(const ezb_zdo_nwk_addr_req_result_t* r, void* ctx) {
     const uint32_t token = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx));
     uint64_t ieee = 0;
+    bool again = false;
     taskENTER_CRITICAL(&s_tx_mux);
-    const bool mine = s_tx.take(token, &s_resend, &ieee);
+    const bool mine = s_tx.take(token, &s_resend, &ieee, &again);
     taskEXIT_CRITICAL(&s_tx_mux);
     if (!mine) return;
     const bool answered = r && r->error == 0 && r->rsp && r->rsp->status == 0 &&
                           r->rsp->ieee_addr_remote_dev.u64 == ieee;
     if (!answered) {
-        ESP_LOGW(TAG, "%016llx did not take cluster 0x%04x and nobody answered for its address -- offline",
-                 (unsigned long long)ieee, s_resend.cluster);
-        zhac_adapter_unreachable(ieee);
+        // Only the stack's timeout means nobody answered. An error within
+        // milliseconds means the broadcast never went out (its tables full
+        // after a power cut, the channel busy): no verdict (review P4 #2).
+        if (r && r->error == EZB_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "%016llx did not take cluster 0x%04x and nobody answered for its address -- offline",
+                     (unsigned long long)ieee, s_resend.cluster);
+            zhac_adapter_unreachable(ieee);
+        } else {
+            ESP_LOGW(TAG, "%016llx did not take cluster 0x%04x -- address not looked up (error 0x%x)",
+                     (unsigned long long)ieee, s_resend.cluster, r ? (unsigned)r->error : 0u);
+        }
         return;
     }
     const uint16_t nwk = r->rsp->nwk_addr_remote_dev;
     if (nwk != s_resend.nwk) {
         pool_set_nwk(ieee, nwk);
-        ESP_LOGI(TAG, "%016llx moved from 0x%04x to 0x%04x -- sending cluster 0x%04x again there",
-                 (unsigned long long)ieee, s_resend.nwk, nwk, s_resend.cluster);
+        ESP_LOGI(TAG, "%016llx moved from 0x%04x to 0x%04x", (unsigned long long)ieee, s_resend.nwk, nwk);
+    }
+    if (!again) {   // a Toggle or a step (it may have run, only its acks lost), or out of date
+        ESP_LOGI(TAG, "%016llx: cluster 0x%04x not sent again", (unsigned long long)ieee, s_resend.cluster);
+        return;
     }
     af_send(nwk, s_resend.ep, s_resend.cluster, s_resend.data, s_resend.len, true);
 }

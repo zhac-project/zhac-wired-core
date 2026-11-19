@@ -45,6 +45,7 @@ struct Guard {
 // ── esp-zigbee-lib, as far as the slice uses it (same names as ezbee/*.h) ───
 using ezb_err_t = int;
 constexpr ezb_err_t EZB_ERR_NO_MEM = 1;
+constexpr ezb_err_t EZB_ERR_TIMEOUT = 0x0007;   // nobody answered within the stack's 5 s
 enum ezb_addr_mode_t { EZB_ADDR_MODE_NONE, EZB_ADDR_MODE_GROUP, EZB_ADDR_MODE_SHORT, EZB_ADDR_MODE_EXT };
 struct ezb_extaddr_t { std::uint64_t u64; };
 struct ezb_grpaddr_t { std::uint16_t group, bcast; };
@@ -185,12 +186,19 @@ static void answer(const ezb_zdo_nwk_addr_req_t& q, std::uint64_t ieee, std::uin
     rsp.ieee_addr_remote_dev.u64 = ieee;
     rsp.nwk_addr_remote_dev = nwk;
     ezb_zdo_nwk_addr_req_result_t r{};
-    r.error = ieee ? 0 : 0x10;
+    r.error = ieee ? 0 : EZB_ERR_TIMEOUT;
     r.rsp = ieee ? &rsp : nullptr;
     q.cb(&r, q.user_ctx);
 }
 static void last_lookup_ends(std::uint64_t ieee, std::uint16_t nwk) {
     if (!g_lookups.empty()) answer(g_lookups.back(), ieee, nwk);
+}
+// The last lookup ends with the stack's error `err` and no answer.
+static void last_lookup_fails(ezb_err_t err) {
+    if (g_lookups.empty() || !g_lookups.back().cb) return;
+    ezb_zdo_nwk_addr_req_result_t r{};
+    r.error = err;
+    g_lookups.back().cb(&r, g_lookups.back().user_ctx);
 }
 static void later() {   // past the broadcast budget's window
     g_now_us += 10'000'000;
@@ -238,12 +246,34 @@ int main() {
     expect("nobody answered: offline (the adapter's unreachable)", g_unreachable.size() == 1 && g_unreachable[0] == kPlug);
     expect("  and nothing resent", g_sent.size() == sent + 1);
 
+    // Review 2026-11-19 P4 #2: only the stack's timeout means nobody answered. An error within milliseconds
+    // means the broadcast never went out (its tables full after a power cut, the channel busy).
+    later();
+    sent = g_sent.size();
+    f = send_on(0x1234);
+    confirm(0x1234, f, kNoAck);
+    last_lookup_fails(0x0401);   // ZDP category: the request's own APS confirm failed
+    expect("a lookup the stack could not send (0x0401): not offline, nothing resent",
+           g_unreachable.empty() && g_sent.size() == sent + 1);
+
+    // Review P4 #3: a Toggle is looked up (a new address is learnt) but not sent again.
+    later();
+    sent = g_sent.size();
+    const std::uint8_t tg[3] = {0x01, 0x77, 0x02};
+    esp_zb_af_send(0x1234, 1, 0x0006, tg, 3);
+    confirm(0x1234, Bytes(tg, tg + 3), kNoAck);
+    last_lookup_ends(kPlug, 0x5678);
+    expect("a Toggle not taken: the new address learnt, the Toggle not sent again (it may have toggled already)",
+           g_moved.size() == 1 && g_moved[0].second == 0x5678 && g_sent.size() == sent + 1);
+    g_pool[0].nwk = 0x1234;
+
     later();
     f = send_on(0x1234);
     confirm(0x1234, f, kNoAck);
+    sent = g_sent.size();
     last_lookup_ends(kOther, 0x7777);
-    expect("an answer for another device counts as none",
-           g_unreachable.size() == 1 && g_unreachable[0] == kPlug && g_moved.empty());
+    expect("an answer for another device: not taken as this one's (no move, nothing resent), not offline either",
+           g_unreachable.empty() && g_moved.empty() && g_sent.size() == sent);
 
     later();
     std::size_t looks = g_lookups.size();
