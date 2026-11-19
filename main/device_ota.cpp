@@ -26,7 +26,7 @@
 #include "esp_zigbee_backend.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "zigbee_mgr.h"
+#include "zigbee_pool.h"
 
 namespace {
 
