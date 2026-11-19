@@ -125,7 +125,7 @@ static void test_update() {
     CHECK(begin(s, A, hdr(), 77) && s.state == State::Waiting && s.ieee == A && s.since == 77 && s.h.total == 1000 &&
           active(s) && fits(s), "begin: waiting for the device");
     CHECK(!begin(s, B, hdr(), 99) && s.ieee == A && s.since == 77, "a second update while one runs is refused");
-    CHECK(!on_start(s, B, qv(1)) && s.state == State::Waiting, "another device of the same model is not served");
+    CHECK(!on_start(s, B, qv(1), 0) && s.state == State::Waiting, "another device of the same model is not served");
     on_query(s, B, qv(5, 0x1234, 0x9999));
     CHECK(!s.has_query, "another device's query is not kept");
     on_query(s, A, qv(0x22000000, 0x117C, 0x2102));
@@ -135,15 +135,15 @@ static void test_update() {
     CHECK(!fits(s), "the target asks with another manufacturer: does not fit");
     on_query(s, A, qv(0x22000000));
     CHECK(fits(s), "the target asks for this image: fits");
-    CHECK(on_start(s, A, qv(0x22000001)) && s.state == State::Sending && s.dev.version == 0x22000001, "the target is served");
+    CHECK(on_start(s, A, qv(0x22000001), 0) && s.state == State::Sending && s.dev.version == 0x22000001, "the target is served");
     CHECK(serves(s, A) && !serves(s, B), "blocks and the end report are taken from the target only");
-    CHECK(!on_block(s, 50) && pct(s) == 5, "5 %");
-    CHECK(on_block(s, 100) && pct(s) == 10, "10 %: a new tenth");
-    CHECK(!on_block(s, 150) && pct(s) == 15, "15 %: the same tenth");
-    CHECK(!on_block(s, 120) && s.offset == 150, "an older block does not move the bar back");
-    CHECK(on_block(s, 990) && pct(s) == 99, "99 %");
-    CHECK(on_start(s, A, qv(0x22000001)) && s.state == State::Sending && s.offset == 0, "the target asks again: starts over");
-    on_block(s, 500);
+    CHECK(!on_block(s, 50, 0) && pct(s) == 5, "5 %");
+    CHECK(on_block(s, 100, 0) && pct(s) == 10, "10 %: a new tenth");
+    CHECK(!on_block(s, 150, 0) && pct(s) == 15, "15 %: the same tenth");
+    CHECK(!on_block(s, 120, 0) && s.offset == 150, "an older block does not move the bar back");
+    CHECK(on_block(s, 990, 0) && pct(s) == 99, "99 %");
+    CHECK(on_start(s, A, qv(0x22000001), 0) && s.state == State::Sending && s.offset == 0, "the target asks again: starts over");
+    on_block(s, 500, 0);
     on_end(s, 0);
     CHECK(s.state == State::Done && pct(s) == 100 && !active(s), "the device took the image");
     on_query(s, A, qv(0x23086631));
@@ -154,34 +154,34 @@ static void test_update() {
 
 static void test_ends() {
     Session s;
-    CHECK(!on_start(s, A, qv(1)) && s.state == State::Idle, "no update: nothing is served");
+    CHECK(!on_start(s, A, qv(1), 0) && s.state == State::Idle, "no update: nothing is served");
     on_query(s, A, qv(1));
     CHECK(!s.has_query, "no update: no query is kept");
     on_query(s, 0, qv(1));
     CHECK(!s.has_query, "no update: a query of a device the hub could not name (IEEE 0) is not kept");
     begin(s, A, hdr(), 1);
-    CHECK(!on_start(s, A, qv(0x23086631)) && s.state == State::Done && !strcmp(s.reason, "same_version") && !active(s),
+    CHECK(!on_start(s, A, qv(0x23086631), 0) && s.state == State::Done && !strcmp(s.reason, "same_version") && !active(s),
           "the device already runs this version");
     CHECK(begin(s, A, hdr(), 2) && s.state == State::Waiting && !s.has_query && s.reason[0] == 0, "a new update after an end");
     on_end(s, 0);
     CHECK(s.state == State::Waiting, "an end report before the device was served is ignored");
-    on_start(s, A, qv(1));
+    on_start(s, A, qv(1), 0);
     on_end(s, 0x96);
     CHECK(s.state == State::Failed && s.device_status == 0x96 && !strcmp(s.reason, "device_status") && !active(s),
           "the device rejects the image");
     begin(s, A, hdr(), 3);
-    on_start(s, A, qv(1));
-    on_block(s, 300);
+    on_start(s, A, qv(1), 0);
+    on_block(s, 300, 0);
     fail(s, "device_left");
     CHECK(s.state == State::Failed && !strcmp(s.reason, "device_left") && !active(s), "a failure while sending");
-    CHECK(!on_block(s, 500) && s.offset == 300, "no progress after the end");
+    CHECK(!on_block(s, 500, 0) && s.offset == 300, "no progress after the end");
     begin(s, A, hdr(), 4);
     cancel(s);
     CHECK(s.state == State::Cancelled && !active(s), "cancel while waiting");
     begin(s, A, hdr(), 5);
-    on_start(s, A, qv(1));
+    on_start(s, A, qv(1), 0);
     cancel(s);
-    CHECK(s.state == State::Cancelled && !on_start(s, A, qv(1)), "cancel while sending; the device is not served again");
+    CHECK(s.state == State::Cancelled && !on_start(s, A, qv(1), 0), "cancel while sending; the device is not served again");
     CHECK(!serves(s, A), "after cancel the target gets no more blocks");
     Session idle;
     cancel(idle);
@@ -204,7 +204,7 @@ static void test_versions() {
     CHECK(s.state == State::Failed && !strcmp(s.reason, "device_newer") && !active(s),
           "no downgrade: the device runs a newer version and keeps it");
     begin(s, A, hdr(), 3);
-    CHECK(!on_start(s, A, qv(0x23090000)) && !strcmp(s.reason, "device_newer"), "no downgrade at START either");
+    CHECK(!on_start(s, A, qv(0x23090000), 0) && !strcmp(s.reason, "device_newer"), "no downgrade at START either");
     begin(s, A, hdr(), 4);
     on_query(s, A, qv(0x23090000, 0x117C, 0x2102));
     CHECK(s.state == State::Waiting, "a query for another image type is not judged by its version");
@@ -212,7 +212,7 @@ static void test_versions() {
     CHECK(s.state == State::Waiting, "another device's newer version ends nothing");
     on_query(s, A, qv(0x23086630));
     CHECK(s.state == State::Waiting, "an older version waits for the download");
-    on_start(s, A, qv(0x23086630));
+    on_start(s, A, qv(0x23086630), 0);
     on_query(s, A, qv(0x23086630));
     CHECK(s.state == State::Sending, "the target asking again while sending goes on");
     on_end(s, 0);
@@ -224,12 +224,31 @@ static void test_versions() {
     CHECK(s.state == State::Cancelled, "a query after a cancel changes nothing");
 }
 
+// A download that stops without an Upgrade End (the device lost power or range, or gave up) ends after kSilentMax
+// with no block request; waiting has no limit (P6 review, 2026-11-19).
+static void test_silent() {
+    Session s;
+    begin(s, A, hdr(), 0);
+    CHECK(!silent(s, 100000) && s.state == State::Waiting, "waiting has no time limit: a sleepy device asks when it wakes");
+    on_start(s, A, qv(1), 100);
+    CHECK(!silent(s, 100 + kSilentMax - 1) && s.state == State::Sending, "sending: quiet for less than the limit");
+    on_block(s, 64, 650);
+    CHECK(!silent(s, 650 + kSilentMax - 1), "a block request restarts the clock");
+    on_block(s, 64, 900);
+    CHECK(!silent(s, 900 + kSilentMax - 1), "a repeated block request also shows the device is there");
+    CHECK(silent(s, 900 + kSilentMax) && s.state == State::Failed && !strcmp(s.reason, "device_silent") && !active(s),
+          "no block request for the limit: the update fails");
+    CHECK(!silent(s, 900 + 2 * kSilentMax) && !strcmp(s.reason, "device_silent"), "an ended update is not failed again");
+    CHECK(kSilentMax == 600, "the limit is 10 minutes");
+}
+
 int main() {
     test_file();
     test_query_frame();
     test_update();
     test_ends();
     test_versions();
+    test_silent();
     printf("%s (%d failed)\n", s_fail ? "FAILED" : "all ok", s_fail);
     return s_fail;
 }

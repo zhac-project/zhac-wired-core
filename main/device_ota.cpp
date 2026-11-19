@@ -58,13 +58,13 @@ bool on_event(int kind, uint64_t ieee, uint16_t manuf, uint16_t type, uint32_t a
         q.manuf = manuf;
         q.image_type = type;
         q.version = a;
-        const bool go = devota::on_start(s_s, ieee, q);
+        const bool go = devota::on_start(s_s, ieee, q, uptime_s());
         if (go) ESP_LOGI(TAG, "0x%016" PRIX64 " runs v%08" PRIX32 ": sending v%08" PRIX32, ieee, a, s_s.h.file_version);
         return go;
     }
     case ZB_OTA_BLOCK:
         if (!devota::serves(s_s, ieee)) return false;
-        if (devota::on_block(s_s, a)) ESP_LOGI(TAG, "0x%016" PRIX64 ": %d %%", ieee, devota::pct(s_s));
+        if (devota::on_block(s_s, a, uptime_s())) ESP_LOGI(TAG, "0x%016" PRIX64 ": %d %%", ieee, devota::pct(s_s));
         return true;
     case ZB_OTA_END:
         if (!devota::serves(s_s, ieee)) return false;
@@ -286,6 +286,11 @@ void device_ota_tick() {
         Hold h(s_mu);
         devota::fail(s_s, "device_left");
         ESP_LOGW(TAG, "0x%016" PRIX64 " left the hub: update ended", ieee);
+    }
+    {
+        Hold h(s_mu);
+        if (devota::silent(s_s, uptime_s()))
+            ESP_LOGW(TAG, "0x%016" PRIX64 " stopped asking for blocks at %d %%: update ended", s_s.ieee, devota::pct(s_s));
     }
     drop_ended();
 }

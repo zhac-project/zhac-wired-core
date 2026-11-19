@@ -62,6 +62,10 @@ inline bool parse_query(const uint8_t* z, size_t n, Query* q) {
 
 enum class State : uint8_t { Idle, Waiting, Sending, Done, Failed, Cancelled };
 
+// Sending with no block request for this long: the device lost power or range, or gave up without an Upgrade End.
+// z2m gives up after 150 s; this waits longer, since a false end costs the user the whole download again.
+constexpr uint32_t kSilentMax = 600;
+
 // One update at a time: one image for one device. `reason` is a code the page puts in words.
 struct Session {
     State state = State::Idle;
@@ -69,10 +73,11 @@ struct Session {
     Header h{};
     uint32_t offset = 0;        // the last block sent
     uint32_t since = 0;         // when the update began (seconds of uptime)
+    uint32_t last = 0;          // the device's last START or block request while sending (seconds of uptime)
     bool has_query = false;     // `dev` holds the device's last Query Next Image
     Query dev{};
     uint8_t device_status = 0;  // the device's Upgrade End status when reason is "device_status"
-    const char* reason = "";    // same_version, device_newer, device_status, or what fail() was given
+    const char* reason = "";    // same_version, device_newer, device_status, device_silent, or what fail() was given
 };
 
 inline bool active(const Session& s) { return s.state == State::Waiting || s.state == State::Sending; }
@@ -116,12 +121,13 @@ inline void on_query(Session& s, uint64_t ieee, const Query& q) {
 }
 
 // The stack found the image for a device's query: serve it only to the target, and only when it runs an older version.
-inline bool on_start(Session& s, uint64_t ieee, const Query& q) {
+inline bool on_start(Session& s, uint64_t ieee, const Query& q, uint32_t now) {
     if (!active(s) || ieee != s.ieee) return false;
     on_query(s, ieee, q);
     if (!active(s)) return false;   // on_query ended it: same or newer version
     s.state = State::Sending;
     s.offset = 0;
+    s.last = now;
     return true;
 }
 
@@ -131,9 +137,11 @@ inline int pct(const Session& s) {
     return p > 100 ? 100 : (int)p;
 }
 
-// A block went out; true when it starts a new tenth (for the log).
-inline bool on_block(Session& s, uint32_t offset) {
-    if (s.state != State::Sending || offset <= s.offset) return false;
+// A block went out (a repeated one too: the device is there); true when it starts a new tenth (for the log).
+inline bool on_block(Session& s, uint32_t offset, uint32_t now) {
+    if (s.state != State::Sending) return false;
+    s.last = now;
+    if (offset <= s.offset) return false;
     const int before = pct(s) / 10;
     s.offset = offset;
     return pct(s) / 10 > before;
@@ -156,6 +164,15 @@ inline void fail(Session& s, const char* reason) {
     if (!active(s)) return;
     s.state = State::Failed;
     s.reason = reason;
+}
+
+// From the main loop: true when a download stopped (kSilentMax without a block request). Waiting has no limit: a
+// sleepy device asks when it wakes.
+inline bool silent(Session& s, uint32_t now) {
+    if (s.state != State::Sending || now - s.last < kSilentMax) return false;
+    s.state = State::Failed;
+    s.reason = "device_silent";
+    return true;
 }
 
 inline void cancel(Session& s) {
