@@ -278,17 +278,21 @@ esp_err_t reply(httpd_req_t* req, const char* status, const char* body) {
     return httpd_resp_sendstr(req, body);
 }
 
-esp_err_t gated(httpd_req_t* req) {
-    sec_headers(req);
-    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
-    if (!check_request(req)) return reply(req, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
-    return reinterpret_cast<Handler>(req->user_ctx)(req);
-}
-
-// 429 while a peer, or the hub as a whole, is locked out of the password.
+// 429 while a peer is locked out (any route that needs the token), or the hub as a whole is
+// locked out of the password.
 esp_err_t reply_locked(httpd_req_t* req) {
     httpd_resp_set_hdr(req, "Retry-After", "60");
     return reply(req, "429 Too Many Requests", "{\"error\":\"too_many_attempts\"}");
+}
+
+esp_err_t gated(httpd_req_t* req) {
+    sec_headers(req);
+    if (!auth_request_allowed(req)) return auth_reply_cross_site(req);
+    // A locked-out peer hears 429, as login tells it, not 401: a 401 would make a client
+    // take its valid token for a bad one.
+    if (s_enabled && locked(peer_ipv4(req))) return reply_locked(req);
+    if (!check_request(req)) return reply(req, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
+    return reinterpret_cast<Handler>(req->user_ctx)(req);
 }
 
 // Read a small JSON body; false (already answered) if it is missing or too big.

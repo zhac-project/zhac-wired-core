@@ -24,6 +24,10 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **A locked-out address gets `429` on every route that needs the token** (`auth.cpp`): it got `401`,
+  even with the right token, so a client could take its valid token for a bad one. Same answer as
+  login: `{"error":"too_many_attempts"}` with `Retry-After: 60`. The WebSocket `auth` still answers
+  `auth failed`.
 - **`main` requires `lua` itself** (`main/CMakeLists.txt`): `lua_io.cpp` calls the Lua C API and
   got it only through `lua_engine`. `lua_engine`, `lua_cjson` and `tg_gw` are listed with the other
   zhac-components, not as local components; the host tests set `ZHAC_COMPONENTS` once.

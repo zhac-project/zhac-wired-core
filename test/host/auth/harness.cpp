@@ -279,6 +279,10 @@ int main() {
     for (int i = 0; i < 5; i++) login(30, "wrong-password");
     expect("a locked-out peer gets 429, not 401", login(30, "hunter2hunter2") == "429 Too Many Requests");
     expect("  with Retry-After", g_retry_after == "60");
+    expect("  a route that needs the token answers it 429 too, even to the right token",
+           post("/api/auth/password", 30, "{\"x\":1}", "application/json", good) == "429 Too Many Requests");
+    expect("    with Retry-After and login's body",
+           g_retry_after == "60" && g_resp == "{\"error\":\"too_many_attempts\"}");
     out = boot();
     expect("after a password lockout the next boot shows the token", out.find(good) != std::string::npos);
     out = boot();
