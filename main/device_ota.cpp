@@ -150,8 +150,10 @@ const char* upload(httpd_req_t* req, const char** status, uint64_t* ieee_out) {
     const uint64_t ieee = strtoull(v, nullptr, 16);
     // A page of another site cannot send this type without a CORS preflight the hub never grants.
     if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof ct) != ESP_OK ||
-        strncasecmp(ct, "application/octet-stream", 24) != 0)
-        return "{\"error\":\"content_type\"}";
+        strncasecmp(ct, "application/octet-stream", 24) != 0) {
+        *status = "415 Unsupported Media Type";
+        return "{\"error\":\"octet_stream_required\"}";
+    }
     if (req->content_len == 0) return "{\"error\":\"not_an_ota_file\"}";
     if (req->content_len > devota::kMaxFile) {
         *status = "413 Payload Too Large";
