@@ -57,6 +57,7 @@
 #include "ezbee/zcl/cluster/basic_desc.h"
 #include "ezbee/zcl/cluster/groups.h"
 #include "ezbee/zcl/cluster/groups_desc.h"
+#include "ezbee/zcl/cluster/ota_upgrade_desc.h"
 #include "ezbee/platform/radio.h"
 #include "driver/gpio.h"   // the RCP reset line
 #include "freertos/FreeRTOS.h"
@@ -230,9 +231,13 @@ static void register_coordinator_endpoint() {
     grp_cfg.name_support = 0;   // no group names
     ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_groups_create_cluster_desc(&grp_cfg, EZB_ZCL_CLUSTER_SERVER));
     ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_groups_create_cluster_desc(nullptr, EZB_ZCL_CLUSTER_CLIENT));
+    // Device firmware updates (research 2026-11-18 C2, esp_zb_ota.cpp): one image at a time.
+    ezb_zcl_ota_upgrade_cluster_server_config_t ota_cfg{};
+    ota_cfg.ota_upgrade_file_table_size = 1;
+    ezb_af_endpoint_add_cluster_desc(ep, ezb_zcl_ota_upgrade_create_cluster_desc(&ota_cfg, EZB_ZCL_CLUSTER_SERVER));
     ezb_af_device_add_endpoint_desc(dev, ep);
     const ezb_err_t e = ezb_af_device_desc_register(dev);
-    ESP_LOGI(TAG, "coordinator endpoint 1 (Basic + Groups server): %s (%d)",
+    ESP_LOGI(TAG, "coordinator endpoint 1 (Basic + Groups + OTA server): %s (%d)",
              e == 0 ? "registered" : "FAILED", (int)e);
 }
 
@@ -557,19 +562,28 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
     return false;
 }
 
-// The stack sees ZDO (profile 0) and the Groups cluster; everything else is
-// consumed here. With endpoint 1 registered (Basic + Groups, for group
-// membership) the stack's ZCL engine would otherwise process every device
-// report against an endpoint that declares none of those clusters -- on the
-// bench that ended in a ZBOSS assert ten seconds after boot. ZHAC decodes
-// for its own shadow; the devices get no ZCL replies from the stack, exactly
-// as before the endpoint existed.
+// The stack sees ZDO (profile 0), the Groups cluster and OTA Upgrade (the
+// server on endpoint 1 answers devices' firmware queries, esp_zb_ota.cpp);
+// everything else is consumed here. With endpoint 1 registered (Basic + Groups,
+// for group membership) the stack's ZCL engine would otherwise process every
+// device report against an endpoint that declares none of those clusters -- on
+// the bench that ended in a ZBOSS assert ten seconds after boot. ZHAC decodes
+// for its own shadow; the devices get no other ZCL replies from the stack,
+// exactly as before the endpoint existed.
 static bool from_self(const ezb_address_t& src);   // tx-delivery, below
+
+void esp_zb_ota_on_frame(const ezb_apsde_data_ind_t* ind);   // esp_zb_ota.cpp
+void esp_zb_ota_attach(void);
 
 static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     if (!ind) return false;
     if (ind->profile_id == 0x0000) return false;          // ZDO: the stack's
-    if (!from_self(ind->src_address)) on_apsde_indication_inner(ind);   // not the hub's own groupcast (B5)
+    const bool mine = from_self(ind->src_address);
+    if (!mine) on_apsde_indication_inner(ind);            // not the hub's own groupcast (B5)
+    if (ind->cluster_id == 0x0019) {                      // OTA Upgrade: the stack's server answers (C2)
+        if (!mine) esp_zb_ota_on_frame(ind);
+        return false;
+    }
     return ind->cluster_id != 0x0004;                     // Groups: the stack's too
 }
 
@@ -1489,6 +1503,7 @@ static bool zb_init() {
     // Hooks BEFORE start, so nothing is missed between start and registration.
     ezb_apsde_data_indication_handler_register(on_apsde_indication);
     ezb_apsde_data_confirm_handler_register(on_apsde_confirm);   // delivery (B1)
+    esp_zb_ota_attach();   // the OTA server's progress (C2)
     const ezb_err_t sig_err = ezb_app_signal_add_handler(on_app_signal);
     if (sig_err != 0) {
         ESP_LOGE(TAG, "app signal handler registration FAILED (%d) -- "

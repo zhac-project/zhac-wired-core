@@ -121,6 +121,7 @@ static Query qv(uint32_t version, uint16_t manuf = 0x117C, uint16_t type = 0x210
 static void test_update() {
     Session s;
     CHECK(s.state == State::Idle && !active(s) && pct(s) == 0, "idle at first");
+    CHECK(!serves(s, 0), "idle: nobody is served, not even IEEE 0");
     CHECK(begin(s, A, hdr(), 77) && s.state == State::Waiting && s.ieee == A && s.since == 77 && s.h.total == 1000 &&
           active(s) && fits(s), "begin: waiting for the device");
     CHECK(!begin(s, B, hdr(), 99) && s.ieee == A && s.since == 77, "a second update while one runs is refused");
@@ -135,6 +136,7 @@ static void test_update() {
     on_query(s, A, qv(0x22000000));
     CHECK(fits(s), "the target asks for this image: fits");
     CHECK(on_start(s, A, qv(0x22000001)) && s.state == State::Sending && s.dev.version == 0x22000001, "the target is served");
+    CHECK(serves(s, A) && !serves(s, B), "blocks and the end report are taken from the target only");
     CHECK(!on_block(s, 50) && pct(s) == 5, "5 %");
     CHECK(on_block(s, 100) && pct(s) == 10, "10 %: a new tenth");
     CHECK(!on_block(s, 150) && pct(s) == 15, "15 %: the same tenth");
@@ -180,6 +182,7 @@ static void test_ends() {
     on_start(s, A, qv(1));
     cancel(s);
     CHECK(s.state == State::Cancelled && !on_start(s, A, qv(1)), "cancel while sending; the device is not served again");
+    CHECK(!serves(s, A), "after cancel the target gets no more blocks");
     Session idle;
     cancel(idle);
     CHECK(idle.state == State::Idle, "cancel with no update changes nothing");

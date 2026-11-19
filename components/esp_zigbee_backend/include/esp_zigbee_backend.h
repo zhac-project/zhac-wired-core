@@ -9,6 +9,7 @@
 // Nothing above zhc_adapter can tell the difference.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 
@@ -81,3 +82,21 @@ bool esp_zb_groupcast_onoff(uint16_t group_id, uint8_t cmd);
 // battery power source). It misses broadcasts, groupcasts included.
 bool esp_zb_is_sleepy(uint64_t ieee);
 
+
+// Zigbee device firmware update (research 2026-11-18 C2; esp_zb_ota.cpp): the stack's OTA Upgrade server on
+// endpoint 1 serves one image the hub holds. What it reports, on the stack task, with the device's IEEE (0 when the
+// stack does not know it): START = the device's query matched the image (manuf, type, a = its version; return true
+// to serve it, false answers "no image"); BLOCK = it asks for the block at offset a; END = its Upgrade End with
+// status a; ABORT = the stack gave the transfer up. For BLOCK and END, false aborts the device's download.
+enum { ZB_OTA_START, ZB_OTA_BLOCK, ZB_OTA_END, ZB_OTA_ABORT };
+typedef bool (*esp_zb_ota_event_fn)(int kind, uint64_t ieee, uint16_t manuf, uint16_t image_type, uint32_t a);
+// Every OTA Upgrade frame a device sends (its Query Next Image among them), as ZCL bytes, on the stack task.
+typedef void (*esp_zb_ota_frame_fn)(uint64_t ieee, const uint8_t* zcl, size_t n);
+void esp_zb_ota_handlers(esp_zb_ota_event_fn on_event, esp_zb_ota_frame_fn on_frame);
+// `image` starts at the OTA magic and must stay valid until esp_zb_ota_unload() returns true. false: radio down, an
+// image already loaded, or the stack refused it.
+bool esp_zb_ota_load(const uint8_t* image, uint32_t size);
+// true = no image is loaded any more (the caller may free it); false = the stack's lock timed out, try later.
+bool esp_zb_ota_unload(void);
+// Image Notify to one device (unicast, query jitter 100): it sends its Query Next Image now, if awake.
+bool esp_zb_ota_notify(uint16_t nwk);

@@ -77,6 +77,10 @@ struct Session {
 
 inline bool active(const Session& s) { return s.state == State::Waiting || s.state == State::Sending; }
 
+// Image blocks and the Upgrade End are answered for the target of a running update only; any other device that asks
+// for blocks of this image without having been served (a resumed download) is turned away.
+inline bool serves(const Session& s, uint64_t ieee) { return active(s) && ieee == s.ieee; }
+
 inline bool begin(Session& s, uint64_t ieee, const Header& h, uint32_t now) {
     if (active(s)) return false;
     s = Session{};
