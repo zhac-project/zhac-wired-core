@@ -51,7 +51,7 @@ static const char* TAG = "ota";
 
 namespace {
 
-volatile bool     s_busy = false;
+std::atomic<bool> s_busy{false};   // an update runs, or a full-backup restore holds the idle slot
 char              s_url[256];
 bool              s_allow_older = false;   // set with s_url, read by TaskOTA
 
@@ -541,10 +541,18 @@ bool ota_update_rolled_back() {
     return set;
 }
 
+bool ota_update_slot_claim() {
+    if (s_state[0] == 'p') return false;
+    bool idle = false;
+    return s_busy.compare_exchange_strong(idle, true);
+}
+
+void ota_update_slot_release() { s_busy = false; }
+
 bool ota_update_start(const char* url, bool allow_older, const char** err) {
     if (!url || strncmp(url, "https://", 8) != 0) { *err = "https:// URL required"; return false; }
     if (strlen(url) >= sizeof(s_url)) { *err = "URL too long"; return false; }
-    if (s_busy) { *err = "an update is already running"; return false; }
+    if (s_busy) { *err = "an update or a restore is already running"; return false; }
     if (s_state[0] == 'p') { *err = "the previous update is still being checked -- wait a few minutes"; return false; }
     // An older build would run on the copy on nvs, from before the last update,
     // and the next update would copy it over what changed since (fix review M-1).
@@ -556,7 +564,7 @@ bool ota_update_start(const char* url, bool allow_older, const char** err) {
         *err = "an older version cannot be installed until the device store's move is final -- see the log";
         return false;
     }
-    s_busy = true;
+    if (s_busy.exchange(true)) { *err = "an update or a restore is already running"; return false; }
     snprintf(s_url, sizeof(s_url), "%s", url);
     s_allow_older = allow_older;
     if (xTaskCreate(task, "TaskOTA", 8192, nullptr, 2, nullptr) != pdPASS) {

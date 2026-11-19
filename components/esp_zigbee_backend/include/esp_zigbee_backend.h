@@ -48,6 +48,16 @@ uint64_t esp_zigbee_backend_coordinator_pin(void);
 // from any task.
 int64_t esp_zigbee_backend_heartbeat_us(void);
 
+// The network's outgoing NWK frame counter, for a full backup (research
+// 2026-11-18 C1); 0 while the stack is not running.
+uint32_t esp_zigbee_backend_nwk_frame_counter(void);
+
+// A network restored from a full backup must send above every NWK frame
+// counter the devices saw from the old hub, or they drop its frames: the
+// counter is raised to `min` once the network is up, on every boot this is
+// called (a counter already past it stays). Call before the backend starts.
+void esp_zigbee_backend_set_min_nwk_frame_counter(uint32_t min);
+
 // Wall-clock seconds for ZapDevice::last_seen, which the web UI reads as Unix
 // time (the dual-chip build's zigbee_mgr does the same). 0 until SNTP has set
 // the clock, i.e. before 2020-01-01; callers keep the previous value then, and

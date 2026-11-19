@@ -57,6 +57,7 @@
 #include "device_options.h"
 #include "esp_zigbee_backend.h"
 #include "auth.h"
+#include "backup.h"
 #include "mqtt_glue.h"
 #include "ota_update.h"
 #include "device_shadow.h"
@@ -188,6 +189,12 @@ static void flush_stores() {
 extern "C" void app_main() {
     ESP_LOGI(TAG, "boot -- zhac-wired-core (%s, wired Ethernet)", CONFIG_IDF_TARGET);
 
+    // A full restore staged before the restart goes over the storage now, before anything opens it, zhac_data
+    // included (registered first on a hub whose table lacks it). The restored network then sends above every NWK
+    // frame counter the old hub used (research 2026-11-18 C1).
+    data_partition_register();
+    esp_zigbee_backend_set_min_nwk_frame_counter(backup_apply_pending());
+
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -210,6 +217,7 @@ extern "C" void app_main() {
     sys_state_init();
     log_cloud_boot();   // takes the previous run's restart tail out of no-init RAM before the hook writes it
     log_ring_init();   // PSRAM log ring + esp_log vprintf hook (capture early)
+    backup_log_outcome();   // a restore applied at the top of this boot, for the Logs page
     // Three early crashes in a row: roll back, or boot without the parts that
     // run other people's input (scripts, MQTT, the cloud link). Review PB-04.
     const bool safe_mode = ota_update_boot_guard();
@@ -228,8 +236,7 @@ extern "C" void app_main() {
     event_bus_init();
     status_led_start();   // the board's RGB LED: green = join open, blue = Zigbee traffic
     heap_mark("status_led");
-    data_partition_register();
-    zap_store_init();
+    zap_store_init();   // zhac_data registered at the top of app_main
     // Shut, not wiped (PB-01): status says storage_error and Settings offers
     // the reset, as for an unusable NVS above.
     if (!zap_store_is_ready()) sys_set_storage_error(true);
@@ -384,6 +391,7 @@ extern "C" void app_main() {
         api_system_register(hd);
         api_groups_register(hd);
         api_remote_register(hd);
+        backup_register(hd);
         // The SPA catchall MUST register last: its `/*` pattern would
         // otherwise shadow the specific /api/* routes, because
         // esp_http_server only falls back to a wildcard when no earlier

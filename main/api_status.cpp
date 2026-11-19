@@ -185,6 +185,7 @@ void api_status_fill(JsonObject doc) {
     doc["metrics_mqtt_interval_s"] = sys_metrics_mqtt_interval_s();
     const bool remote = fill_remote_state(doc);
     doc["remote_available"] = remote;
+    doc["full_backup"] = true;   // Settings › Backup offers POST /api/backup/full|restore (research 2026-11-18 C1)
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     // The hub page shows its "Allow script changes from the cloud" switch only when this is present.
     doc["remote_scripts"] = sys_remote_scripts();

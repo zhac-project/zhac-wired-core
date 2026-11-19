@@ -895,6 +895,28 @@ static void coordinator_address_remember() {
     nvs_close(h);
 }
 
+// A network restored from a full backup (research 2026-11-18 C1) sends above this NWK frame counter. Raised on the
+// stack's task or under the SDK lock once the network runs (this lib's setter only stores the value, in any state);
+// a counter already past it stays.
+static std::atomic<uint32_t> s_min_nwk_fc{0};
+
+static void nwk_frame_counter_raise() {
+    const uint32_t min = s_min_nwk_fc.load();
+    const uint32_t cur = ezb_nwk_get_frame_counter();
+    if (min == 0 || cur >= min) return;
+    ezb_nwk_set_frame_counter(min);
+    ESP_LOGW(TAG, "NWK frame counter %lu -> %lu (network restored from a backup)", (unsigned long)cur,
+             (unsigned long)min);
+}
+
+void esp_zigbee_backend_set_min_nwk_frame_counter(uint32_t min) { s_min_nwk_fc.store(min); }
+
+uint32_t esp_zigbee_backend_nwk_frame_counter(void) {
+    if (!s_running) return 0;
+    zb_lock::Guard g;
+    return g ? ezb_nwk_get_frame_counter() : 0;
+}
+
 // ── Zigbee network reset (review 2026-10-24 PB-06) ──────────────────────
 // Only on the owner's command (zigbee_force_recommission, below): every device
 // is forgotten (pool, device store, shadow), and a mark in NVS asks the next
@@ -1150,6 +1172,7 @@ static bool on_app_signal(const ezb_app_signal_t* app_signal) {
         s_formed = true;
         s_guard.network_up();   // the radio started: later crashes are not its
         coordinator_address_remember();
+        nwk_frame_counter_raise();
         ESP_LOGI(TAG, "resumed network: pan 0x%04x channel %u",
                  (unsigned)ezb_nwk_get_panid(),
                  (unsigned)ezb_nwk_get_current_channel());
@@ -1578,6 +1601,7 @@ static bool zb_init() {
         } else if (zb_network_ready()) {
             s_formed = true;
             s_guard.network_up();   // also when the signal never came
+            nwk_frame_counter_raise();
             ESP_LOGI(TAG, "coordinator up: pan 0x%04x channel %u max_children=%d",
                      (unsigned)ezb_nwk_get_panid(),
                      (unsigned)ezb_nwk_get_current_channel(),

@@ -41,3 +41,9 @@ bool ota_update_rolled_back();
 // not https://. The download is refused (ota.complete with err) when it is not
 // this firmware, or an older release and `allow_older` is false (ota_image.h).
 bool ota_update_start(const char* url, bool allow_older, const char** err);
+
+// The idle OTA slot for a full-backup restore (backup.cpp), which stages there: false while an update runs or the
+// running image is on trial (a rollback would need the image the restore overwrites). Updates are refused until
+// the release.
+bool ota_update_slot_claim();
+void ota_update_slot_release();

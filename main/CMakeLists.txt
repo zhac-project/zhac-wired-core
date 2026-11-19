@@ -48,6 +48,8 @@ idf_component_register(
         "ota_update.cpp"
         "supervisor.cpp"
         "auth.cpp"
+        "backup.cpp"
+        "backup_crypto.cpp"
         "api_net.cpp"
         "api_status.cpp"
         "api_devices.cpp"
