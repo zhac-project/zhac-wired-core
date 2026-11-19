@@ -175,6 +175,20 @@ inline bool parse_header(const uint8_t* zcl, size_t len, Header* out) {
     return true;
 }
 
+// Whether ZHAC answers a unicast frame with a Default Response (ZCL §2.5.12): every command whose frame control did
+// not opt out (bit 4), never a profile-wide response, not genTime Read Attributes (answered in full), and nothing on
+// the OTA cluster: the stack's OTA server (esp_zb_ota.cpp) answers those frames, and a second reply to a Query Next
+// Image or an Image Block Request is one the device may take as the answer.
+inline bool wants_default_response(uint16_t cluster, const Header& h) {
+    if (h.fc & 0x10 || cluster == 0x0019) return false;        // opted out; the OTA server's own
+    if (h.cluster_specific) return true;
+    switch (h.cmd) {   // profile-wide responses, never answered
+        case 0x01: case 0x04: case 0x05: case 0x07: case 0x09:
+        case 0x0B: case 0x0D: case 0x10: case 0x12: case 0x14: case 0x16: return false;
+        default: return !(h.cmd == 0x00 && cluster == 0x000A);
+    }
+}
+
 // The device's answer to our Configure Reporting (cmd 0x06) for attribute `attr_id`, sent with `tsn` (ZCL
 // §2.5.8, §2.5.12). A Configure Reporting Response (profile-wide 0x07) is a lone status when every record
 // succeeded, else [status | direction | attr_id LE] records, often only the failed ones. A Default Response

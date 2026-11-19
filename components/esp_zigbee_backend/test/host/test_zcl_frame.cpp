@@ -233,6 +233,26 @@ int main() {
         expect_eq("cfg-report rsp: no status is not an answer", configure_report_status(ok_all, 3, 0x21, 0x0400), -1);
     }
 
+    // ── wants_default_response: which unicast frames ZHAC answers itself.
+    auto wants = [](uint16_t cluster, std::vector<uint8_t> f) {
+        Header fh;
+        return parse_header(f.data(), f.size(), &fh) && wants_default_response(cluster, fh);
+    };
+    expect_eq("default response: On/Off toggle",                 wants(0x0006, {0x01, 0x10, 0x02}), true);
+    expect_eq("default response: a mfg-specific command",        wants(0xFCC0, {0x05, 0x5F, 0x11, 0x10, 0x02}), true);
+    expect_eq("default response: opted out (fc bit 4)",          wants(0x0006, {0x11, 0x10, 0x02}), false);
+    expect_eq("default response: a report",                      wants(0x0402, {0x08, 0x10, 0x0A}), true);
+    expect_eq("default response: never to a Default Response",   wants(0x0006, {0x08, 0x10, 0x0B}), false);
+    expect_eq("default response: never to a Read Attributes Rsp", wants(0x0000, {0x08, 0x10, 0x01}), false);
+    expect_eq("default response: Read Attributes",               wants(0x0000, {0x00, 0x10, 0x00}), true);
+    expect_eq("default response: not genTime Read (answered)",   wants(0x000A, {0x00, 0x10, 0x00}), false);
+    // The stack's OTA server answers the OTA cluster itself; a second reply to the same TSN is one a device may take
+    // as the answer (P6 review, 2026-11-19).
+    expect_eq("default response: not OTA Query Next Image",      wants(0x0019, {0x01, 0x10, 0x01}), false);
+    expect_eq("default response: not OTA Image Block Request",   wants(0x0019, {0x01, 0x11, 0x03}), false);
+    expect_eq("default response: not OTA Upgrade End Request",   wants(0x0019, {0x01, 0x12, 0x06}), false);
+    expect_eq("default response: not an OTA attribute report",   wants(0x0019, {0x08, 0x13, 0x0A}), false);
+
     n = write_cie_address(b, sizeof(b), 0x41, 0x30EDA0FFFEF43DD6ull);
     expect_bytes("write IAS_CIE_Address", b, n,
                  {0x00, 0x41, 0x02, 0x10, 0x00, 0xF0, 0xD6, 0x3D, 0xF4, 0xFE, 0xFF, 0xA0, 0xED, 0x30});

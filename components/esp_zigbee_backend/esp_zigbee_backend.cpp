@@ -287,26 +287,14 @@ static void spawn_group_join_task() {
 // backend consumed all ZCL frames and answered nothing. Same rule here: reply
 // to every unicast command whose frame control did not opt out, never to a
 // response, and drop an identical resend that slips through anyway.
-static bool global_cmd_wants_default_response(uint8_t cmd) {
-    switch (cmd) {   // global responses, never ACKed (ZCL 2.5.12)
-        case 0x01: case 0x04: case 0x05: case 0x07: case 0x09:
-        case 0x0B: case 0x0D: case 0x10: case 0x12: case 0x14: case 0x16: return false;
-        default: return true;
-    }
-}
-
 static void send_default_response_if_needed(uint16_t nwk, uint8_t src_ep, uint16_t cluster,
                                             const uint8_t* zcl, uint16_t len) {
     zhc_zcl::Header h;
-    if (nwk == 0 || !zhc_zcl::parse_header(zcl, len, &h)) return;
+    if (nwk == 0 || !zhc_zcl::parse_header(zcl, len, &h) || !zhc_zcl::wants_default_response(cluster, h)) return;
     const uint8_t in_fc = h.fc;
     const bool    mfg   = h.mfg;
-    const bool    is_cs = h.cluster_specific;
     const uint8_t tsn   = h.tsn;
     const uint8_t cmd   = h.cmd;
-    if (in_fc & 0x10) return;                                   // opted out
-    if (!is_cs && (cmd == 0x0B || !global_cmd_wants_default_response(cmd))) return;
-    if (!is_cs && cmd == 0x00 && cluster == 0x000A) return;     // genTime read: answered in full
     uint8_t out[8];
     size_t  n  = 0;
     uint8_t fc = 0x10;                                          // no response to this response
