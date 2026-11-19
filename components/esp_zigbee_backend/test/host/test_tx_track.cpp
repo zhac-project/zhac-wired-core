@@ -87,6 +87,18 @@ int main() {
                t.take(tok, &back, &ieee) && back.data[1] == 7);
     }
     {
+        // The stack copies the sent bytes into every confirm; a frame the hub
+        // did not track (an earlier one, cancelled, or forgotten) is not
+        // another frame's failure.
+        Table t;
+        const Frame f = on_cmd(0x1234, 7), other = on_cmd(0x1234, 99);
+        t.sent(f, false, 0);
+        std::uint32_t tok = 0;
+        expect("a confirm carrying other bytes: not ours",
+               t.confirm(0x1234, 0x0006, other.data, other.len, kNoAck, &tok) == Verdict::kNone);
+        expect("  ours still waits for its own", t.confirm(0x1234, 0x0006, f.data, f.len, kNoAck, &tok) == Verdict::kRetry);
+    }
+    {
         Table t;
         const Frame f = on_cmd(0x1234, 7);
         t.sent(f, false, 0);

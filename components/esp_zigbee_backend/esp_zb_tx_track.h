@@ -11,9 +11,10 @@
 // until then, so the first failure can be retried once after the address is
 // looked up again, as zigbee-herdsman does. The second failure is final.
 //
-// Matching: the confirm names the destination and cluster and carries the
-// sent bytes; a frame with the same bytes wins, else the oldest frame to that
-// destination and cluster (the stack confirms one destination in order).
+// Matching: the confirm names the destination and cluster and carries a copy
+// of the sent bytes (esp-zigbee-lib aps_apsde_user_data_confirm); only a frame
+// with the same bytes is ours. A confirm without bytes (the stack could not
+// copy them) takes the oldest frame to that destination and cluster.
 //
 // Pure C++ (no ESP-IDF, no SDK) so the policy has a host test; the backend
 // adds the lock, the confirm handler, the address lookup and the resend.
@@ -71,11 +72,16 @@ public:
     // left the table.
     Verdict confirm(std::uint16_t nwk, std::uint16_t cluster, const std::uint8_t* asdu,
                     std::uint16_t asdu_len, std::uint8_t status, std::uint32_t* token) {
+        const bool bytes = asdu && asdu_len;
         Slot* hit = nullptr;
         for (Slot& s : slots_) {
             if (!s.token || s.lookup || s.f.nwk != nwk || s.f.cluster != cluster) continue;
-            if (asdu && s.f.len == asdu_len && std::memcmp(s.f.data, asdu, s.f.len) == 0) { hit = &s; break; }
-            if (!hit || older(s, *hit)) hit = &s;
+            if (!bytes) {
+                if (!hit || older(s, *hit)) hit = &s;
+            } else if (s.f.len == asdu_len && std::memcmp(s.f.data, asdu, s.f.len) == 0) {
+                hit = &s;
+                break;
+            }
         }
         if (!hit) return Verdict::kNone;
         if (status == 0) { *hit = {}; return Verdict::kNone; }
