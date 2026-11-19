@@ -22,7 +22,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
-- **Binds and group-membership commands no longer hold up the hub page** (research 2026-11-18 B2). `device.bind` and `device.groups.add` / `remove` / `refresh` waited for the device (up to 10 s, 20 s behind another radio command) on the web server's only task. The web server now checks the request and queues it; a worker sends one at a time and answers when the device did. With one running and four waiting, another gets `busy -- another radio command is still running, try again`. An answer for a page that went away is not sent.
+- **Binds and group-membership commands no longer hold up the hub page** (research 2026-11-18 B2). `device.bind` and `device.groups.add` / `remove` / `refresh` waited for the device (up to 10 s, 20 s behind another radio command) on the web server's only task. The web server now checks the request and queues it; a worker sends one at a time and answers when the device did. With one running and four waiting, another gets `busy -- another radio command is still running, try again`. An answer for a page that went away is not sent. Commands from the cloud still run on the cloud link's task, which alone may send its replies.
 - **Rules and Lua no longer see the hub's own MQTT messages** (research 2026-11-18 A12d): what it publishes under the root (`devices/`, `log/`, `bridge/`, `availability`) is dropped on arrival; `/set` commands and every other topic still pass.
 - **Lua's `on_mqtt` gets the whole payload, up to 1 KB** (research A12c); it was cut at 31 bytes.
 - **More free internal RAM** (P4 and S31, research 2026-11-18 A7/A8):

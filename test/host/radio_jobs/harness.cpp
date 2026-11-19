@@ -401,12 +401,15 @@ int main() {
     expect("the page went away meanwhile: no frame to its socket's number", replies() == 0);
     expect("  the mirror still follows the device", mirror() == (std::vector<uint16_t>{5, 6, 120}));
 
+    // The cloud relay (REMOTE_VIRTUAL_FD) replies through the link's handle, which its own task tears down on a
+    // disconnect: no other task may use it. Its commands run where they arrive, as before.
     reset();
+    answer();   // the device answers at once
     d = req("{\"args\":{" PLUG ",\"src_ep\":1,\"cluster\":8}}");
-    cmd_device_bind(-32768, 110, d);   // REMOTE_VIRTUAL_FD: the cloud relay has no socket here
-    answer();
-    expect("the cloud relay's request (fd < 0) is answered from the worker",
-           wait_replies(1) && reply(0).fd == -32768 && reply(0).text == "{\"id\":110,\"ok\":true}");
+    cmd_device_bind(-32768, 110, d);
+    expect("the cloud relay's request (fd < 0) is sent and answered on the relay's own task",
+           replies() == 1 && reply(0).fd == -32768 && reply(0).text == "{\"id\":110,\"ok\":true}" &&
+               call(0).task == &g_httpd);
 
     // Queue and order.
     reset();

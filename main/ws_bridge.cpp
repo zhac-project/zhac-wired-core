@@ -883,6 +883,9 @@ static void cmd_device_options_set(int fd, uint32_t id, JsonDocument& doc) {
 // it; this worker sends it, one at a time as before, and answers when the device
 // did. The worker starts with the first job and ends after a minute without one
 // (internal stack, freed when it ends). A full queue answers "busy" at once.
+// The cloud relay's commands run where they arrive, as before: its replies go
+// out through the link's handle, which the relay's own task tears down on a
+// disconnect, so no other task may use it.
 // radio-jobs begin (cut out by test/host/radio_jobs)
 enum class RadioOp : uint8_t { Bind, Unbind, GroupAdd, GroupRemove, GroupRefresh };
 struct RadioJob {
@@ -971,6 +974,10 @@ static void radio_job_task(void*) {
 // On the web server's task (or the cloud relay's): queue the job, starting the
 // worker when it is not running. Answers here only when the job cannot wait.
 static void radio_job_post(const RadioJob& j) {
+    if (j.fd < 0) {   // the cloud relay (REMOTE_VIRTUAL_FD), on its own task
+        radio_job_run(j);
+        return;
+    }
     static const bool ready = [] {
         s_radio_q   = xQueueCreate(kRadioJobDepth, sizeof(RadioJob));
         s_radio_mtx = xSemaphoreCreateMutex();
