@@ -70,7 +70,7 @@ expect CONFIG_APP_COMPILE_TIME_DATE y \
 expect CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY "" \
     "Cross-signed bundle verification hands mbedTLS bundle roots dated year 0; with HAVE_TIME_DATE on, IDF v6.0 then refuses every TLS link once the clock is set (LOW round review M3). Leave it off."
 expect CONFIG_LUA_ENGINE_TASK_STACK_BYTES 32768 \
-    "The Lua C-stack limits (zhac-main-core lua_engine/lua_limits.cmake, LUAI_MAXCCALLS=16) are sized for a 32 KB TaskLua. An old local sdkconfig keeps 8192: delete it (or run idf.py set-target) so sdkconfig.defaults applies."
+    "The Lua C-stack limits (zhac-components lua_engine/lua_limits.cmake, LUAI_MAXCCALLS=16) are sized for a 32 KB TaskLua. An old local sdkconfig keeps 8192: delete it (or run idf.py set-target) so sdkconfig.defaults applies."
 
 # ---------------------------------------------------------------- esp32s31 --
 if [ "$TARGET" = "esp32s31" ]; then

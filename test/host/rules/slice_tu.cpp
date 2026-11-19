@@ -6,7 +6,7 @@
 // below, because the originals are static.
 #include "stubs.h"
 #include "json_buf.h"       // the real JsonWriter (main/)
-#include "remote_xfer.h"    // the real kRemotePageBudget (zhac-net-core remote_client)
+#include "remote_xfer.h"    // the real kRemotePageBudget (zhac-components remote_client)
 #include "event_bus.h"      // the real Event, RuleChangedEvent, RULE_CHANGE_* (zhac-components)
 #include "edit_lock.h"      // the real rule/script edit lock (main/)
 

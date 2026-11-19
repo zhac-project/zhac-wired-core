@@ -137,7 +137,7 @@ idf_component_register(
         ha_bridge
         mqtt
         arduinojson
-        # -- zhac-net-core ------------------------------------------------
+        # -- WebSocket endpoint and cloud link (zhac-components) ----------
         ws_server
         remote_client
 )

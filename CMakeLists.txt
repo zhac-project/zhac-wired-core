@@ -8,23 +8,18 @@
 # by name" rule.
 cmake_minimum_required(VERSION 3.22)
 
-# Shared components. This mirrors zhac-net-core's resolution, including its
-# three-way fallback, and the scope is deliberate: ONLY zhac-components.
+# Shared components: ONLY zhac-components, with a three-way fallback.
 #
-# Do NOT add zhac-main-core/components or zhac-mono-core/components here.
-# ESP-IDF *builds* only what is reachable from main's REQUIRES, but it
-# *resolves requirements* for everything it discovers, so a wider search path
-# drags in dependencies this firmware does not have. Adding zhac-main-core
-# fails configure outright:
+# The scope is deliberate. ESP-IDF *builds* only what is reachable from main's
+# REQUIRES, but it *resolves requirements* for everything it discovers, so a
+# wider search path drags in dependencies this firmware does not have. Adding
+# the archived zhac-main-core's components failed configure outright:
 #
 #   Failed to resolve component 'lua' required by component 'lua_cjson'
 #
-# zhac-components itself is safe to scan: it contains no lua_* components, and
-# the only member declaring a registry dependency is arduinojson (see
-# main/idf_component.yml for why that one must not be path-added).
-#
-# ws_server and remote_client live in zhac-net-core and are pulled by explicit
-# path in main/idf_component.yml rather than by widening this search path.
+# zhac-components is safe to scan: everything there resolves in this build,
+# and its components with registry dependencies declare them in their own
+# idf_component.yml (see main/idf_component.yml, and its arduinojson trap).
 if(DEFINED ENV{IDF_COMPONENT_OVERRIDE_PATH})
     set(EXTRA_COMPONENT_DIRS "$ENV{IDF_COMPONENT_OVERRIDE_PATH}")
 elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../zhac-components/components")

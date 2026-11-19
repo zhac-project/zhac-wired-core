@@ -13,7 +13,7 @@ H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$H/../../../main" && pwd)
 AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
 DC=$(cd "$H/../../../../zhac-components/components/device_cmd" && pwd)
-WS=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # utf8_seq.h, for json_buf.h
+WS=$(cd "$H/../../../../zhac-components/components/ws_server/include" && pwd)   # utf8_seq.h, for json_buf.h
 ZC=$(cd "$H/../../../../zhac-components/components/zap_common/include" && pwd)   # ZapDevice, for the pool fake
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-groups.XXXXXX")
 trap 'rm -rf "$W"' EXIT

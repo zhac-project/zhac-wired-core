@@ -44,7 +44,7 @@ jobs:
         id: pins
         working-directory: zhac-wired-core
         run: |
-          for r in zhac-components zhac-net-core embedded-zhc zhac-main-core www-spa zhac-docs; do
+          for r in zhac-components embedded-zhc www-spa zhac-docs; do
             sha=$(jq -er ".siblings[\"$r\"]" release-manifest.json)
             echo "${r//-/_}=$sha" >> "$GITHUB_OUTPUT"
             echo "$r @ $sha"
@@ -58,23 +58,9 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: zhac-project/zhac-net-core
-          ref: ${{ steps.pins.outputs.zhac_net_core }}
-          path: zhac-net-core
-
-      - uses: actions/checkout@v4
-        with:
           repository: zhac-project/embedded-zhc
           ref: ${{ steps.pins.outputs.embedded_zhc }}
           path: embedded-zhc
-
-      # components/lua_engine and components/lua_cjson compile zhac-main-core's
-      # sources in place; without this checkout CMake stops at configure.
-      - uses: actions/checkout@v4
-        with:
-          repository: zhac-project/zhac-main-core
-          ref: ${{ steps.pins.outputs.zhac_main_core }}
-          path: zhac-main-core
 
       - name: SKU invariants
         working-directory: zhac-wired-core

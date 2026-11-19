@@ -4,20 +4,22 @@
 #
 # Dependency manifest for zhac-wired-core (ESP32-P4, wired Ethernet).
 #
-# Resolution is the same hybrid zhac-net-core uses, and each half has a reason:
+# Where components come from:
 #
-#   zhac-components  -> EXTRA_COMPONENT_DIRS in the root CMakeLists.txt.
-#   zhac-net-core    -> explicit `path:` entries below, so the rest of that
-#                       repo's components are not scanned.
+#   zhac-components  -> EXTRA_COMPONENT_DIRS in the root CMakeLists.txt. The
+#                       idf_component.yml of each of its components is read
+#                       too: lua_engine and lua_cjson bring georgik/lua,
+#                       remote_client brings espressif/esp_websocket_client.
 #   registry         -> version-pinned entries below.
 #   local shims      -> components/ in this repo wins by first-match.
 #
 # TWO TRAPS, both hit for real while building this file. Read before editing.
 #
-# 1. Do NOT widen EXTRA_COMPONENT_DIRS to zhac-main-core / zhac-mono-core.
-#    ESP-IDF resolves the requirements of every component it *discovers*, not
-#    just the reachable ones, so a wider path fails configure on
-#    `lua_cjson -> lua` before compiling anything.
+# 1. Keep EXTRA_COMPONENT_DIRS to zhac-components. ESP-IDF resolves the
+#    requirements of every component it *discovers*, not just the reachable
+#    ones, so a directory whose components need something this build lacks
+#    fails configure before compiling anything (seen with the archived
+#    zhac-main-core: `lua_cjson -> lua`).
 #
 # 2. Do NOT add `arduinojson` as a `path:` dependency here. The vendored copy
 #    at zhac-components/components/arduinojson declares its own REGISTRY
@@ -40,17 +42,12 @@ dependencies:
 
   # -- registry --------------------------------------------------------------
 
-  # mDNS. net-core gets this transitively via espressif/esp_rainmaker; this
-  # SKU has no RainMaker, so it must be declared explicitly. Same major as
-  # net-core resolves, to keep both firmwares on one mDNS implementation.
+  # mDNS. Declared explicitly: nothing else here pulls it in (no RainMaker).
   espressif/mdns: "^1.9.0"
 
   # esp-mqtt. ESP-IDF v6.0 no longer bundles this as a built-in component,
   # so mqtt_gw takes it from the registry. Must stay unconditional.
   espressif/mqtt: "^1.0.0"
-
-  # Lua interpreter for components/lua_engine + components/lua_cjson.
-  georgik/lua: ^5.5.0~7
 
   # Zigbee stack (Phase 1). ^2.0.4 is a FLOOR, not a preference: 2.0.4 is the
   # first release shipping lib/esp32s31/ -- including the `native` radio
@@ -71,16 +68,6 @@ dependencies:
     path: "../components/wifi_hosted"
     rules:
       - if: 'target in [esp32p4, esp32s31] && $CONFIG{ZHAC_WIFI_HOSTED} == True'
-
-  # -- zhac-net-core (not on EXTRA_COMPONENT_DIRS; named explicitly) ----------
-
-  ws_server:
-    path: "../../zhac-net-core/components/ws_server"
-
-  # Declares espressif/esp_websocket_client itself -- a genuine registry
-  # dependency, unlike the arduinojson case above.
-  remote_client:
-    path: "../../zhac-net-core/components/remote_client"
 
   # embedded-zhc is NOT a Component-Manager dependency -- it ships its own
   # CMake tree, pulled via EMBEDDED_ZHC_PATH in the root CMakeLists.txt.

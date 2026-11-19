@@ -13,7 +13,7 @@
 # kRuleRowCap, rule_row_json, cmd_rule_list/create/update/check, on_rule_changed); JsonWriter, kRemotePageBudget,
 # utf8_seq.h, ArduinoJson, event_bus.h and RuleSlot are the real headers. Only the neighbours are stubs (stubs.h,
 # harness.cpp): allocator, reply sink, pushes, rule_store, simple_rules, PSA (OpenSSL underneath). Expected
-# fingerprints come from sha256sum. Needs the sibling checkouts (zhac-components, zhac-net-core) next to this repo,
+# fingerprints come from sha256sum. Needs the sibling checkouts (zhac-components) next to this repo,
 # g++, libcrypto, and PATH=/usr/bin first (set below).
 set -e
 H=$(cd "$(dirname "$0")" && pwd)
@@ -21,8 +21,8 @@ Z=$(cd "$H/../../../.." && pwd)
 R=$Z/zhac-wired-core/main
 C=$Z/zhac-components/components
 AJ=$C/arduinojson/src
-RC=$Z/zhac-net-core/components/remote_client/include
-WS=$Z/zhac-net-core/components/ws_server/include
+RC=$Z/zhac-components/components/remote_client/include
+WS=$Z/zhac-components/components/ws_server/include
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-rules.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 cp "$H/stubs.h" "$H/slice_tu.cpp" "$H/harness.cpp" "$W/"

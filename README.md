@@ -84,7 +84,7 @@ Building and flashing from source is in [Build from source](#build-from-source) 
   unless you build yourself (below).
 
 Bugs, missing devices and reports about other boards go to the
-[ZHAC issue tracker](https://github.com/zhac-project/zhac-platform/issues/new/choose).
+[ZHAC issue tracker](https://github.com/zhac-project/zhac-docs/issues/new/choose).
 
 ## Status — 2026-09-26
 
@@ -278,9 +278,8 @@ time, a device's "last seen" shows "—" and time-based rules (`Time#Cron`) wait
 
 ## Build from source
 
-The sibling repos must sit next to this one — `zhac-components`, `zhac-net-core`,
-`zhac-main-core` (the Lua engine compiles its sources), `embedded-zhc` and `www-spa` — exactly
-as `zhac-platform` lays them out. Build the web UI
+The sibling repos must sit next to this one — `zhac-components`, `embedded-zhc` and
+`www-spa`. Build the web UI
 first: `idf.py build` never runs `npm`, and without `../www-spa/dist` the firmware is built
 without the web UI (the build warns).
 
@@ -389,8 +388,7 @@ An unrecognised target fails at CMake time with a message naming the two files t
 rather than as a mysterious link error.
 
 Sibling repos are **read-only inputs**, resolved via `EXTRA_COMPONENT_DIRS` and
-`EMBEDDED_ZHC_PATH`: `zhac-components`, `zhac-net-core`, `zhac-main-core`, `embedded-zhc`,
-`www-spa`. A change needed in one of them belongs in that repo, not here.
+`EMBEDDED_ZHC_PATH`: `zhac-components`, `embedded-zhc`, `www-spa`. A change needed in one of them belongs in that repo, not here.
 
 ## Deliberate omissions
 

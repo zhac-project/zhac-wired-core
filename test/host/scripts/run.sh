@@ -19,8 +19,8 @@
 # staging slot and the page cutter), remote_allow.cpp (remote_script_name_ok), lua_engine_err.h, ArduinoJson, and
 # lua_engine_check_syntax on real Lua 5.5. Stubs: allocator, clock, reply sink, push, the script store, Lua
 # reload/run, PSA (OpenSSL underneath), esp_http_server (fake/). Expected fingerprints come from sha256sum or are
-# fixed digests. Needs the sibling checkouts (zhac-components, zhac-net-core, zhac-main-core with its
-# managed_components/georgik__lua, which an IDF configure of zhac-main-core downloads) next to this repo, g++,
+# fixed digests. Needs the sibling zhac-components checkout next to this repo, this repo's
+# managed_components/georgik__lua (an IDF configure downloads it), g++,
 # libcrypto, and PATH=/usr/bin first (set below). Builds in a temporary dir (deleted on exit); LUA_OBJ_CACHE=<dir>
 # keeps the compiled Lua between runs (and is NOT deleted).
 set -e
@@ -28,11 +28,11 @@ H=$(cd "$(dirname "$0")" && pwd)
 Z=$(cd "$H/../../../.." && pwd)
 R=$Z/zhac-wired-core/main
 AJ=$Z/zhac-components/components/arduinojson/src
-RCD=$Z/zhac-net-core/components/remote_client
+RCD=$Z/zhac-components/components/remote_client
 RC=$RCD/include
-WS=$Z/zhac-net-core/components/ws_server/include
-ENG=$Z/zhac-main-core/components/lua_engine
-LUA=$Z/zhac-main-core/managed_components/georgik__lua
+WS=$Z/zhac-components/components/ws_server/include
+ENG=$Z/zhac-components/components/lua_engine
+LUA=$(cd "$H/../../.." && pwd)/managed_components/georgik__lua
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-scripts.XXXXXX")
 LUAOBJ=${LUA_OBJ_CACHE:-$W/luaobj}
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++

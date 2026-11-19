@@ -215,7 +215,7 @@ menu "ZHAC wired-core board"
 
 endmenu
 
-# The cloud link (remote_client, pulled from zhac-net-core by path). That
+# The cloud link (zhac-components remote_client). That
 # component has no Kconfig of its own -- each firmware root defines these
 # symbols -- and this root never did, so every wired build compiled the client
 # out: no cloud link, and the web UI hid the Remote card.
@@ -268,7 +268,7 @@ menu "ZHAC Remote (cloud link)"
             settings (settings.set), rotate the token (system.token.rotate)
             or switch the uplink mode (uplink.set) -- only reads and
             recoverable device, rule and group operations. On exposes
-            exactly the privileged list in zhac-net-core's
+            exactly the privileged list in zhac-components'
             components/remote_client/remote_allow.cpp (kRemotePrivilegedCmds).
             Turn on only for a cloud endpoint you operate and trust.
 

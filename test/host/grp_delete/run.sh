@@ -5,12 +5,12 @@
 # Host check of a group delete cut by a power loss (review PB-08): the real main/groups_store.cpp over
 # the fake NVS and FreeRTOS headers in ../nvs_fake.
 #   sh run.sh        build and run; exit code = number of mismatches
-# Needs the sibling zhac-net-core checkout (utf8_seq.h, for json_buf.h), g++ and PATH=/usr/bin first.
+# Needs the sibling zhac-components checkout (utf8_seq.h, for json_buf.h), g++ and PATH=/usr/bin first.
 set -e
 H=$(cd "$(dirname "$0")" && pwd)
 F=$(cd "$H/../nvs_fake" && pwd)
 R=$(cd "$H/../../../main" && pwd)
-WS=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)
+WS=$(cd "$H/../../../../zhac-components/components/ws_server/include" && pwd)
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-grp-delete.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 

@@ -12,13 +12,13 @@
 # fakes (harness.cpp).
 #   sh run.sh                  build and run; exit code = number of mismatches (ASan/UBSan/TSan abort = non-zero)
 #   WS_SRC=<file> sh run.sh    the same checks against another ws_bridge.cpp (a RED run)
-# Needs the sibling checkouts (zhac-components, zhac-net-core) next to this repo, g++, and PATH=/usr/bin first.
+# Needs the sibling checkouts (zhac-components) next to this repo, g++, and PATH=/usr/bin first.
 set -e
 H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$H/../../../main" && pwd)
 Z=$(cd "$H/../../../.." && pwd)
 AJ=$Z/zhac-components/components/arduinojson/src
-WS=$Z/zhac-net-core/components/ws_server/include   # utf8_seq.h, for json_buf.h
+WS=$Z/zhac-components/components/ws_server/include   # utf8_seq.h, for json_buf.h
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-radiojobs.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 

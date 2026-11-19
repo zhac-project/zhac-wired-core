@@ -14,7 +14,7 @@ set -e
 H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$H/../../../main" && pwd)
 AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
-NC=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # utf8_seq.h
+NC=$(cd "$H/../../../../zhac-components/components/ws_server/include" && pwd)   # utf8_seq.h
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-switch.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 

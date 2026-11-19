@@ -12,7 +12,7 @@
 #             research 2026-11-18 B2), also under ThreadSanitizer
 # Each runs the REAL code, cut out of main/ by sed or copied, against stubs of its neighbours, under ASan/UBSan,
 # and each takes MUTANT=<name> to show it can fail (see its run.sh). Needs the sibling checkouts next to this repo
-# (zhac-components, zhac-net-core, zhac-main-core with managed_components/georgik__lua), g++, libcrypto.
+# (zhac-components) and this repo's managed_components/georgik__lua (an IDF configure downloads it), g++, libcrypto.
 #   sh test/host/run.sh        exit code = the suites that failed
 fails=0
 for s in switch rules scripts radio_jobs; do
