@@ -32,6 +32,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **`main-largest` in the heap log reports the main internal heap only** (P2 review 2026-11-19). It also counted the 32 KB DMA reserve PSRAM keeps aside, and showed that pool's size once the main heap fragmented.
 - **Early crashes put the hub in safe mode before any rollback** (`ota_update`, `boot_guard_rule.h`, research 2026-11-18 A1). Three crashes soon after boot rolled the firmware back before the radio guard or the Lua hold could act, so a stuck C6 or a crashing script downgraded the hub. Now 3–4 early crashes in a row mean safe mode; 5 roll back only an image that has run under 24 h and whose other slot boots.
 - **Crash reports are no longer lost** (`log_cloud`, `api_status`, research A2). The core dump was read only after some panics and marked reported before any upload. It is now read at every boot: `/api/status` (`reset_reason`, `last_crash`) and the Info page show it on the boot right after a crash, and the cloud gets it with the next log tail while cloud logs are on. Nothing is uploaded while they are off.
 - **"Restart hub" flushes the store on a 6 KB stack** (`ws_bridge`, research A3). It ran on 2 KB, and the restart runs the store flush (NVS writes) on that stack.
