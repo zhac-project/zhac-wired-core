@@ -13,6 +13,8 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **A command a device did not take is sent again after an address lookup** (research 2026-11-18 B1). When the stack reports a frame to a mains device undelivered, the hub asks the network for the device's address (ZDO `NWK_addr_req`, as zigbee-herdsman does) and resends the frame once, to the new address when the device moved. When nobody answers, the device is offline at once, as after an unanswered ping. Sleepy devices are only logged; their writes already wait for the next wake. The hub starts at most 4 such broadcasts in 9 s, shared with the collection groupcasts.
+- **A collection that is exactly a native ZCL group switches with one groupcast** (research B5). `group.cmd` On / Off / Toggle (`{cluster:6, cmd}` or `state` = `ON` / `OFF` / `TOGGLE`) goes out as one genOnOff groupcast when the device pages' group mirror shows a group holding exactly the collection's members (at least two, none asleep), so they no longer switch one after the other. Booleans, other keys, a spent broadcast budget or a refused send fall back to one command per member. The copy of the groupcast the stack hands back to the hub's own endpoint is dropped before the decoder.
 - **Devices that stop answering the availability ping show offline** (research 2026-11-18 B7): unavailable in Home Assistant, an Offline badge on the hub page (`attr.bulk` entries carry `offline`, and `device.list` / `device.get` list it), and an `Offline#<device>` rule trigger. Any frame from the device counts as an answer, also one no definition decodes, and Home Assistant's availability is checked against the hub's verdict every second.
 - **Full device state on `<root>/devices/<IEEE>/state`** (research A12b): `{"ieee", "attrs":{every attribute}}`, once per report as zigbee2mqtt publishes it, retained while Home Assistant discovery is off (with it on, that topic is also the bare `state` value Home Assistant reads); momentary values (`action`) and secrets go out non-retained; cleared when the device is removed.
 - **Home Assistant device triggers for button presses** (research A11).
@@ -20,6 +22,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **Binds and group-membership commands no longer hold up the hub page** (research 2026-11-18 B2). `device.bind` and `device.groups.add` / `remove` / `refresh` waited for the device (up to 10 s, 20 s behind another radio command) on the web server's only task. The web server now checks the request and queues it; a worker sends one at a time and answers when the device did. With one running and four waiting, another gets `busy -- another radio command is still running, try again`. An answer for a page that went away is not sent.
 - **Rules and Lua no longer see the hub's own MQTT messages** (research 2026-11-18 A12d): what it publishes under the root (`devices/`, `log/`, `bridge/`, `availability`) is dropped on arrival; `/set` commands and every other topic still pass.
 - **Lua's `on_mqtt` gets the whole payload, up to 1 KB** (research A12c); it was cut at 31 bytes.
 - **More free internal RAM** (P4 and S31, research 2026-11-18 A7/A8):
