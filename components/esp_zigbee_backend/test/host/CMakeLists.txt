@@ -43,6 +43,9 @@ add_test(NAME boot_guard COMMAND boot_guard_tests)
 add_executable(configure_kick_tests test_configure_kick.cpp)
 add_test(NAME configure_kick COMMAND configure_kick_tests)
 
+add_executable(tx_track_tests test_tx_track.cpp)
+add_test(NAME tx_track COMMAND tx_track_tests)
+
 add_executable(nvs_raw_tests test_nvs_raw.cpp)
 target_compile_definitions(nvs_raw_tests PRIVATE NVS_PIN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/nvs_pin.bin")
 add_test(NAME nvs_raw COMMAND nvs_raw_tests)
