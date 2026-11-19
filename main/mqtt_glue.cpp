@@ -130,6 +130,7 @@ const HaBridgePlatform kPlatform = {
     for_each_device,
     with_device,
     set_attr,
+    zhac_adapter_device_offline,   // the bridge repairs a lost DEVICE_SEEN/OFFLINE from it (review 2026-11-19 P3 #2)
 };
 
 // z2m's per-device message: {"ieee":"0x..","attrs":{...}} with the device's
