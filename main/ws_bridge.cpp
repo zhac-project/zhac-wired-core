@@ -638,6 +638,7 @@ static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
         o["model_id"]     = copy(d.model_id);
         o["known"]        = model_buf[0] != '\0';
         o["last_seen"]    = (int64_t)d.last_seen;
+        if (zhac_adapter_device_offline(d.ieee_addr)) o["offline"] = true;   // meter lock is a leaf: safe here
         o["lqi"]          = d.link_quality;
         o["battery"]      = d.battery_pct;
         o["ep_count"]     = d.endpoint_count;
@@ -705,6 +706,7 @@ static void cmd_device_get(int fd, uint32_t id, JsonDocument& doc) {
     D["power_source"]= dev->power_source;
     D["type"]        = dev->device_type;
     D["last_seen"]   = (int64_t)dev->last_seen;
+    if (zhac_adapter_device_offline(dev->ieee_addr)) D["offline"] = true;
     D["lqi"]         = dev->link_quality;
     D["bat_pct"]     = dev->battery_pct;
     D["ep_count"]    = dev->endpoint_count;
@@ -1967,19 +1969,21 @@ static void on_device_leave(const Event& e) {
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("device.removed", buf, (size_t)n);
 }
 
-// A device ended a long silence, usually by answering an availability ping, which changes no state and so
-// sends no attr.changed. Push its new last_seen alone, as an attr.bulk entry with no attrs (the hub page and
-// the cloud both merge it as is), the way zigbee2mqtt publishes last_seen. Without a clock there is nothing
-// to say.
-static void on_device_seen(const Event& e) {
+// A device's availability, for the hub page and the cloud, as an attr.bulk entry with no attrs (both merge it as is).
+// DEVICE_SEEN: it ended a long silence, usually by answering an availability ping, which changes no state and so
+// sends no attr.changed -- its new last_seen (when there is a clock) the way zigbee2mqtt publishes last_seen, and
+// online again. DEVICE_OFFLINE: it let its ping go unanswered (research 2026-11-18 B7).
+static void on_device_availability(const Event& e) {
     if (!push_listeners()) return;
-    const uint32_t t = esp_zigbee_backend_wall_clock_s();
-    if (!t) return;
     uint64_t ieee = 0;
     std::memcpy(&ieee, e.data, sizeof(ieee));
-    char buf[80];
-    const int n = snprintf(buf, sizeof(buf), "[{\"ieee\":\"0x%016" PRIX64 "\",\"last_seen\":%" PRIu32 ",\"attrs\":{}}]",
-                           ieee, t);
+    const bool seen = e.type == EventType::DEVICE_SEEN;
+    char at[24] = "";
+    if (const uint32_t t = seen ? esp_zigbee_backend_wall_clock_s() : 0)
+        snprintf(at, sizeof(at), ",\"last_seen\":%" PRIu32, t);
+    char buf[112];
+    const int n = snprintf(buf, sizeof(buf), "[{\"ieee\":\"0x%016" PRIX64 "\"%s,\"offline\":%s,\"attrs\":{}}]",
+                           ieee, at, seen ? "false" : "true");
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("attr.bulk", buf, (size_t)n);
 }
 
@@ -2032,7 +2036,8 @@ void ws_bridge_install() {
     event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, on_zcl_attr);
     event_bus_subscribe(EventType::DEVICE_JOIN, on_device_join);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
-    event_bus_subscribe(EventType::DEVICE_SEEN, on_device_seen);
+    event_bus_subscribe(EventType::DEVICE_SEEN, on_device_availability);
+    event_bus_subscribe(EventType::DEVICE_OFFLINE, on_device_availability, nullptr, 4);   // at most 4 per ping tick
     event_bus_subscribe(EventType::RULE_CHANGED, on_rule_changed);
     esp_zb_netmap_set_listener(on_netmap_event);
     lua_engine_set_error_hook(on_script_error);
