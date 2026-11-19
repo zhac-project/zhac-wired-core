@@ -270,7 +270,7 @@ void mqtt_glue_start() {
     });
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
     event_bus_subscribe(EventType::DEVICE_OFFLINE, on_availability, nullptr, 4);   // at most 4 per ping tick
-    event_bus_subscribe(EventType::DEVICE_SEEN, on_availability, nullptr, 4);      // one per answered ping
+    event_bus_subscribe(EventType::DEVICE_SEEN, on_availability, nullptr, 4);      // a burst can overflow it: the bridge's tick repairs that
 
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, on_got_ip, nullptr);
 #ifdef CONFIG_ZHAC_WIFI_HOSTED
