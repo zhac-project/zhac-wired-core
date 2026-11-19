@@ -24,6 +24,9 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **Device support follows zigbee-herdsman-converters v26.133.0** (embedded-zhc cad6000, was v26.125.0;
+  pinned in `release-manifest.json` with the P1–P8 siblings): devices that landed on the wrong definition get
+  their own, and new Tuya, ZCL, Aqara, Philips and OSRAM definitions; embedded-zhc's CHANGELOG lists them.
 - **A locked-out address gets `429` on every route that needs the token** (`auth.cpp`): it got `401`,
   even with the right token, so a client could take its valid token for a bad one. Same answer as
   login: `{"error":"too_many_attempts"}` with `Retry-After: 60`. The WebSocket `auth` still answers
