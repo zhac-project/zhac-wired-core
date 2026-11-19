@@ -79,6 +79,8 @@
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -872,6 +874,122 @@ static void cmd_device_options_set(int fd, uint32_t id, JsonDocument& doc) {
     reply_ok_or_err(fd, id, ok, "options apply failed");
 }
 
+// ── Radio jobs: the commands that wait for a device (research 2026-11-18 B2) ──
+//
+// device.bind and device.groups.add / remove / refresh wait for the device's
+// answer: up to 10 s for a bind or a group command, 20 s behind another radio
+// operation. On the web server's one task that froze every page and every other
+// WebSocket client meanwhile. The web server now checks the request and queues
+// it; this worker sends it, one at a time as before, and answers when the device
+// did. The worker starts with the first job and ends after a minute without one
+// (internal stack, freed when it ends). A full queue answers "busy" at once.
+// radio-jobs begin (cut out by test/host/radio_jobs)
+enum class RadioOp : uint8_t { Bind, Unbind, GroupAdd, GroupRemove, GroupRefresh };
+struct RadioJob {
+    int      fd;
+    uint32_t id;
+    RadioOp  op;
+    uint8_t  ep;      // bind: the device's source endpoint
+    uint16_t nwk;
+    uint16_t arg;     // bind: the cluster; group add / remove: the group id
+    uint64_t ieee;
+    uint64_t coord;   // bind: the coordinator, the binding's destination
+};
+namespace {
+constexpr UBaseType_t kRadioJobDepth = 4;
+constexpr uint32_t    kRadioJobStack = 6144;
+constexpr TickType_t  kRadioJobIdle  = pdMS_TO_TICKS(60 * 1000);
+QueueHandle_t     s_radio_q    = nullptr;
+SemaphoreHandle_t s_radio_mtx  = nullptr;
+TaskHandle_t      s_radio_task = nullptr;   // under s_radio_mtx
+}  // namespace
+
+static void dgm_reply_list(int fd, uint32_t id, uint64_t ieee);
+
+static void radio_job_run(const RadioJob& j) {
+    bool ok = false;
+    const char* err = "command failed";
+    switch (j.op) {
+    case RadioOp::Bind:
+        ok = zigbee_zdo_bind(j.nwk, j.ieee, j.ep, j.arg, j.coord, /*dst_ep=*/1);
+        err = "bind failed";
+        break;
+    case RadioOp::Unbind:
+        ok = zigbee_zdo_unbind(j.nwk, j.ieee, j.ep, j.arg, j.coord, /*dst_ep=*/1);
+        err = "unbind failed";
+        break;
+    case RadioOp::GroupAdd:
+    case RadioOp::GroupRemove: {
+        const bool remove = j.op == RadioOp::GroupRemove;
+        ok = remove ? zigbee_zcl_group_remove(j.nwk, j.ep, j.arg) : zigbee_zcl_group_add(j.nwk, j.ep, j.arg);
+        // Mirror only after the radio accepted it, so a failed send cannot leave
+        // the UI claiming a membership the device never got.
+        if (ok && remove) dgm_remove(j.ieee, j.ep, j.arg);
+        if (ok && !remove) dgm_add(j.ieee, j.ep, j.arg);
+        break;
+    }
+    case RadioOp::GroupRefresh: {
+        // Read the device's ACTUAL table and reconcile the mirror to it. No
+        // answer is NOT "device is in no groups": reconciling to empty would wipe
+        // a working configuration because a sleepy device missed its window, so
+        // the mirror is left exactly as it was.
+        uint16_t gids[DGM_MAX_GIDS];
+        uint8_t  count = 0;
+        ok = zigbee_zcl_get_group_membership(j.nwk, j.ep, gids, DGM_MAX_GIDS, &count);
+        if (ok) dgm_set(j.ieee, j.ep, gids, count);   // that endpoint only: the others keep theirs (review F18)
+        err = "device did not answer";
+        break;
+    }
+    }
+    // The answer comes seconds after the request: the page may have gone, and
+    // its socket's number may now carry another connection (a reload's page
+    // request), which must not get a WebSocket frame. The cloud relay (fd < 0)
+    // has no socket here.
+    if (j.fd >= 0 && !ws_server_fd_is_authed(j.fd)) return;
+    if (!ok) send_err(j.fd, j.id, err);
+    else if (j.op == RadioOp::Bind || j.op == RadioOp::Unbind) reply_ok_or_err(j.fd, j.id, true, nullptr);
+    else dgm_reply_list(j.fd, j.id, j.ieee);
+}
+
+static void radio_job_task(void*) {
+    RadioJob j;
+    for (;;) {
+        if (xQueueReceive(s_radio_q, &j, kRadioJobIdle) == pdTRUE) {
+            radio_job_run(j);
+            continue;
+        }
+        // A minute without a job: end, unless one came meanwhile. radio_job_post
+        // queues under the same lock, so no job is left without a worker.
+        xSemaphoreTake(s_radio_mtx, portMAX_DELAY);
+        const bool idle = uxQueueMessagesWaiting(s_radio_q) == 0;
+        if (idle) s_radio_task = nullptr;
+        xSemaphoreGive(s_radio_mtx);
+        if (idle) vTaskDelete(nullptr);   // xTaskCreate: the idle task frees the stack
+    }
+}
+
+// On the web server's task (or the cloud relay's): queue the job, starting the
+// worker when it is not running. Answers here only when the job cannot wait.
+static void radio_job_post(const RadioJob& j) {
+    static const bool ready = [] {
+        s_radio_q   = xQueueCreate(kRadioJobDepth, sizeof(RadioJob));
+        s_radio_mtx = xSemaphoreCreateMutex();
+        return s_radio_q && s_radio_mtx;
+    }();
+    bool queued = false;
+    if (ready) {
+        xSemaphoreTake(s_radio_mtx, portMAX_DELAY);
+        if (!s_radio_task &&
+            xTaskCreate(radio_job_task, "radio_job", kRadioJobStack, nullptr, 4, &s_radio_task) != pdPASS) {
+            s_radio_task = nullptr;
+        }
+        queued = s_radio_task && xQueueSend(s_radio_q, &j, 0) == pdTRUE;
+        xSemaphoreGive(s_radio_mtx);
+    }
+    if (!queued) send_err(j.fd, j.id, "busy -- another radio command is still running, try again");
+}
+// radio-jobs end
+
 // ── device.bind ──────────────────────────────────────────────────────
 //
 // SPA's BindTab calls this with `{ ieee, src_ep, cluster, unbind?:bool }`.
@@ -901,12 +1019,8 @@ static void cmd_device_bind(int fd, uint32_t id, JsonDocument& doc) {
     const uint16_t nwk_cp = dev->nwk_addr;
     zigbee_pool_unlock();
 
-    const bool ok = unbind
-        ? zigbee_zdo_unbind(nwk_cp, ieee, (uint8_t)src_ep, (uint16_t)cl,
-                             coord, /*dst_ep=*/1)
-        : zigbee_zdo_bind  (nwk_cp, ieee, (uint8_t)src_ep, (uint16_t)cl,
-                             coord, /*dst_ep=*/1);
-    reply_ok_or_err(fd, id, ok, unbind ? "unbind failed" : "bind failed");
+    radio_job_post({.fd = fd, .id = id, .op = unbind ? RadioOp::Unbind : RadioOp::Bind, .ep = (uint8_t)src_ep,
+                    .nwk = nwk_cp, .arg = (uint16_t)cl, .ieee = ieee, .coord = coord});
 }
 
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
@@ -982,16 +1096,11 @@ static void cmd_device_groups_add_remove(int fd, uint32_t id, JsonDocument& doc,
         send_err(fd, id, "device not found");
         return;
     }
-    const bool ok = remove ? zigbee_zcl_group_remove(snap.nwk_addr, ep, gid)
-                           : zigbee_zcl_group_add(snap.nwk_addr, ep, gid);
-    if (!ok) { send_err(fd, id, "command failed"); return; }
-    // Mirror only after the radio accepted it, so a failed send cannot leave
-    // the UI claiming a membership the device never got.
-    if (remove) dgm_remove(ieee, ep, gid); else dgm_add(ieee, ep, gid);
-    dgm_reply_list(fd, id, ieee);
+    radio_job_post({.fd = fd, .id = id, .op = remove ? RadioOp::GroupRemove : RadioOp::GroupAdd, .ep = ep,
+                    .nwk = snap.nwk_addr, .arg = gid, .ieee = ieee, .coord = 0});
 }
 
-// Read the device's ACTUAL table and reconcile the mirror to it.
+// Read the device's ACTUAL table and reconcile the mirror to it (radio_job_run).
 static void cmd_device_groups_refresh(int fd, uint32_t id, JsonDocument& doc) {
     const uint64_t ieee = dgm_arg_ieee(doc);
     if (ieee == 0) { send_err(fd, id, "missing or bad ieee"); return; }
@@ -1002,18 +1111,8 @@ static void cmd_device_groups_refresh(int fd, uint32_t id, JsonDocument& doc) {
         send_err(fd, id, "device not found");
         return;
     }
-    uint16_t gids[DGM_MAX_GIDS];
-    uint8_t  count = 0;
-    if (!zigbee_zcl_get_group_membership(snap.nwk_addr, ep, gids,
-                                         DGM_MAX_GIDS, &count)) {
-        // No answer is NOT "device is in no groups". Reconciling to empty here
-        // would wipe a working configuration because a sleepy device missed
-        // its window, so the mirror is left exactly as it was.
-        send_err(fd, id, "device did not answer");
-        return;
-    }
-    dgm_set(ieee, ep, gids, count);   // that endpoint only: the others keep theirs (review F18)
-    dgm_reply_list(fd, id, ieee);
+    radio_job_post({.fd = fd, .id = id, .op = RadioOp::GroupRefresh, .ep = ep, .nwk = snap.nwk_addr, .arg = 0,
+                    .ieee = ieee, .coord = 0});
 }
 
 // Whole-store view, inverted by gid — backs the SPA's global Groups tab.
