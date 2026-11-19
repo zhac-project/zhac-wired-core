@@ -30,8 +30,7 @@ target_include_directories(devlist_page_tests PRIVATE
     "${ZHAC_COMPONENTS}/components/arduinojson/src")
 add_test(NAME devlist_page COMMAND devlist_page_tests)
 
-# json_buf.h (Task 3) includes utf8_seq.h from zhac-components' ws_server (a sibling checkout).
-set(ZHAC_COMPONENTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../zhac-components" CACHE PATH "zhac-components checkout")
+# json_buf.h (Task 3) includes utf8_seq.h from zhac-components' ws_server (ZHAC_COMPONENTS above).
 
 add_executable(log_cloud_core_tests
     test_log_cloud_core.cpp

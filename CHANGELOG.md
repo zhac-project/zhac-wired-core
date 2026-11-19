@@ -24,6 +24,9 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **`main` requires `lua` itself** (`main/CMakeLists.txt`): `lua_io.cpp` calls the Lua C API and
+  got it only through `lua_engine`. `lua_engine`, `lua_cjson` and `tg_gw` are listed with the other
+  zhac-components, not as local components; the host tests set `ZHAC_COMPONENTS` once.
 - **Built from zhac-components, embedded-zhc and www-spa only.** `ws_server`, `remote_client`, `lua_engine` and `lua_cjson` now live in zhac-components (moved with their history). The two `path:` dependencies on zhac-net-core and the `components/lua_engine` / `components/lua_cjson` wrappers that compiled zhac-main-core's sources are gone, and so are both repos from `release-manifest.json`, `build.yml` and `release.yml` (the two repos are archived). `georgik/lua` comes from lua_engine's own manifest. The host suites that read `utf8_seq.h`, the cloud allow-list or the Lua engine use zhac-components and this repo's `managed_components/georgik__lua`. The firmware is unchanged. Bugs and reports go to zhac-docs' issue tracker.
 - **Binds and group-membership commands no longer hold up the hub page** (research 2026-11-18 B2). `device.bind` and `device.groups.add` / `remove` / `refresh` waited for the device (up to 10 s, 20 s behind another radio command) on the web server's only task. The web server now checks the request and queues it; a worker sends one at a time and answers when the device did. With one running and four waiting, another gets `busy -- another radio command is still running, try again`. An answer for a page that went away is not sent. Commands from the cloud still run on the cloud link's task, which alone may send its replies.
 - **Rules and Lua no longer see the hub's own MQTT messages** (research 2026-11-18 A12d): what it publishes under the root (`devices/`, `log/`, `bridge/`, `availability`) is dropped on arrival; `/set` commands and every other topic still pass.

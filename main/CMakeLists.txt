@@ -106,11 +106,8 @@ idf_component_register(
         hap_master
         hap_slave
         mono_bridge
-        lua_engine
-        lua_cjson
         zigbee_mgr
         esp_zigbee_backend
-        tg_gw
         # Must be required EXPLICITLY. With set(COMPONENTS main) a component
         # that nothing requires is not built -- and a component that is not
         # built contributes no Kconfig, so CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
@@ -137,6 +134,12 @@ idf_component_register(
         ha_bridge
         mqtt
         arduinojson
+        tg_gw
+        lua_engine
+        lua_cjson
+        # lua_io.cpp calls the Lua C API. `lua` is georgik/lua, which
+        # lua_engine's idf_component.yml brings.
+        lua
         # -- WebSocket endpoint and cloud link (zhac-components) ----------
         ws_server
         remote_client
