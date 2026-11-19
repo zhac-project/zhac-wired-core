@@ -181,7 +181,9 @@ void on_attr(const Event& e) {
     if (have) ha_bridge_publish_state(z.ieee, z.key, v);   // Home Assistant topics, only while discovery is on
     if (!mqtt_gw_is_connected()) return;
     if (have && z.key[0] != '_' && !ha::state_retained(z.key)) publish_state(z.ieee, z.key, v, false);
-    if (!z.more) publish_state(z.ieee, nullptr, nullptr, true);
+    // Retained only with discovery off: with it on, this topic is also the own topic of a value called `state`,
+    // which Home Assistant reads bare -- a retained JSON would replace the retained 1/0 there.
+    if (!z.more) publish_state(z.ieee, nullptr, nullptr, !ha_bridge_enabled());
 }
 
 // A removed device: its retained state goes too (an empty retained message),

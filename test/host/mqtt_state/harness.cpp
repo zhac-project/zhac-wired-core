@@ -36,6 +36,8 @@ bool mqtt_gw_publish(const char* topic, const char* payload, size_t n, int, bool
     g_pubs.push_back({topic, std::string(payload, n), retain});
     return true;
 }
+static bool g_discovery = false;
+bool ha_bridge_enabled() { return g_discovery; }
 static int g_removed = 0;
 void ha_bridge_publish_state(uint64_t, const char*, const char*) {}
 void ha_bridge_device_removed(uint64_t) { g_removed++; }
@@ -143,6 +145,15 @@ int main() {
     expect("removed: Home Assistant told", g_removed == 1);
     expect("removed: retained state cleared", g_pubs.size() == 1 && g_pubs[0].retain && g_pubs[0].payload.empty() &&
                                                   g_pubs[0].topic == "zhac/devices/00158D0007A1B2C3/state");
+
+    // Discovery on: <root>/devices/<IEEE>/state is also the own topic of a value called `state`, which Home
+    // Assistant reads as a bare value. A retained JSON there would replace the retained `1`/`0`, and after a
+    // Home Assistant restart every switch, plug and light would show "unknown".
+    g_discovery = true;
+    g_pubs.clear();
+    on_attr(report("battery", VAL_INT, 87, false));
+    expect("discovery on: the state goes out, not retained", g_pubs.size() == 1 && !g_pubs[0].retain);
+    g_discovery = false;
 
     // The availability ping's verdict reaches Home Assistant (research 2026-11-18 B7).
     Event gone{};
