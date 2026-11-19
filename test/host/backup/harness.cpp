@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Host check of the full backup (research 2026-11-18 C1): the file and stage headers (main/backup_format.h), the
-// crypto (main/backup_crypto.cpp, on TF-PSA-Crypto built from the IDF tree; vectors from Python `cryptography`).
+// crypto (main/backup_crypto.cpp, on TF-PSA-Crypto built from the IDF tree; vectors from Python `cryptography`), and
+// the core (main/backup_core.h): the snapshot, the file writer, the stager and the boot-time apply, on fake NOR flash
+// that can fail any erase or write (a power cut) and change under a read (a store writing).
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS   // mbedtls_psa_stats_t, to count live keys
+#include "backup_core.h"
 #include "backup_crypto.h"
 #include "backup_format.h"
 
@@ -295,6 +299,345 @@ static void test_sha() {
           "\"abc\" in two pieces");
 }
 
+// ── core ────────────────────────────────────────────────────────────────────
+// NOR flash: erase sets 4096-byte sectors to 0xFF, a write can only clear bits. fail_after = the erases and writes
+// that still succeed (a power cut after them); on_read runs before each read (a store writing meanwhile).
+struct Fake : Flash {
+    std::vector<uint8_t> m;
+    int fail_after = -1, ops = 0, erases = 0, writes = 0, reads = 0;
+    std::vector<std::pair<uint32_t, size_t>> wlog;
+    std::function<void(Fake&)> on_read;
+    Fake(size_t n, uint8_t fill) : m(n, fill) {}
+    uint32_t size() const override { return (uint32_t)m.size(); }
+    bool cut() { return fail_after >= 0 && ops++ >= fail_after; }
+    bool read(uint32_t off, void* d, size_t n) override {
+        if (off + n > m.size()) return false;
+        reads++;
+        if (on_read) on_read(*this);
+        memcpy(d, m.data() + off, n);
+        return true;
+    }
+    bool write(uint32_t off, const void* s, size_t n) override {
+        if (off + n > m.size() || cut()) return false;
+        for (size_t i = 0; i < n; i++) m[off + i] &= static_cast<const uint8_t*>(s)[i];
+        writes++;
+        wlog.push_back({off, n});
+        return true;
+    }
+    bool erase(uint32_t off, size_t n) override {
+        if (off % kSector || n % kSector || off + n > m.size() || cut()) return false;
+        memset(m.data() + off, 0xFF, n);
+        erases++;
+        return true;
+    }
+};
+
+struct MemSink : Sink {
+    std::vector<uint8_t> b;
+    size_t fail_at = SIZE_MAX;
+    bool put(const uint8_t* p, size_t n) override {
+        if (b.size() + n > fail_at) return false;
+        b.insert(b.end(), p, p + n);
+        return true;
+    }
+};
+
+static const uint32_t kSizes[4] = {0x1000, 0x2000, 0x10000, 0x20000};   // small stand-ins for the four partitions
+static const char kPw[] = "correct horse battery";
+
+struct Hub {   // this hub's partitions (the backup's source, or the restore's target)
+    Fake p[4] = {Fake(kSizes[0], 0), Fake(kSizes[1], 0), Fake(kSizes[2], 0), Fake(kSizes[3], 0)};
+    Part list[4];
+    Hub(uint8_t seed) {
+        for (int i = 0; i < 4; i++) {
+            for (size_t j = 0; j < p[i].m.size(); j++) p[i].m[j] = (uint8_t)(j * (i + 3) + seed);
+            strcpy(list[i].name, kPartNames[i]);
+            list[i].size = kSizes[i];
+        }
+    }
+    static Flash* find(const char* name, void* ctx) {
+        Hub* h = static_cast<Hub*>(ctx);
+        for (int i = 0; i < 4; i++) if (strcmp(kPartNames[i], name) == 0) return &h->p[i];
+        return nullptr;
+    }
+};
+
+static Header file_header(const Hub& hub) {
+    Header h{};
+    h.n_parts = 4;
+    h.kdf_iter = kKdfIterMin;   // fast enough for a test
+    for (int i = 0; i < 16; i++) h.salt[i] = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 12; i++) h.nonce[i] = (uint8_t)(0x40 + i);
+    h.created = 1795000000;
+    h.nwk_fc = 123456;
+    strcpy(h.chip, "esp32p4");
+    strcpy(h.fw, "v2026111903");
+    strcpy(h.host, "zhac");
+    memcpy(h.parts, hub.list, sizeof hub.list);
+    return h;
+}
+
+struct Bufs {   // one snapshot buffer per partition, as the download handler allocates them
+    std::vector<uint8_t> v[4] = {std::vector<uint8_t>(kSizes[0]), std::vector<uint8_t>(kSizes[1]),
+                                 std::vector<uint8_t>(kSizes[2]), std::vector<uint8_t>(kSizes[3])};
+    uint8_t* p[4] = {v[0].data(), v[1].data(), v[2].data(), v[3].data()};
+};
+
+static Err write_hub(Hub& src, Sink& out) {
+    Bufs b;
+    std::vector<uint8_t> io(kPiece + 16);
+    Flash* parts[4] = {&src.p[0], &src.p[1], &src.p[2], &src.p[3]};
+    return write_file(file_header(src), kPw, strlen(kPw), parts, b.p, out, io.data(), nullptr);
+}
+
+static std::vector<uint8_t> make_file(Hub& src) {
+    MemSink out;
+    return write_hub(src, out) == Err::None ? out.b : std::vector<uint8_t>{};
+}
+
+// Upload `file` into `slot` the way the restore handler does, in `piece`-byte reads. Returns the last error.
+static Err stage(const std::vector<uint8_t>& file, Fake& slot, const Hub& target, const char* pw, size_t piece,
+                 uint32_t fc = 777) {
+    Header h{};
+    const char* why = nullptr;
+    Err e = check(file.data(), &h, target.list, 4, "v2026111903", &why);
+    if (e != Err::None) return e;
+    if (file.size() != kHeaderLen + total(h) + kTagLen) return Err::Length;
+    uint8_t key[32];
+    if ((e = unlock(h, pw, strlen(pw), key)) != Err::None) return e;
+    Stager st;
+    if ((e = st.begin(slot, h, file.data(), key)) != Err::None) return e;
+    const size_t ct_end = file.size() - kTagLen;
+    for (size_t off = kHeaderLen; off < ct_end; off += piece) {
+        const size_t n = off + piece > ct_end ? ct_end - off : piece;
+        if ((e = st.feed(file.data() + off, n)) != Err::None) return e;
+    }
+    return st.finish(file.data() + ct_end, fc);
+}
+
+static bool same(const Hub& a, const Hub& b) {
+    for (int i = 0; i < 4; i++) if (a.p[i].m != b.p[i].m) return false;
+    return true;
+}
+
+static void test_snapshot() {
+    printf("snapshot\n");
+    Fake f(0x3000, 0), g(0x1000, 0);
+    for (size_t i = 0; i < f.m.size(); i++) f.m[i] = (uint8_t)i;
+    std::vector<uint8_t> buf(f.m.size()), gbuf(g.m.size()), tmp(kPiece);
+    Flash* parts[2] = {&f, &g};
+    uint8_t* bufs[2] = {buf.data(), gbuf.data()};
+    CHECK(snapshot(parts, bufs, 2, tmp.data(), 5, nullptr) && buf == f.m && gbuf == g.m, "quiet partitions: copied as they are");
+    int n = 0;
+    f.on_read = [&n](Fake& x) { if (++n == 2) x.m[0x2100] ^= 0xFF; };   // a store writes during the first pass
+    CHECK(snapshot(parts, bufs, 2, tmp.data(), 5, nullptr) && buf == f.m, "written during the copy: copied again, the new state");
+    // One instant for all of them: a write to the first while the second is copied redoes both.
+    f.on_read = nullptr;
+    int k = 0;
+    g.on_read = [&](Fake&) { if (++k == 1) f.m[0x10] ^= 0xFF; };
+    CHECK(snapshot(parts, bufs, 2, tmp.data(), 5, nullptr) && buf == f.m && k > 2,
+          "a write to one while another is copied: all copied again");
+    g.on_read = nullptr;
+    f.on_read = [](Fake& x) { x.m[0x10]++; };                              // never settles
+    CHECK(!snapshot(parts, bufs, 2, tmp.data(), 5, nullptr), "never quiet: refused after the tries");
+}
+
+static void test_round_trip() {
+    printf("backup and restore, end to end\n");
+    Hub src(1), dst(9);
+    const std::vector<uint8_t> file = make_file(src);
+    CHECK(file.size() == kHeaderLen + 0x33000 + kTagLen, "file = header + the partitions + tag");
+    Header h{};
+    CHECK(file.size() > kHeaderLen && parse(file.data(), &h) && h.nwk_fc == 123456 && h.kdf_iter == kKdfIterMin,
+          "its header parses");
+    uint8_t key[32], chk[16];
+    CHECK(derive_key(kPw, strlen(kPw), h.salt, h.kdf_iter, key) && key_check(key, chk) && memcmp(chk, h.key_check, 16) == 0,
+          "the key check in the file is the password's");
+
+    Fake slot(0x40000 + 0x10000, 0x00);   // the old app image there: nothing erased
+    CHECK(stage(file, slot, dst, kPw, 1000) == Err::None, "staged in 1000-byte pieces");
+    Stage st{};
+    CHECK(parse(slot.m.data(), &st) && st.applied == 0xFFFFFFFF && st.fc_target == 777 && st.n_parts == 4 &&
+          st.parts[0].offset == kStageDataOffset && st.parts[3].offset == kStageDataOffset + 0x13000 &&
+          strcmp(st.host, "zhac") == 0, "stage header: armed, not applied, offsets after sector 0");
+    CHECK(memcmp(slot.m.data() + st.parts[2].offset, src.p[2].m.data(), kSizes[2]) == 0, "the plaintext is in the slot");
+    CHECK(!slot.wlog.empty() && slot.wlog.back().first == 0 && slot.wlog.back().second == 8, "the magic was written last");
+    CHECK(!same(src, dst), "(the target still holds its own data)");
+
+    Stage got{};
+    std::vector<uint8_t> tmp(kPiece);
+    CHECK(apply(slot, Hub::find, &dst, tmp.data(), &got) == Applied::Done && same(src, dst) && got.fc_target == 777,
+          "boot: applied, the target equals the source");
+    CHECK(parse(slot.m.data(), &st) && st.applied == 0, "marked applied");
+    const int erases = dst.p[0].erases + dst.p[1].erases + dst.p[2].erases + dst.p[3].erases;
+    CHECK(apply(slot, Hub::find, &dst, tmp.data(), &got) == Applied::AlreadyDone && got.fc_target == 777 &&
+          dst.p[0].erases + dst.p[1].erases + dst.p[2].erases + dst.p[3].erases == erases,
+          "next boot: nothing written again, the frame counter target still handed out");
+    Fake empty(0x50000, 0xFF);
+    CHECK(apply(empty, Hub::find, &dst, tmp.data(), &got) == Applied::Nothing, "an erased slot: nothing to do");
+}
+
+static void test_refusals() {
+    printf("restore refusals\n");
+    Hub src(1), dst(9);
+    const Hub orig(9);
+    std::vector<uint8_t> file = make_file(src);
+    Fake slot(0x50000, 0x00);
+    CHECK(stage(file, slot, dst, "wrong password", 4096) == Err::Password && slot.erases == 0 && slot.writes == 0,
+          "wrong password: refused before the slot is touched");
+    {
+        Header hk{};
+        parse(file.data(), &hk);
+        hk.key_check[15] ^= 1;   // all but the last byte the password's
+        uint8_t key[32];
+        CHECK(unlock(hk, kPw, strlen(kPw), key) == Err::Password, "a key check off in its last byte: refused");
+    }
+    Hub small(9);
+    small.list[2].size = 0x8000;
+    CHECK(stage(file, slot, small, kPw, 4096) == Err::Parts && slot.erases == 0, "a partition size differs: refused");
+    Header h{};
+    parse(file.data(), &h);
+    const char* why = nullptr;
+    CHECK(check(file.data(), &h, dst.list, 4, "v2026111001", &why) == Err::Newer, "newer firmware's backup: refused");
+    std::vector<uint8_t> junk = file;
+    junk[0] = 'X';
+    CHECK(check(junk.data(), &h, dst.list, 4, "v2026111903", &why) == Err::Format, "not a backup: refused");
+
+    std::vector<uint8_t> bad = file;
+    bad[kHeaderLen + 0x5000] ^= 1;
+    Stage st{};
+    std::vector<uint8_t> tmp(kPiece);
+    CHECK(stage(bad, slot, dst, kPw, 4096) == Err::Damaged && !parse(slot.m.data(), &st), "a flipped bit: damaged, not armed");
+    CHECK(apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::Nothing && same(dst, orig), "and boot keeps the storage");
+
+    // An earlier restore's applied header is gone as soon as a new staging starts, even if that one then fails.
+    CHECK(stage(file, slot, dst, kPw, 4096) == Err::None && apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::Done,
+          "(an earlier restore, applied)");
+    Hub dst2(5);
+    bad = file;
+    bad[kHeaderLen + 10] ^= 1;
+    CHECK(stage(bad, slot, dst2, kPw, 4096) == Err::Damaged && !parse(slot.m.data(), &st),
+          "a later damaged upload leaves no header at all, not the old one");
+
+    Header hh{};
+    parse(file.data(), &hh);
+    uint8_t key[32];
+    unlock(hh, kPw, strlen(kPw), key);
+    Stager s1;
+    Fake tiny(0x20000, 0);
+    CHECK(s1.begin(tiny, hh, file.data(), key) == Err::Space && tiny.erases == 0, "a slot too small: refused, untouched");
+    Fake slot3(0x50000, 0);
+    Stager s2;
+    CHECK(s2.begin(slot3, hh, file.data(), key) == Err::None && s2.feed(file.data() + kHeaderLen, 4096) == Err::None &&
+          s2.finish(file.data() + file.size() - kTagLen, 1) == Err::Length && !parse(slot3.m.data(), &st),
+          "finished before all the data came: refused, not armed");
+    Stager s3;
+    CHECK(s3.begin(slot3, hh, file.data(), key) == Err::None && s3.feed(file.data(), kPiece + 1) == Err::Length,
+          "a piece larger than kPiece: refused");
+}
+
+static void test_power_cuts() {
+    printf("power cuts\n");
+    Hub src(1);
+    const std::vector<uint8_t> file = make_file(src);
+    std::vector<uint8_t> tmp(kPiece);
+    Stage st{};
+    // During the upload: whatever was written, no header is armed.
+    for (int k : {0, 1, 5, 30, 55}) {   // a whole staging here takes 57 erases and writes
+        Hub dst(9);
+        const Hub orig(9);
+        Fake slot(0x50000, 0x00);
+        slot.fail_after = k;
+        const Err e = stage(file, slot, dst, kPw, 4096);
+        slot.fail_after = -1;
+        char m[96];
+        snprintf(m, sizeof m, "cut after %d slot writes: upload fails, boot keeps the storage", k);
+        CHECK(e == Err::Flash && apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::Nothing && same(dst, orig), m);
+    }
+    // The header's magic is its last write: a cut just before it leaves no header.
+    {
+        Hub dst(9);
+        Fake count(0x50000, 0x00);
+        stage(file, count, dst, kPw, 4096);
+        Fake slot(0x50000, 0x00);
+        slot.fail_after = count.erases + count.writes - 1;
+        CHECK(stage(file, slot, dst, kPw, 4096) == Err::Flash && !parse(slot.m.data(), &st), "cut before the magic: not armed");
+    }
+    // During the boot-time apply: the next boot applies it again, from the start, and completes.
+    for (int k : {0, 1, 3, 10, 20}) {   // ops a partition takes here: 2, 3, 17, 33
+        Hub dst(9);
+        Fake slot(0x50000, 0x00);
+        stage(file, slot, dst, kPw, 4096);
+        for (Fake& p : dst.p) { p.fail_after = k; p.ops = 0; }   // each partition: k erases/writes, then the cut
+        const Applied first = apply(slot, Hub::find, &dst, tmp.data(), &st);
+        for (Fake& p : dst.p) p.fail_after = -1;
+        const Applied second = apply(slot, Hub::find, &dst, tmp.data(), &st);
+        char m[96];
+        snprintf(m, sizeof m, "cut during apply (%d ops per partition): next boot applies it all", k);
+        CHECK(first == Applied::Flash && second == Applied::Done && same(src, dst), m);
+    }
+}
+
+static void test_boot_checks() {
+    printf("boot checks\n");
+    Hub src(1);
+    const std::vector<uint8_t> file = make_file(src);
+    std::vector<uint8_t> tmp(kPiece);
+    Stage st{};
+    {
+        Hub dst(9);
+        const Hub orig(9);
+        Fake slot(0x50000, 0x00);
+        stage(file, slot, dst, kPw, 4096);
+        slot.m[kStageDataOffset + 0x2345] ^= 0x10;   // the staged copy went bad
+        CHECK(apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::BadSha && same(dst, orig) && !parse(slot.m.data(), &st),
+              "staged data does not match its SHA-256: storage kept, header disarmed");
+    }
+    {
+        Hub dst(9);
+        const Hub orig(9);
+        Fake slot(0x50000, 0x00);
+        stage(file, slot, dst, kPw, 4096);
+        dst.p[3].m.resize(0x10000);   // the last partition is smaller now
+        CHECK(apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::Parts && !parse(slot.m.data(), &st) &&
+              dst.p[0].m == orig.p[0].m && dst.p[1].m == orig.p[1].m && dst.p[2].m == orig.p[2].m,
+              "a partition no longer fits: nothing written (not even the ones before it), disarmed");
+    }
+}
+
+static void test_stage_bounds() {
+    printf("stage header past the slot\n");
+    Hub src(1), dst(9);
+    const Hub orig(9);
+    const std::vector<uint8_t> file = make_file(src);
+    Fake slot(0x50000, 0x00);
+    std::vector<uint8_t> tmp(kPiece);
+    Stage st{};
+    stage(file, slot, dst, kPw, 4096);
+    parse(slot.m.data(), &st);
+    st.parts[3].offset = 0x48000;   // its 128 KB would run past the 320 KB slot
+    uint8_t b[kStageLen];
+    pack(st, b);
+    slot.erase(0, kSector);
+    slot.write(0, b, kStageLen);
+    CHECK(apply(slot, Hub::find, &dst, tmp.data(), &st) == Applied::Parts && same(dst, orig) && !parse(slot.m.data(), &st),
+          "a stage pointing past the slot: disarmed (not retried at every boot), storage kept");
+}
+
+static void test_write_errors() {
+    printf("download errors\n");
+    Hub src(1);
+    MemSink cut;
+    cut.fail_at = 5000;
+    CHECK(write_hub(src, cut) == Err::Sink, "the browser went away: stops");
+    src.p[2].on_read = [](Fake& x) { x.m[7]++; };
+    MemSink out;
+    CHECK(write_hub(src, out) == Err::Busy && out.b.empty(), "a partition never quiet: busy, nothing sent yet");
+    src.p[2].on_read = nullptr;
+    src.p[1].m.resize(0x1000);
+    CHECK(write_hub(src, out) == Err::Parts && out.b.empty(), "a partition not the size in the header: refused");
+}
+
 int main() {
     if (!crypto_init()) { printf("crypto_init failed\n"); return 99; }
     test_header();
@@ -305,6 +648,13 @@ int main() {
     test_kdf();
     test_gcm();
     test_sha();
+    test_snapshot();
+    test_round_trip();
+    test_refusals();
+    test_power_cuts();
+    test_boot_checks();
+    test_stage_bounds();
+    test_write_errors();
     printf("%s (%d failed)\n", s_fail ? "FAILED" : "all ok", s_fail);
     return s_fail;
 }
