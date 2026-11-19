@@ -60,7 +60,6 @@ bool on_event(int kind, uint64_t ieee, uint16_t manuf, uint16_t type, uint32_t a
         q.version = a;
         const bool go = devota::on_start(s_s, ieee, q);
         if (go) ESP_LOGI(TAG, "0x%016" PRIX64 " runs v%08" PRIX32 ": sending v%08" PRIX32, ieee, a, s_s.h.file_version);
-        else if (s_s.state == devota::State::Done && ieee == s_s.ieee) ESP_LOGI(TAG, "0x%016" PRIX64 " already runs v%08" PRIX32, ieee, a);
         return go;
     }
     case ZB_OTA_BLOCK:
@@ -88,7 +87,11 @@ void on_frame(uint64_t ieee, const uint8_t* zcl, size_t n) {
     devota::Query q;
     if (!devota::parse_query(zcl, n, &q)) return;
     Hold h(s_mu);
+    const bool was = devota::active(s_s);
     devota::on_query(s_s, ieee, q);
+    if (was && !devota::active(s_s))   // same_version or device_newer
+        ESP_LOGI(TAG, "0x%016" PRIX64 " runs v%08" PRIX32 ", the file is v%08" PRIX32 ": %s", ieee, q.version,
+                 s_s.h.file_version, s_s.reason);
 }
 
 // ── The hub's side (web server, main loop) ────────────────────────────────

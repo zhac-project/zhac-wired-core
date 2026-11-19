@@ -72,7 +72,7 @@ struct Session {
     bool has_query = false;     // `dev` holds the device's last Query Next Image
     Query dev{};
     uint8_t device_status = 0;  // the device's Upgrade End status when reason is "device_status"
-    const char* reason = "";    // same_version, device_status, or what fail() was given
+    const char* reason = "";    // same_version, device_newer, device_status, or what fail() was given
 };
 
 inline bool active(const Session& s) { return s.state == State::Waiting || s.state == State::Sending; }
@@ -91,22 +91,35 @@ inline bool begin(Session& s, uint64_t ieee, const Header& h, uint32_t now) {
     return true;
 }
 
-// Every Query Next Image of the target, matching the image or not; kept after the end to show the new version.
+// False once the device asked for another manufacturer or image type: the stack will never offer it this file.
+inline bool fits(const Session& s) {
+    return !s.has_query || (s.dev.manuf == s.h.manuf && s.dev.image_type == s.h.image_type);
+}
+
+// The device already runs the file's version (done), or a newer one (no downgrades: it keeps its firmware).
+inline bool ends_on_version(Session& s) {
+    if (s.dev.version < s.h.file_version) return false;
+    const bool same = s.dev.version == s.h.file_version;
+    s.state = same ? State::Done : State::Failed;
+    s.reason = same ? "same_version" : "device_newer";
+    return true;
+}
+
+// Every Query Next Image of the target, matching the image or not; kept after the end to show the new version. A
+// matching query is judged by its version here too, so the answer does not hang on whether the stack offers an
+// image it would not upgrade to.
 inline void on_query(Session& s, uint64_t ieee, const Query& q) {
     if (s.state == State::Idle || ieee != s.ieee) return;
     s.dev = q;
     s.has_query = true;
+    if (s.state == State::Waiting && fits(s)) ends_on_version(s);
 }
 
-// The stack found the image for a device's query: serve it only to the target, and not when it runs this version.
+// The stack found the image for a device's query: serve it only to the target, and only when it runs an older version.
 inline bool on_start(Session& s, uint64_t ieee, const Query& q) {
     if (!active(s) || ieee != s.ieee) return false;
     on_query(s, ieee, q);
-    if (q.version == s.h.file_version) {
-        s.state = State::Done;
-        s.reason = "same_version";
-        return false;
-    }
+    if (!active(s)) return false;   // on_query ended it: same or newer version
     s.state = State::Sending;
     s.offset = 0;
     return true;
@@ -147,11 +160,6 @@ inline void fail(Session& s, const char* reason) {
 
 inline void cancel(Session& s) {
     if (active(s)) s.state = State::Cancelled;
-}
-
-// False once the device asked for another manufacturer or image type: the stack will never offer it this file.
-inline bool fits(const Session& s) {
-    return !s.has_query || (s.dev.manuf == s.h.manuf && s.dev.image_type == s.h.image_type);
 }
 
 inline const char* state_name(State st) {

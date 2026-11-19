@@ -192,11 +192,44 @@ static void test_ends() {
           "state names");
 }
 
+// The device's running version against the file's, judged on the target's own query as well as at START, so the answer
+// does not depend on whether the stack offers an image it would not upgrade to (P6 review, 2026-11-19).
+static void test_versions() {
+    Session s;
+    begin(s, A, hdr(), 1);
+    on_query(s, A, qv(0x23086631));
+    CHECK(s.state == State::Done && !strcmp(s.reason, "same_version"), "the target's query settles the same version");
+    begin(s, A, hdr(), 2);
+    on_query(s, A, qv(0x23090000));
+    CHECK(s.state == State::Failed && !strcmp(s.reason, "device_newer") && !active(s),
+          "no downgrade: the device runs a newer version and keeps it");
+    begin(s, A, hdr(), 3);
+    CHECK(!on_start(s, A, qv(0x23090000)) && !strcmp(s.reason, "device_newer"), "no downgrade at START either");
+    begin(s, A, hdr(), 4);
+    on_query(s, A, qv(0x23090000, 0x117C, 0x2102));
+    CHECK(s.state == State::Waiting, "a query for another image type is not judged by its version");
+    on_query(s, B, qv(0x23090000));
+    CHECK(s.state == State::Waiting, "another device's newer version ends nothing");
+    on_query(s, A, qv(0x23086630));
+    CHECK(s.state == State::Waiting, "an older version waits for the download");
+    on_start(s, A, qv(0x23086630));
+    on_query(s, A, qv(0x23086630));
+    CHECK(s.state == State::Sending, "the target asking again while sending goes on");
+    on_end(s, 0);
+    on_query(s, A, qv(0x23086631));
+    CHECK(s.state == State::Done && s.reason[0] == 0, "after the update its new version does not read as 'already ran it'");
+    begin(s, A, hdr(), 5);
+    cancel(s);
+    on_query(s, A, qv(0x23090000));
+    CHECK(s.state == State::Cancelled, "a query after a cancel changes nothing");
+}
+
 int main() {
     test_file();
     test_query_frame();
     test_update();
     test_ends();
+    test_versions();
     printf("%s (%d failed)\n", s_fail ? "FAILED" : "all ok", s_fail);
     return s_fail;
 }
