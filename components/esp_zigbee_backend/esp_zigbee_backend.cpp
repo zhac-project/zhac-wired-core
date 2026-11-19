@@ -27,6 +27,8 @@
 #include "esp_zigbee_backend.h"
 #include "esp_zb_boot_guard.h"
 #include "esp_zb_configure_kick.h"
+#include "esp_zb_bcast_budget.h"
+#include "esp_zb_tx_track.h"
 #include "nvs_raw.h"
 #include "esp_zb_interview.h"
 #include <ctime>
@@ -570,10 +572,112 @@ static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
 }
 
 // ── Egress: adapter-encoded ZCL out over APS ─────────────────────────────
+//
+// Delivery (research 2026-11-18 B1): every frame sent here is kept in s_tx
+// until the stack confirms it. The first failure of a frame to a device that
+// keeps its receiver on looks the device's address up again (ZDO NWK_addr_req,
+// broadcast) and resends the frame once, to the new address when it moved --
+// what zigbee-herdsman does. Nobody answering the lookup is as good as an
+// unanswered ping: the device goes offline (zhac_adapter_unreachable). A sleepy
+// device is only logged: the adapter already holds its writes for its next
+// wake. Lookups share the broadcast budget with the collection groupcasts.
+// tx-delivery begin (cut out by test/host/tx_delivery)
+namespace {
+EXT_RAM_BSS_ATTR tx_track::Table s_tx;    // ~2.4 KB in PSRAM
+BroadcastBudget  s_bcast;
+portMUX_TYPE     s_tx_mux = portMUX_INITIALIZER_UNLOCKED;
+EXT_RAM_BSS_ATTR tx_track::Frame s_stage;    // af_send's copy for s_tx, under s_tx_mux (not on every sender's stack)
+EXT_RAM_BSS_ATTR tx_track::Frame s_resend;   // on_nwk_addr only (stack task)
+
+uint32_t ms_now() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+}  // namespace
+
+static bool af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
+                    const uint8_t* zcl_data, size_t zcl_len, bool resend);
+
 // Non-static: esp_zb_interview.cpp sends its Basic-cluster reads through this
 // rather than duplicating the apsde plumbing (declared in esp_zb_interview.h).
 bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
                     const uint8_t* zcl_data, size_t zcl_len) {
+    return af_send(nwk_addr, dst_ep, cluster_id, zcl_data, zcl_len, false);
+}
+
+// The lookup after a failed send ended (stack task).
+static void on_nwk_addr(const ezb_zdo_nwk_addr_req_result_t* r, void* ctx) {
+    const uint32_t token = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx));
+    uint64_t ieee = 0;
+    taskENTER_CRITICAL(&s_tx_mux);
+    const bool mine = s_tx.take(token, &s_resend, &ieee);
+    taskEXIT_CRITICAL(&s_tx_mux);
+    if (!mine) return;
+    const bool answered = r && r->error == 0 && r->rsp && r->rsp->status == 0 &&
+                          r->rsp->ieee_addr_remote_dev.u64 == ieee;
+    if (!answered) {
+        ESP_LOGW(TAG, "%016llx did not take cluster 0x%04x and nobody answered for its address -- offline",
+                 (unsigned long long)ieee, s_resend.cluster);
+        zhac_adapter_unreachable(ieee);
+        return;
+    }
+    const uint16_t nwk = r->rsp->nwk_addr_remote_dev;
+    if (nwk != s_resend.nwk) {
+        pool_set_nwk(ieee, nwk);
+        ESP_LOGI(TAG, "%016llx moved from 0x%04x to 0x%04x -- sending cluster 0x%04x again there",
+                 (unsigned long long)ieee, s_resend.nwk, nwk, s_resend.cluster);
+    }
+    af_send(nwk, s_resend.ep, s_resend.cluster, s_resend.data, s_resend.len, true);
+}
+
+// The stack's APSDE-DATA.confirm for a frame sent by af_send (stack task).
+static void on_apsde_confirm(const ezb_apsde_data_confirm_t* c) {
+    if (!c || c->dst_address.addr_mode != EZB_ADDR_MODE_SHORT) return;   // groupcasts are not tracked
+    const uint16_t nwk = c->dst_address.u.short_addr;
+    uint32_t token = 0;
+    taskENTER_CRITICAL(&s_tx_mux);
+    const tx_track::Verdict v = s_tx.confirm(nwk, c->cluster_id, c->asdu, c->asdu_length, c->status, &token);
+    taskEXIT_CRITICAL(&s_tx_mux);
+    if (v == tx_track::Verdict::kNone) return;
+    // The device the hub addressed: the pool's, also when the stack's own
+    // address map no longer has that address.
+    ZapDevice d{};
+    const uint64_t ieee = zigbee_pool_snapshot_by_nwk(nwk, &d) ? d.ieee_addr : 0;
+    if (v == tx_track::Verdict::kFailed) {
+        ESP_LOGW(TAG, "%016llx (0x%04x) did not take cluster 0x%04x, also after its address was looked up "
+                      "again (status 0x%02x)", (unsigned long long)ieee, nwk, c->cluster_id, c->status);
+        return;
+    }
+    const bool sleepy = ieee && esp_zb_is_sleepy(ieee);
+    bool asked = false;
+    if (ieee && !sleepy) {
+        taskENTER_CRITICAL(&s_tx_mux);
+        const bool budget = s_bcast.take(ms_now());
+        if (budget) s_tx.looking_up(token, ieee);
+        taskEXIT_CRITICAL(&s_tx_mux);
+        if (budget) {
+            ezb_zdo_nwk_addr_req_t req{};
+            req.dst_nwk_addr = 0xFFFD;                       // every device that keeps its receiver on
+            req.field.ieee_addr_of_interest.u64 = ieee;
+            req.field.request_type = 0;                      // that device only
+            req.cb = on_nwk_addr;
+            req.user_ctx = reinterpret_cast<void*>(static_cast<uintptr_t>(token));
+            asked = ezb_zdo_nwk_addr_req(&req) == 0;
+        }
+    }
+    if (asked) return;
+    taskENTER_CRITICAL(&s_tx_mux);
+    s_tx.take(token, nullptr, nullptr);
+    taskEXIT_CRITICAL(&s_tx_mux);
+    if (sleepy) {
+        ESP_LOGD(TAG, "%016llx (0x%04x, asleep) did not take cluster 0x%04x (status 0x%02x)",
+                 (unsigned long long)ieee, nwk, c->cluster_id, c->status);
+    } else {
+        ESP_LOGW(TAG, "0x%04x (%016llx) did not take cluster 0x%04x (status 0x%02x)%s", nwk,
+                 (unsigned long long)ieee, c->cluster_id, c->status,
+                 ieee ? " -- address not looked up (broadcast budget spent, or the stack refused)" : " (not in the pool)");
+    }
+}
+
+static bool af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
+                    const uint8_t* zcl_data, size_t zcl_len, bool resend) {
     if (!zcl_data || zcl_len == 0) return false;
 
     ezb_apsde_data_req_t req{};
@@ -588,6 +692,24 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     req.asdu_length  = static_cast<uint16_t>(zcl_len);
     req.asdu         = const_cast<uint8_t*>(zcl_data);
 
+    uint32_t token = 0;
+    if (zcl_len <= tx_track::kFrameMax) {
+        const uint32_t now = ms_now();
+        taskENTER_CRITICAL(&s_tx_mux);
+        s_stage.nwk = nwk_addr;
+        s_stage.ep = req.dst_endpoint;
+        s_stage.cluster = cluster_id;
+        s_stage.len = static_cast<uint8_t>(zcl_len);
+        std::memcpy(s_stage.data, zcl_data, zcl_len);
+        token = s_tx.sent(s_stage, resend, now);   // before the request: its confirm can come first
+        taskEXIT_CRITICAL(&s_tx_mux);
+    }
+    auto untrack = [token] {   // no request, no confirm
+        taskENTER_CRITICAL(&s_tx_mux);
+        s_tx.cancel(token);
+        taskEXIT_CRITICAL(&s_tx_mux);
+    };
+
     // EZB_ERR_NO_MEM (1) means the stack's buffer pool is spent: frames queued
     // for sleeping children hold a buffer each until delivered or expired
     // (~8 s). A sleepy thermostat under interview + configure hit this on
@@ -599,13 +721,17 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     for (int attempt = 0; attempt < 8; attempt++) {
         {
             zb_lock::Guard g;
-            if (!g) return false;
+            if (!g) {
+                untrack();
+                return false;
+            }
             err = ezb_apsde_data_request(&req);
         }
         if (err != EZB_ERR_NO_MEM || !can_wait) break;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (err != 0) {
+        untrack();
         ESP_LOGW(TAG, "apsde_data_request to 0x%04x cluster 0x%04x failed (%d)%s",
                  nwk_addr, cluster_id, (int)err,
                  err == EZB_ERR_NO_MEM ? " -- stack buffers full (frames pending for sleeping children)" : "");
@@ -613,6 +739,7 @@ bool esp_zb_af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
     }
     return true;
 }
+// tx-delivery end
 
 // Commands the adapter encodes carry a placeholder TSN (0). The ZNP bridge
 // numbers them; this path sent them as they came, so every library command
@@ -1276,6 +1403,7 @@ static bool zb_init() {
 
     // Hooks BEFORE start, so nothing is missed between start and registration.
     ezb_apsde_data_indication_handler_register(on_apsde_indication);
+    ezb_apsde_data_confirm_handler_register(on_apsde_confirm);   // delivery (B1)
     const ezb_err_t sig_err = ezb_app_signal_add_handler(on_app_signal);
     if (sig_err != 0) {
         ESP_LOGE(TAG, "app signal handler registration FAILED (%d) -- "

@@ -66,3 +66,17 @@ add_executable(netmap_tests test_netmap.cpp ../../esp_zb_netmap_walk.cpp ../../e
 target_include_directories(netmap_tests PRIVATE
     ${ZHAC_COMPONENTS}/components/arduinojson/src)
 add_test(NAME netmap COMMAND netmap_tests)
+
+# The delivery path (research 2026-11-18 B1), cut out of esp_zigbee_backend.cpp between "tx-delivery begin" and
+# "tx-delivery end" and run against stubs of the stack, the pool and the adapter.
+set(BACKEND_CPP ${CMAKE_CURRENT_SOURCE_DIR}/../../esp_zigbee_backend.cpp)
+set(DELIVERY_SLICE ${CMAKE_CURRENT_BINARY_DIR}/tx_delivery.inc)
+add_custom_command(
+    OUTPUT ${DELIVERY_SLICE}
+    COMMAND sh -c "sed -n '/tx-delivery begin/,/tx-delivery end/p' \"$0\" > \"$1\"" ${BACKEND_CPP} ${DELIVERY_SLICE}
+    DEPENDS ${BACKEND_CPP}
+    VERBATIM)
+add_executable(tx_delivery_tests test_tx_delivery.cpp ${DELIVERY_SLICE})
+target_include_directories(tx_delivery_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_options(tx_delivery_tests PRIVATE -Wno-unused-function)
+add_test(NAME tx_delivery COMMAND tx_delivery_tests)
