@@ -6,8 +6,10 @@
 // the core (main/backup_core.h): the snapshot, the file writer, the stager and the boot-time apply, on fake NOR flash
 // that can fail any erase or write (a power cut) and change under a read (a store writing).
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS   // mbedtls_psa_stats_t, to count live keys
@@ -638,8 +640,54 @@ static void test_write_errors() {
     CHECK(write_hub(src, out) == Err::Parts && out.b.empty(), "a partition not the size in the header: refused");
 }
 
-int main() {
+// For run.sh's check against tools/zhac_backup.py. export DIR: a file the firmware's code made from Hub(1), and its
+// partitions. import FILE DIR: restore FILE onto Hub(9) as the hub would; exit 0 when it then holds DIR's partitions.
+static std::vector<uint8_t> slurp(const std::string& p) {
+    std::vector<uint8_t> v;
+    if (FILE* f = fopen(p.c_str(), "rb")) {
+        int c;
+        while ((c = fgetc(f)) != EOF) v.push_back((uint8_t)c);
+        fclose(f);
+    }
+    return v;
+}
+
+static int export_to(const std::string& dir) {
+    Hub src(1);
+    const std::vector<uint8_t> file = make_file(src);
+    bool ok = !file.empty();
+    const auto put = [&ok](const std::string& p, const std::vector<uint8_t>& v) {
+        FILE* f = fopen(p.c_str(), "wb");
+        ok = ok && f && fwrite(v.data(), 1, v.size(), f) == v.size();
+        if (f) fclose(f);
+    };
+    put(dir + "/fw.zhacbak", file);
+    for (int i = 0; i < 4; i++) put(dir + "/" + kPartNames[i] + ".bin", src.p[i].m);
+    return ok ? 0 : 1;
+}
+
+static int import_from(const std::string& file, const std::string& dir) {
+    const std::vector<uint8_t> f = slurp(file);
+    const char* pw = getenv("ZHAC_BACKUP_PASSWORD");
+    Hub dst(9);
+    Fake slot(0x50000, 0x00);
+    std::vector<uint8_t> tmp(kPiece);
+    Stage st{};
+    Header h{};
+    // run.sh made it with --fw v2026111903 --nwk-fc 42 and the default host.
+    if (f.size() < kHeaderLen || !parse(f.data(), &h) || strcmp(h.fw, "v2026111903") != 0 || strcmp(h.host, "zhac") != 0 ||
+        h.nwk_fc != 42 || h.kdf_iter != kKdfIter) return 5;
+    if (!pw || stage(f, slot, dst, pw, 1500, 99) != Err::None) return 2;
+    if (apply(slot, Hub::find, &dst, tmp.data(), &st) != Applied::Done || st.fc_target != 99) return 3;
+    for (int i = 0; i < 4; i++) if (dst.p[i].m != slurp(dir + "/" + kPartNames[i] + ".bin")) return 4;
+    return 0;
+}
+
+int main(int argc, char** argv) {
     if (!crypto_init()) { printf("crypto_init failed\n"); return 99; }
+    if (argc == 3 && strcmp(argv[1], "export") == 0) return export_to(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "import") == 0) return import_from(argv[2], argv[3]);
+    if (argc != 1) { printf("usage: harness [export DIR | import FILE DIR]\n"); return 98; }
     test_header();
     test_stage();
     test_fc_target();
