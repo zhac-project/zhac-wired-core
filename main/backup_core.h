@@ -193,7 +193,7 @@ inline Applied apply(Flash& slot, Flash* (*find)(const char* name, void* ctx), v
     Flash* dst[kMaxParts] = {};
     for (uint16_t i = 0; i < st->n_parts; i++) {
         dst[i] = find(st->parts[i].name, ctx);
-        if (!dst[i] || dst[i]->size() != st->parts[i].size ||
+        if (!dst[i] || !fits(st->parts[i].name, st->parts[i].size, dst[i]->size()) ||
             static_cast<uint64_t>(st->parts[i].offset) + st->parts[i].size > slot.size()) {
             slot.erase(0, kSector);
             return Applied::Parts;
@@ -213,7 +213,7 @@ inline Applied apply(Flash& slot, Flash* (*find)(const char* name, void* ctx), v
         return Applied::BadSha;
     }
     for (uint16_t i = 0; i < st->n_parts; i++) {
-        if (!dst[i]->erase(0, st->parts[i].size)) return Applied::Flash;
+        if (!dst[i]->erase(0, dst[i]->size())) return Applied::Flash;   // all of it: a larger one's rest is free
         for (uint32_t off = 0; off < st->parts[i].size; off += kPiece) {
             if (!slot.read(st->parts[i].offset + off, tmp, kPiece) || !dst[i]->write(off, tmp, kPiece)) return Applied::Flash;
         }

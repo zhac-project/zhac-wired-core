@@ -165,17 +165,24 @@ static void test_stage() {
 static void test_fc_target() {
     printf("frame counter target\n");
     const uint32_t t0 = 1795000000;
+    // The stack saves its counter (+1024) only when the counter reaches a multiple of 1024 (esp-zigbee-lib 2.1.0
+    // nwk_secur_inc_frame_cntr): a target on one is saved with the first frame after the raise (review P5 I1).
+    const auto up = [](uint64_t v) { return (uint32_t)((v + 1023) / 1024 * 1024); };
     CHECK(fc_target(0, t0, t0 + 60, 5000) == 0, "no network in the backup: nothing to raise");
-    CHECK(fc_target(1000, t0, t0 + 3600, 0) == 1000 + 100000 + 20 * 3600, "an hour later: +100 000 +20/s");
-    CHECK(fc_target(1000, t0, t0 + 3600, 500000) == 600000, "this hub's own counter is higher: it +100 000");
-    CHECK(fc_target(1000, 0, t0, 0) == 1000 + 100000 + 20u * 90 * 86400, "backup clock unknown: 90 days");
-    CHECK(fc_target(1000, t0, 0, 0) == 1000 + 100000 + 20u * 90 * 86400, "hub clock unknown: 90 days");
-    CHECK(fc_target(1000, t0, t0 - 10, 0) == 1000 + 100000 + 20u * 90 * 86400, "clock behind the backup: 90 days");
-    CHECK(fc_target(1000, 1600000000, t0, 0) == 1000 + 100000 + 20u * 90 * 86400,
+    CHECK(fc_target(1000, t0, t0 + 3600, 0) == up(1000 + 100000 + 20 * 3600), "an hour later: +100 000 +20/s");
+    CHECK(fc_target(1000, t0, t0 + 3600, 500000) == up(600000), "this hub's own counter is higher: it +100 000");
+    CHECK(fc_target(1000, 0, t0, 0) == up(1000 + 100000 + 20u * 90 * 86400), "backup clock unknown: 90 days");
+    CHECK(fc_target(1000, t0, 0, 0) == up(1000 + 100000 + 20u * 90 * 86400), "hub clock unknown: 90 days");
+    CHECK(fc_target(1000, t0, t0 - 10, 0) == up(1000 + 100000 + 20u * 90 * 86400), "clock behind the backup: 90 days");
+    CHECK(fc_target(1000, 1600000000, t0, 0) == up(1000 + 100000 + 20u * 90 * 86400),
           "a backup stamped before the clock could be right (2020): 90 days");
     CHECK(fc_target(0xEFFFFFFF, t0, t0 + 1, 0) == 0xF0000000u, "capped at 0xF0000000");
     CHECK(fc_target(1000, t0, t0 + 400000000u, 0) == 0xF0000000u, "a very old backup: capped");
     CHECK(fc_target(1000, t0, t0 + 3600, 0xFFFFFFF0u) == 0xF0000000u, "a huge counter here: capped too");
+    bool all = true;
+    for (uint32_t fc : {1u, 1000u, 123456u, 0x7FFFFu, 0xEFFFF000u})
+        for (uint32_t dt : {0u, 1u, 3600u, 86400u * 30}) all = all && fc_target(fc, t0, t0 + dt, fc / 2) % 1024 == 0;
+    CHECK(all, "always a multiple of 1024, so the stack saves it with its first frame");
 }
 
 static void test_versions() {
@@ -196,8 +203,14 @@ static void test_parts_match() {
     const Header h = sample_header();
     const char* why = nullptr;
     CHECK(parts_match(h, hub, 4, &why), "the same four partitions match");
-    Header x = h; x.parts[2].size = 0x80000;
-    CHECK(!parts_match(x, hub, 4, &why) && why && strcmp(why, "zhac_data") == 0, "a size differs: refused, named");
+    // Hubs installed before 2026-10-25 have a 16 KB zb_storage, later ones 128 KB (wired 2d23a0e): an NVS
+    // partition may be larger here, never smaller; scripts (SPIFFS) only the same size (review P5 I2).
+    Header x = h; x.parts[1].size = 0x4000;
+    CHECK(parts_match(x, hub, 4, &why), "a smaller NVS partition in the file (old 16 KB zb_storage): fits");
+    x = h; x.parts[2].size = 0x200000;
+    CHECK(!parts_match(x, hub, 4, &why) && why && strcmp(why, "zhac_data") == 0, "a larger one in the file: refused, named");
+    x = h; x.parts[3].size = 0x100000;
+    CHECK(!parts_match(x, hub, 4, &why) && why && strcmp(why, "scripts") == 0, "scripts of another size: refused");
     x = h; strcpy(x.parts[0].name, "phy_init");
     CHECK(!parts_match(x, hub, 4, &why) && why && strcmp(why, "phy_init") == 0, "a partition this hub lacks: refused");
     x = h; strcpy(x.parts[3].name, "nvs"); x.parts[3].size = 0x10000;
@@ -380,13 +393,15 @@ static Header file_header(const Hub& hub) {
 }
 
 struct Bufs {   // one snapshot buffer per partition, as the download handler allocates them
-    std::vector<uint8_t> v[4] = {std::vector<uint8_t>(kSizes[0]), std::vector<uint8_t>(kSizes[1]),
-                                 std::vector<uint8_t>(kSizes[2]), std::vector<uint8_t>(kSizes[3])};
-    uint8_t* p[4] = {v[0].data(), v[1].data(), v[2].data(), v[3].data()};
+    std::vector<uint8_t> v[4];
+    uint8_t* p[4];
+    explicit Bufs(const Hub& h) {
+        for (int i = 0; i < 4; i++) { v[i].resize(h.list[i].size); p[i] = v[i].data(); }
+    }
 };
 
 static Err write_hub(Hub& src, Sink& out) {
-    Bufs b;
+    Bufs b(src);
     std::vector<uint8_t> io(kPiece + 16);
     Flash* parts[4] = {&src.p[0], &src.p[1], &src.p[2], &src.p[3]};
     return write_file(file_header(src), kPw, strlen(kPw), parts, b.p, out, io.data(), nullptr);
@@ -477,6 +492,31 @@ static void test_round_trip() {
           "next boot: nothing written again, the frame counter target still handed out");
     Fake empty(0x50000, 0xFF);
     CHECK(apply(empty, Hub::find, &dst, tmp.data(), &got) == Applied::Nothing, "an erased slot: nothing to do");
+}
+
+static void test_larger_target() {
+    printf("restore onto a hub with a larger NVS partition\n");
+    Hub src(1), big(9);
+    big.p[1] = Fake(kSizes[1] * 4, 0x5A);   // a new install's zb_storage, holding its own network
+    big.list[1].size = kSizes[1] * 4;
+    const std::vector<uint8_t> file = make_file(src);
+    Fake slot(0x50000, 0x00);
+    CHECK(stage(file, slot, big, kPw, 4096) == Err::None, "staged");
+    Stage got{};
+    std::vector<uint8_t> tmp(kPiece);
+    CHECK(apply(slot, Hub::find, &big, tmp.data(), &got) == Applied::Done, "applied");
+    const std::vector<uint8_t>& z = big.p[1].m;
+    CHECK(memcmp(z.data(), src.p[1].m.data(), kSizes[1]) == 0, "the image at the start");
+    bool erased = true;
+    for (size_t i = kSizes[1]; i < z.size(); i++) erased = erased && z[i] == 0xFF;
+    CHECK(erased, "the rest erased: free NVS pages, nothing of the old network");
+    Hub old(9);
+    Hub big_src(3);
+    big_src.p[1] = Fake(kSizes[1] * 4, 0x33);
+    big_src.list[1].size = kSizes[1] * 4;
+    Fake slot2(0x60000, 0x00);
+    CHECK(stage(make_file(big_src), slot2, old, kPw, 4096) == Err::Parts && slot2.erases == 0,
+          "the other way (a larger zb_storage in the file): refused, untouched");
 }
 
 static void test_refusals() {
@@ -698,6 +738,7 @@ int main(int argc, char** argv) {
     test_sha();
     test_snapshot();
     test_round_trip();
+    test_larger_target();
     test_refusals();
     test_power_cuts();
     test_boot_checks();

@@ -167,7 +167,9 @@ inline bool parse(const uint8_t* b, Stage* s) {
 
 // The NWK frame counter a restored network must start from. Devices drop a frame whose counter is not above the
 // last one they saw from the hub, and the old hub may have run on after the backup: allow 20 frames a second since
-// then (90 days when either clock was not set), never less than this hub's own counter, plus 100 000.
+// then (90 days when either clock was not set), never less than this hub's own counter, plus 100 000. Rounded up to
+// a multiple of 1024: the stack saves its counter (+1024) only when the counter reaches one (esp-zigbee-lib 2.1.0
+// nwk_secur_inc_frame_cntr), so the raised counter is saved with the first frame after the raise (review P5 I1).
 inline uint32_t fc_target(uint32_t nwk_fc, uint32_t created, uint32_t now, uint32_t fc_now) {
     constexpr uint32_t kClockSet = 1700000000;   // 2023-11: a clock below this was never set
     constexpr uint64_t kMargin = 100000, kRate = 20, kUnknown = 90ull * 86400, kCap = 0xF0000000u;
@@ -175,6 +177,7 @@ inline uint32_t fc_target(uint32_t nwk_fc, uint32_t created, uint32_t now, uint3
     const uint64_t elapsed = created >= kClockSet && now >= created ? now - created : kUnknown;
     uint64_t t = nwk_fc + kMargin + kRate * elapsed;
     if (fc_now + kMargin > t) t = fc_now + kMargin;
+    t = (t + 1023) & ~uint64_t{1023};
     return (uint32_t)(t > kCap ? kCap : t);
 }
 
@@ -189,12 +192,19 @@ inline bool newer_fw(const char* backup_fw, const char* hub_fw) {
     return tag(backup_fw) && tag(hub_fw) && strncmp(backup_fw + 1, hub_fw + 1, 10) > 0;
 }
 
-// Every partition in the file must exist on this hub with the same size, once. `why` names the first that does not.
+// Whether this hub's partition can take the file's: the same size, or an NVS one larger here (NVS reads the erased
+// rest as free pages). Hubs installed before 2026-10-25 have a 16 KB zb_storage, later ones 128 KB (wired 2d23a0e).
+// SPIFFS (scripts) keeps its geometry in its size: the same only (review P5 I2).
+inline bool fits(const char* name, uint32_t file_size, uint32_t hub_size) {
+    return hub_size == file_size || (strcmp(name, "scripts") != 0 && hub_size > file_size);
+}
+
+// Every partition in the file must exist on this hub, once, and fit. `why` names the first that does not.
 inline bool parts_match(const Header& h, const Part* hub, size_t n, const char** why) {
     for (uint16_t i = 0; i < h.n_parts; i++) {
         *why = h.parts[i].name;
         bool found = false;
-        for (size_t j = 0; j < n; j++) found = found || (strcmp(hub[j].name, h.parts[i].name) == 0 && hub[j].size == h.parts[i].size);
+        for (size_t j = 0; j < n; j++) found = found || (strcmp(hub[j].name, h.parts[i].name) == 0 && fits(h.parts[i].name, h.parts[i].size, hub[j].size));
         for (uint16_t k = 0; k < i; k++) found = found && strcmp(h.parts[k].name, h.parts[i].name) != 0;
         if (!found) return false;
     }

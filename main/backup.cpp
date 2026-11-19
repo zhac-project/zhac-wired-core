@@ -12,12 +12,14 @@
 // extra/docs/superpowers/specs/2026-11-19-full-backup-design.md, main/backup_format.h.
 #include "backup.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <memory>
 #include <new>
 #include <strings.h>
+#include <sys/socket.h>
 
 #include "ArduinoJson.h"
 #include "auth.h"
@@ -324,14 +326,40 @@ bool stage_restore(httpd_req_t* req) {
     return true;
 }
 
-esp_err_t handle_restore(httpd_req_t* req) {
+// Replies; true once the restore is staged and the restart is on its way.
+bool restore(httpd_req_t* req) {
     if (!content_type_is(req, "application/octet-stream")) {
-        return reply(req, "415 Unsupported Media Type", "{\"error\":\"octet_stream_required\"}");
+        return fail(req, "415 Unsupported Media Type", "{\"error\":\"octet_stream_required\"}");
     }
-    if (ota_update_state()[0] == 'p') return reply(req, "409 Conflict", "{\"error\":\"on_trial\"}");
-    if (!ota_update_slot_claim()) return reply(req, "409 Conflict", "{\"error\":\"update_running\"}");
+    if (ota_update_state()[0] == 'p') return fail(req, "409 Conflict", "{\"error\":\"on_trial\"}");
+    if (!ota_update_slot_claim()) return fail(req, "409 Conflict", "{\"error\":\"update_running\"}");
     // Staged: the slot stays claimed until the restart, so no update erases the backup first.
-    if (!stage_restore(req)) ota_update_slot_release();
+    if (stage_restore(req)) return true;
+    ota_update_slot_release();
+    return false;
+}
+
+// ws_server fails a request's reads 8 s after its first byte until the hub answers (its slowloris guard); a restore
+// answers only once it is staged, 20-30 s in. This request reads through its own function instead, with one limit
+// for the whole upload, inside the supervisor's 3 minutes for the web server's task (review P5 C1).
+constexpr int64_t kRestoreBudgetUs = 120 * 1000 * 1000;
+int64_t s_restore_until;   // the web server has one task: one restore at a time
+
+int restore_recv(httpd_handle_t, int fd, char* buf, size_t len, int flags) {
+    if (!buf) return HTTPD_SOCK_ERR_INVALID;
+    if (esp_timer_get_time() > s_restore_until) return HTTPD_SOCK_ERR_FAIL;
+    const int r = recv(fd, buf, len, flags);
+    if (r >= 0) return r;
+    return errno == EAGAIN || errno == EINTR ? HTTPD_SOCK_ERR_TIMEOUT : HTTPD_SOCK_ERR_FAIL;
+}
+
+esp_err_t handle_restore(httpd_req_t* req) {
+    const int fd = httpd_req_to_sockfd(req);
+    s_restore_until = esp_timer_get_time() + kRestoreBudgetUs;
+    httpd_sess_set_recv_override(req->handle, fd, restore_recv);
+    // Any answer but the restart: httpd reads the rest of the body, then closes this session, which is no longer
+    // under ws_server's guard.
+    if (!restore(req)) httpd_sess_trigger_close(req->handle, fd);
     return ESP_OK;
 }
 
