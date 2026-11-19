@@ -107,6 +107,30 @@ bool dgm_tbl_set(DgmTable& t, uint64_t ieee, uint8_t ep, const uint16_t* gids, u
     return changed;
 }
 
+uint16_t dgm_tbl_group_of(const DgmTable& t, const uint64_t* ieee, const uint8_t* ep, uint8_t n) {
+    const auto row = [&](uint64_t ie, uint8_t e) -> const DgmEntry* {
+        for (uint8_t i = 0; i < t.n; i++)
+            if (t.devs[i].ieee == ie && t.devs[i].ep == e) return &t.devs[i];
+        return nullptr;
+    };
+    const DgmEntry* first = n ? row(ieee[0], ep[0]) : nullptr;
+    if (!first) return 0;
+    for (uint8_t g = 0; g < first->count; g++) {
+        const uint16_t gid = first->gids[g];
+        bool all = true;
+        for (uint8_t k = 1; k < n && all; k++) {
+            const DgmEntry* e = row(ieee[k], ep[k]);
+            all = e && dgm_has(*e, gid);
+        }
+        // Every member is in it; it holds no one else (rows are unique per
+        // device endpoint, so a member listed twice comes out short here).
+        uint8_t members = 0;
+        for (uint8_t i = 0; i < t.n; i++) members += dgm_has(t.devs[i], gid) ? 1 : 0;
+        if (all && members == n) return gid;
+    }
+    return 0;
+}
+
 void dgm_tbl_from_v1(const DgmTableV1& old, DgmTable& out) {
     std::memset(&out, 0, sizeof(out));
     const uint8_t n = old.n > DGM_MAX_DEVS ? DGM_MAX_DEVS : old.n;   // clamp a corrupt blob
@@ -197,6 +221,9 @@ uint8_t dgm_prune(bool (*paired)(uint64_t ieee)) {
         const uint8_t n = dgm_tbl_prune(t, paired);
         return n && !dgm_save(t) ? 0 : n;   // 0: nothing went for good
     });
+}
+uint16_t dgm_group_of(const uint64_t* ieee, const uint8_t* ep, uint8_t n) {
+    return with_table([&](DgmTable& t) { return dgm_tbl_group_of(t, ieee, ep, n); });
 }
 uint8_t dgm_list(uint64_t ieee, uint16_t* out, uint8_t max) {
     return with_table([&](DgmTable& t) { return dgm_tbl_list(t, ieee, out, max); });

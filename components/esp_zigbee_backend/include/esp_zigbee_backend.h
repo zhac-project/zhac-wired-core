@@ -62,3 +62,12 @@ inline uint32_t esp_zigbee_backend_wall_clock_s(void) {
 // -- the only way a groupcast-only zone remote (FUT089Z) is heard. Idempotent.
 bool esp_zb_coordinator_join_group(uint16_t group_id);
 
+// One genOnOff command (0 Off, 1 On, 2 Toggle) to every member of ZCL group
+// group_id: a single groupcast, within the hub's broadcast budget (research
+// 2026-11-18 B5). false = not sent; the caller sends to each member instead.
+bool esp_zb_groupcast_onoff(uint16_t group_id, uint8_t cmd);
+
+// A device that sleeps between polls (a direct child's rx_on_when_idle, else a
+// battery power source). It misses broadcasts, groupcasts included.
+bool esp_zb_is_sleepy(uint64_t ieee);
+

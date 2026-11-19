@@ -16,6 +16,8 @@
 #include "esp_log.h"
 #include "device_cmd.h"
 #include "device_cmd_json.h"
+#include "dgm_store.h"
+#include "esp_zigbee_backend.h"   // esp_zb_groupcast_onoff, esp_zb_is_sleepy
 #include "groups_store.h"
 #include "json_buf.h"
 #include "zhc_adapter.h"
@@ -113,6 +115,25 @@ bool group_delete_req(const char* body, size_t len) {
     return grp_delete(doc["id"] | (uint16_t)0);
 }
 
+// One On / Off / Toggle for the whole collection (research 2026-11-18 B5):
+// when a native ZCL group holds exactly its members (the device pages' group
+// mirror) and none of them sleeps -- a groupcast is a broadcast, which a
+// sleeping device misses -- one groupcast switches them together instead of
+// one after the other. false: not sent (no such group, a member asleep, the
+// broadcast budget spent, the stack refused).
+static bool groupcast_collection(const GrpRecord& r, uint8_t cmd) {
+    if (r.member_count < 2) return false;
+    uint64_t ieee[GRP_MAX_MEMBERS];
+    uint8_t  ep[GRP_MAX_MEMBERS];
+    for (uint8_t i = 0; i < r.member_count; i++) {
+        if (esp_zb_is_sleepy(r.members[i].ieee)) return false;
+        ieee[i] = r.members[i].ieee;
+        ep[i]   = r.members[i].ep;
+    }
+    const uint16_t gid = dgm_group_of(ieee, ep, r.member_count);
+    return gid && esp_zb_groupcast_onoff(gid, cmd);
+}
+
 size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
     JsonDocument doc;
     if (len == 0 || deserializeJson(doc, body, len))
@@ -129,11 +150,13 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
     // (review F34).
     char key[24] = "state";
     DevCmdValue val;
+    int onoff = -1;   // a genOnOff command (0 Off, 1 On, 2 Toggle): one groupcast can carry it
     if (!doc["cmd"].isNull()) {
         const uint16_t cluster = doc["cluster"] | (uint16_t)0;
         const int      cmd     = doc["cmd"].is<int>() ? doc["cmd"].as<int>() : -1;
         if (cluster == 0x0006 && cmd >= 0 && cmd <= 2) {
             val = device_cmd_str(cmd == 1 ? "ON" : cmd == 0 ? "OFF" : "TOGGLE");
+            onoff = cmd;
         } else if (cluster == 0x0003 && cmd == 0) {
             strcpy(key, "identify");
             val = device_cmd_str("identify");
@@ -144,7 +167,11 @@ size_t group_cmd(const char* body, size_t len, char* out, size_t cap) {
         strncpy(key, doc["key"] | "state", sizeof(key) - 1);
         if (!device_cmd_value_from_json(doc["val"], &val))
             return snprintf(out, cap, "{\"ok\":false,\"err\":\"val must be a boolean, number or string\"}");
+        if (strcmp(key, "state") == 0 && val.kind == DEVCMD_STR)
+            onoff = strcmp(val.s, "OFF") == 0 ? 0 : strcmp(val.s, "ON") == 0 ? 1 : strcmp(val.s, "TOGGLE") == 0 ? 2 : -1;
     }
+    if (onoff >= 0 && groupcast_collection(r, static_cast<uint8_t>(onoff)))
+        return snprintf(out, cap, "{\"ok\":true,\"sent\":%u,\"failed\":0}", r.member_count);
 
     uint8_t sent = 0, failed = 0;
     for (uint8_t i = 0; i < r.member_count; i++) {

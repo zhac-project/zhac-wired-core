@@ -17,15 +17,18 @@ WS=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # 
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-groups.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
-cp "$R/groups_store.h" "$R/json_buf.h" "$H/harness.cpp" "$DC/include/device_cmd.h" "$DC/include/device_cmd_json.h" \
+cp "$R/groups_store.h" "$R/dgm_store.h" "$R/json_buf.h" "$H/harness.cpp" "$DC/include/device_cmd.h" "$DC/include/device_cmd_json.h" \
    "$DC/device_cmd_json.cpp" "$W/"
 echo '#pragma once' > "$W/nvs.h"
 { echo '#include "groups_store.h"'; echo '#include "json_buf.h"'; echo '#include "device_cmd_json.h"'
+  echo '#include "dgm_store.h"'
   echo '#include <cstdio>'; echo '#include <cstring>'; echo '#include <memory>'; echo '#include <new>'; echo 'bool grp_find(uint16_t id, GrpRecord& out);'
+  echo 'bool esp_zb_groupcast_onoff(uint16_t group_id, uint8_t cmd); bool esp_zb_is_sleepy(uint64_t ieee);'
   sed -n '/^size_t grp_to_json/,/^}/p' "$R/groups_store.cpp"
   sed -n '/^size_t group_list_json/,/^}/p' "$R/api_groups.cpp"
+  sed -n '/^static bool groupcast_collection/,/^}/p' "$R/api_groups.cpp"
   sed -n '/^size_t group_cmd/,/^}/p' "$R/api_groups.cpp"; } > "$W/slice_tu.cpp"
-test "$(grep -c '^}' "$W/slice_tu.cpp")" -eq 3   # all three functions were found
+test "$(grep -c '^}' "$W/slice_tu.cpp")" -eq 4   # all four functions were found
 
 cd "$W"
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++

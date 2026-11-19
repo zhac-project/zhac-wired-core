@@ -34,13 +34,36 @@ static std::string g_sent;
 DevCmdResult device_cmd_set_attr(uint64_t, uint8_t, const char* key, const DevCmdValue* v) {
     char one[64];
     if (v->kind == DEVCMD_STR) std::snprintf(one, sizeof(one), "%s=%s;", key, v->s);
+    else if (v->kind == DEVCMD_BOOL) std::snprintf(one, sizeof(one), "%s=%s;", key, v->b ? "true" : "false");
     else std::snprintf(one, sizeof(one), "%s=%lld;", key, (long long)v->i);
     g_sent += one;
     return DEVCMD_OK;
 }
+// Native ZCL groups (research 2026-11-18 B5): the group the mirror matches, who sleeps, what went out as a
+// groupcast ("gid/cmd;"), and whether the radio took it.
+static uint16_t    g_native = 0;
+static std::string g_asked, g_gc;
+static uint64_t    g_sleepy = 0;
+static bool        g_gc_ok = true;
+uint16_t dgm_group_of(const uint64_t* ieee, const uint8_t* ep, uint8_t n) {
+    char one[40];
+    for (uint8_t i = 0; i < n; i++) {
+        std::snprintf(one, sizeof(one), "%s%llx/%u", i ? "," : "", (unsigned long long)ieee[i], ep[i]);
+        g_asked += one;
+    }
+    g_asked += ";";
+    return g_native;
+}
+bool esp_zb_is_sleepy(uint64_t ieee) { return ieee == g_sleepy; }
+bool esp_zb_groupcast_onoff(uint16_t gid, uint8_t c) {
+    g_gc += std::to_string(gid) + "/" + std::to_string(c) + ";";
+    return g_gc_ok;
+}
 static std::string cmd(const char* body) {
     char out[128];
     g_sent.clear();
+    g_asked.clear();
+    g_gc.clear();
     const size_t n = group_cmd(body, std::strlen(body), out, sizeof(out));
     return std::string(out, n);
 }
@@ -109,6 +132,43 @@ int main() {
         const std::string r = cmd(bad);
         expect(bad, g_sent.empty() && r.find("\"ok\":false") != std::string::npos);
     }
+
+    // A native ZCL group holding exactly the members (B5): one groupcast instead of a command per member.
+    g_native = 101;
+    std::string res = cmd("{\"id\":7,\"ep\":1,\"cluster\":6,\"cmd\":1}");
+    expect("On to a collection that is a native group: one groupcast, no command per member",
+           g_gc == "101/1;" && g_sent.empty() && res == "{\"ok\":true,\"sent\":2,\"failed\":0}");
+    expect("  the mirror was asked about exactly the members", g_asked == "a4c1380000000000/255,a4c1380000000001/255;");
+    cmd("{\"id\":7,\"ep\":1,\"cluster\":6,\"cmd\":0}");
+    const std::string off = g_gc;
+    cmd("{\"id\":7,\"ep\":1,\"cluster\":6,\"cmd\":2}");
+    expect("Off and Toggle: commands 0 and 2", off == "101/0;" && g_gc == "101/2;" && g_sent.empty());
+    cmd("{\"id\":7,\"key\":\"state\",\"val\":\"OFF\"}");
+    expect("state OFF by key and value: the same groupcast", g_gc == "101/0;" && g_sent.empty());
+    cmd("{\"id\":7,\"key\":\"state\",\"val\":true}");
+    expect("state true (a boolean): a command per member, as before", g_gc.empty() && g_sent == "state=true;state=true;");
+    cmd("{\"id\":7,\"key\":\"brightness\",\"val\":128}");
+    expect("brightness: a command per member", g_gc.empty() && g_sent == "brightness=128;brightness=128;");
+    cmd("{\"id\":7,\"cluster\":3,\"cmd\":0}");
+    expect("Identify: a command per member", g_gc.empty() && g_sent == "identify=identify;identify=identify;");
+    g_sleepy = 0xA4C1380000000001ull;
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":1}");
+    expect("a member that sleeps (it would miss a groupcast): a command per member",
+           g_gc.empty() && g_sent == "state=ON;state=ON;");
+    g_sleepy = 0;
+    g_gc_ok = false;
+    res = cmd("{\"id\":7,\"cluster\":6,\"cmd\":1}");
+    expect("the groupcast not sent (budget, radio): a command per member after all",
+           g_gc == "101/1;" && g_sent == "state=ON;state=ON;" && res == "{\"ok\":true,\"sent\":2,\"failed\":0}");
+    g_gc_ok = true;
+    g_native = 0;
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":1}");
+    expect("no native group holds exactly the members: a command per member",
+           !g_asked.empty() && g_gc.empty() && g_sent == "state=ON;state=ON;");
+    g_native = 101;
+    g_store[g_count++] = group(8, "lamp", 1);
+    cmd("{\"id\":8,\"cluster\":6,\"cmd\":1}");
+    expect("a collection of one: its command, no broadcast", g_asked.empty() && g_gc.empty() && g_sent == "state=ON;");
 
     std::printf(g_fail ? "\n%d FAILURE(S)\n" : "\ngroup JSON and commands OK\n", g_fail);
     return g_fail;

@@ -53,6 +53,10 @@ bool dgm_tbl_forget(DgmTable& t, uint64_t ieee);
 uint8_t dgm_tbl_prune(DgmTable& t, bool (*paired)(uint64_t ieee));
 // The pre-endpoint table, every entry on endpoint 1 (what the UI defaulted to).
 void dgm_tbl_from_v1(const DgmTableV1& old, DgmTable& out);
+// The group whose members are exactly these n device endpoints, none more and
+// none fewer: a collection one groupcast can switch (research 2026-11-18 B5).
+// 0 = no such group.
+uint16_t dgm_tbl_group_of(const DgmTable& t, const uint64_t* ieee, const uint8_t* ep, uint8_t n);
 
 // ── NVS-backed store ("zhac_gm" namespace) — thin load / op / save wrappers ──
 void    dgm_store_init();
@@ -63,6 +67,8 @@ bool    dgm_set(uint64_t ieee, uint8_t ep, const uint16_t* gids, uint8_t count);
 bool    dgm_forget(uint64_t ieee);
 // Boot: dgm_tbl_prune on the stored mirror, saved when a row went. Returns how many.
 uint8_t dgm_prune(bool (*paired)(uint64_t ieee));
+// dgm_tbl_group_of on the stored mirror.
+uint16_t dgm_group_of(const uint64_t* ieee, const uint8_t* ep, uint8_t n);
 
 // ── Global by-gid view (increment 3: the SPA "Groups" tab) ───────────────────
 // Max distinct group ids the global view enumerates in one response.

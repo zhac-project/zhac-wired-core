@@ -79,4 +79,9 @@ bool zigbee_zcl_get_group_membership(uint16_t /*nwk_addr*/, uint8_t /*ep*/, uint
 // coordinator's IEEE, and an invented value would look like a real device.
 uint64_t zigbee_mgr_coordinator_ieee() { return 0; }
 
+// esp_zigbee_backend.h: no radio, no groupcast (group commands fall back to
+// one command per member, which the stubs above refuse).
+bool esp_zb_groupcast_onoff(uint16_t /*group_id*/, uint8_t /*cmd*/) { return false; }
+bool esp_zb_is_sleepy(uint64_t /*ieee*/) { return false; }
+
 #endif  // !CONFIG_ZHAC_ESP_ZIGBEE

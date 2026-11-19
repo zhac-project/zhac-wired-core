@@ -177,7 +177,7 @@ static void respond_gen_time(uint16_t nwk, uint8_t dst_ep, const uint8_t* zcl, u
 // the neighbour table knows (rx_on_when_idle). A device parented by a router
 // is not in it; there a battery power source (ZCL powerSource 0x03, bit 7 =
 // backup battery) stands in.
-static bool esp_zb_is_sleepy(uint64_t ieee) {
+bool esp_zb_is_sleepy(uint64_t ieee) {
     {
         zb_lock::Guard g;
         if (g) {
@@ -564,10 +564,12 @@ static bool on_apsde_indication_inner(const ezb_apsde_data_ind_t* ind) {
 // bench that ended in a ZBOSS assert ten seconds after boot. ZHAC decodes
 // for its own shadow; the devices get no ZCL replies from the stack, exactly
 // as before the endpoint existed.
+static bool from_self(const ezb_address_t& src);   // tx-delivery, below
+
 static bool on_apsde_indication(const ezb_apsde_data_ind_t* ind) {
     if (!ind) return false;
     if (ind->profile_id == 0x0000) return false;          // ZDO: the stack's
-    on_apsde_indication_inner(ind);
+    if (!from_self(ind->src_address)) on_apsde_indication_inner(ind);   // not the hub's own groupcast (B5)
     return ind->cluster_id != 0x0004;                     // Groups: the stack's too
 }
 
@@ -738,6 +740,54 @@ static bool af_send(uint16_t nwk_addr, uint8_t dst_ep, uint16_t cluster_id,
         return false;
     }
     return true;
+}
+
+// A collection whose members are exactly a native ZCL group switches with one
+// groupcast instead of a frame per member (research 2026-11-18 B5). It travels
+// as a network-wide broadcast, so it spends the broadcast budget; there is no
+// APS ACK for it, and its confirm is not tracked (on_apsde_confirm).
+bool esp_zb_groupcast_onoff(uint16_t group_id, uint8_t cmd) {
+    if (group_id == 0 || cmd > 2) return false;
+    taskENTER_CRITICAL(&s_tx_mux);
+    const bool budget = s_bcast.take(ms_now());
+    taskEXIT_CRITICAL(&s_tx_mux);
+    if (!budget) {
+        ESP_LOGI(TAG, "groupcast to group %u: broadcast budget spent -- one command per member", group_id);
+        return false;
+    }
+    uint8_t f[3] = {0x11, zcl_seq_next(), cmd};   // cluster command, to the server, no default response
+    ezb_apsde_data_req_t req{};
+    req.dst_address.addr_mode          = EZB_ADDR_MODE_GROUP;
+    req.dst_address.u.group_addr.group = group_id;
+    req.dst_address.u.group_addr.bcast = 0xFFFD;   // the devices that keep their receiver on
+    req.src_endpoint = 1;
+    req.cluster_id   = 0x0006;
+    req.profile_id   = 0x0104;
+    req.asdu_length  = sizeof(f);
+    req.asdu         = f;
+    ezb_err_t err = 0;
+    {
+        zb_lock::Guard g;
+        if (!g) return false;
+        err = ezb_apsde_data_request(&req);
+    }
+    if (err != 0) {
+        ESP_LOGW(TAG, "groupcast to group %u failed (%d) -- one command per member", group_id, (int)err);
+        return false;
+    }
+    ESP_LOGI(TAG, "groupcast to group %u: genOnOff command %u", group_id, cmd);
+    return true;
+}
+
+// A frame the hub sent itself. The stack hands a groupcast to endpoint 1 too
+// when it is in the group (aps_send_msg_task -> aps_send_msg_loopback), and it
+// is in every group a device joined (esp_zb_groups.cpp). From 0x0000 it would
+// decode under a pool device whose address is not known (0), or the address
+// map would offer the hub itself for adoption.
+static bool from_self(const ezb_address_t& src) {
+    if (src.addr_mode == EZB_ADDR_MODE_SHORT) return src.u.short_addr == 0x0000;
+    const uint64_t coord = zigbee_mgr_coordinator_ieee();
+    return src.addr_mode == EZB_ADDR_MODE_EXT && coord != 0 && src.u.extended_addr.u64 == coord;
 }
 // tx-delivery end
 

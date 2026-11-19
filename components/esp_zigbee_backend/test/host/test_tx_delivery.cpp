@@ -5,6 +5,8 @@
 // (see CMakeLists.txt), against stubs of the stack, the pool and the adapter: what the hub does with a frame the
 // stack could not deliver (research 2026-11-18 B1). A device that keeps its receiver on is looked up again (ZDO
 // NWK_addr_req) and the frame resent once, to its new address when it moved; nobody answering marks it offline.
+// A collection's On / Off / Toggle goes out as one groupcast within the same broadcast budget, and the copy of
+// it the stack hands back to the hub's own endpoint is recognised as the hub's (B5).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -81,15 +83,30 @@ struct ezb_zdo_nwk_addr_req_t {
 };
 
 // The radio: what was sent, and what the stack says to each request.
-struct Sent { std::uint16_t nwk; std::uint8_t ep; std::uint16_t cluster; std::vector<std::uint8_t> bytes; };
+struct Sent {
+    std::uint16_t              nwk;   // or the group, for a groupcast
+    std::uint8_t               ep;
+    std::uint16_t              cluster;
+    std::vector<std::uint8_t> bytes;
+    ezb_addr_mode_t            mode;
+    std::uint16_t              bcast;   // a groupcast's broadcast address
+    std::uint8_t               src_ep, tx_options;
+    std::uint16_t              profile;
+};
 static std::vector<Sent> g_sent;
 static ezb_err_t g_aps_err = 0;
 static ezb_err_t ezb_apsde_data_request(const ezb_apsde_data_req_t* r) {
     if (g_aps_err) return g_aps_err;
     g_sent.push_back({r->dst_address.u.short_addr, r->dst_endpoint, r->cluster_id,
-                      std::vector<std::uint8_t>(r->asdu, r->asdu + r->asdu_length)});
+                      std::vector<std::uint8_t>(r->asdu, r->asdu + r->asdu_length), r->dst_address.addr_mode,
+                      r->dst_address.u.group_addr.bcast, r->src_endpoint, r->tx_options, r->profile_id});
     return 0;
 }
+static std::uint8_t g_tsn = 0x40;
+static std::uint8_t zcl_seq_next() { return ++g_tsn; }
+constexpr std::uint64_t kCoord = 0x00124B0000000C00ull;
+static std::uint64_t g_coord = kCoord;   // 0: the hub's IEEE not known yet
+static std::uint64_t zigbee_mgr_coordinator_ieee() { return g_coord; }
 static std::vector<ezb_zdo_nwk_addr_req_t> g_lookups;   // every NWK_addr_req asked for, refused ones too
 static ezb_err_t g_zdo_err = 0;
 static ezb_err_t ezb_zdo_nwk_addr_req(const ezb_zdo_nwk_addr_req_t* r) {
@@ -293,6 +310,62 @@ int main() {
     f = send_on(0x1234);
     confirm(0x1234, f, kNoAck, EZB_ADDR_MODE_GROUP);
     expect("a groupcast's confirm is not looked at", g_lookups.size() == looks);
+
+    // Collections (B5): one groupcast instead of a frame per member.
+    later();
+    std::size_t before = g_sent.size();
+    expect("a collection's On: sent", esp_zb_groupcast_onoff(101, 1));
+    const Sent gc = g_sent.empty() ? Sent{} : g_sent.back();
+    expect("  one frame, to group 101, for the devices that keep their receiver on (0xFFFD)",
+           g_sent.size() == before + 1 && gc.mode == EZB_ADDR_MODE_GROUP && gc.nwk == 101 && gc.bcast == 0xFFFD);
+    expect("  genOnOff from endpoint 1, Home Automation, no APS ACK (a groupcast has none)",
+           gc.cluster == 0x0006 && gc.src_ep == 1 && gc.profile == 0x0104 && gc.tx_options == 0);
+    expect("  the ZCL On: a cluster command, no default response", gc.bytes == Bytes({0x11, g_tsn, 0x01}));
+    esp_zb_groupcast_onoff(101, 0);
+    esp_zb_groupcast_onoff(101, 2);
+    expect("Off and Toggle are commands 0 and 2, each with a TSN of its own",
+           g_sent.size() == before + 3 && g_sent[before + 1].bytes[2] == 0x00 && g_sent[before + 2].bytes[2] == 0x02 &&
+               g_sent[before + 1].bytes[1] != g_sent[before + 2].bytes[1] && g_sent[before + 1].bytes[1] != gc.bytes[1]);
+    esp_zb_groupcast_onoff(101, 1);   // the fourth broadcast in 9 s
+    before = g_sent.size();
+    expect("a fifth broadcast within 9 s: refused, nothing sent", !esp_zb_groupcast_onoff(101, 1) && g_sent.size() == before);
+    looks = g_lookups.size();
+    f = send_on(0x1234);
+    confirm(0x1234, f, kNoAck);
+    expect("  the same budget as the address lookups: a failed frame is not looked up meanwhile", g_lookups.size() == looks);
+    later();
+    before = g_sent.size();
+    expect("command 3, or group 0: refused before the radio",
+           !esp_zb_groupcast_onoff(101, 3) && !esp_zb_groupcast_onoff(0, 1) && g_sent.size() == before);
+    bool four = true;
+    for (int i = 0; i < 4; i++) four = esp_zb_groupcast_onoff(102, 1) && four;
+    expect("  and they spent no broadcast: four more go out", four && g_sent.size() == before + 4);
+    later();
+    g_aps_err = 5;
+    expect("the stack refused it: false (the caller sends one command per member)", !esp_zb_groupcast_onoff(101, 1));
+    g_aps_err = 0;
+    zb_lock::g_ok = false;
+    before = g_sent.size();
+    expect("the stack's lock not taken: false, nothing sent", !esp_zb_groupcast_onoff(101, 1) && g_sent.size() == before);
+    zb_lock::g_ok = true;
+
+    // The stack hands a groupcast to the hub's own endpoint too when it is in the group, which it is for every
+    // group a device joined: from 0x0000, or from the hub's IEEE.
+    ezb_address_t src{};
+    src.addr_mode = EZB_ADDR_MODE_SHORT;
+    src.u.short_addr = 0x0000;
+    expect("a frame from 0x0000 is the hub's own", from_self(src));
+    src.u.short_addr = 0x1234;
+    expect("  a device's is not", !from_self(src));
+    src.addr_mode = EZB_ADDR_MODE_EXT;
+    src.u.extended_addr.u64 = kCoord;
+    expect("from the hub's IEEE: its own", from_self(src));
+    src.u.extended_addr.u64 = kPlug;
+    expect("  a device's IEEE: not", !from_self(src));
+    g_coord = 0;
+    src.u.extended_addr.u64 = 0;
+    expect("  the hub's IEEE not known yet: no IEEE source is taken for it", !from_self(src));
+    g_coord = kCoord;
 
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "passed", g_fail);
     return g_fail;
