@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Host check of the full backup (research 2026-11-18 C1): the file and stage headers (main/backup_format.h).
+// Host check of the full backup (research 2026-11-18 C1): the file and stage headers (main/backup_format.h), the
+// crypto (main/backup_crypto.cpp, on TF-PSA-Crypto built from the IDF tree; vectors from Python `cryptography`).
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS   // mbedtls_psa_stats_t, to count live keys
+#include "backup_crypto.h"
 #include "backup_format.h"
 
 static int s_fail = 0;
@@ -196,12 +200,111 @@ static void test_parts_match() {
     CHECK(parts_match(x, hub, 4, &why), "fewer partitions: the others stay as they are");
 }
 
+static std::vector<uint8_t> hex(const char* h) {
+    std::vector<uint8_t> v;
+    for (; h[0] && h[1]; h += 2) { unsigned x; sscanf(h, "%2x", &x); v.push_back((uint8_t)x); }
+    return v;
+}
+
+static void test_kdf() {
+    printf("key derivation\n");
+    uint8_t salt[16], key[32], chk[16];
+    for (int i = 0; i < 16; i++) salt[i] = (uint8_t)(0x10 + i);
+    const char* pw = "correct horse battery";
+    CHECK(derive_key(pw, strlen(pw), salt, 10000, key) &&
+          memcmp(key, hex("f0541e7cbfd06b18ed260e0c55b6a0502b52c1dd726b70ba240e96523d621ce0").data(), 32) == 0,
+          "PBKDF2-HMAC-SHA256 10 000 matches Python");
+    CHECK(key_check(key, chk) && memcmp(chk, hex("42d8431eea7a6d17cf6c9282295bd546").data(), 16) == 0,
+          "key check = SHA-256(label | key)[0..16) matches Python");
+    const char* pw2 = "\xd0\xbf\xd0\xb0\xd1\x80\xd0\xbe\xd0\xbb\xd1\x8c-\xc5\xbb\xc3\x93\xc5\x81W-\xe5\xaf\x86\xe7\xa0\x81-1234567890";
+    CHECK(strlen(pw2) == 38 && derive_key(pw2, strlen(pw2), salt, 10000, key) &&
+          memcmp(key, hex("b11d7c36fdd16f1bc4c2c22ae48ddd507a6e66261c2eaa974aa609f9d71cf343").data(), 32) == 0,
+          "a UTF-8 password: its bytes, as Python");
+}
+
+static void test_gcm() {
+    printf("AES-256-GCM, streamed\n");
+    const std::vector<uint8_t> key = hex("f0541e7cbfd06b18ed260e0c55b6a0502b52c1dd726b70ba240e96523d621ce0");
+    uint8_t nonce[12], aad[228], tag[16];
+    for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(0x40 + i);
+    for (int i = 0; i < 228; i++) aad[i] = (uint8_t)(i * 3);
+    std::vector<uint8_t> pt(10000), ct(10000 + 64), back(10000 + 64);
+    for (size_t i = 0; i < pt.size(); i++) pt[i] = (uint8_t)(i * 7);
+
+    // Odd piece sizes: GCM may hold back a partial block, the totals must still add up.
+    const size_t pieces[] = {1, 15, 4096, 1000, 17, 2871, 2000};
+    Gcm e;
+    size_t in = 0, out = 0, n = 0;
+    bool ok = e.begin(key.data(), nonce, aad, sizeof aad, true);
+    for (size_t p : pieces) {
+        ok = ok && e.update(pt.data() + in, p, ct.data() + out, ct.size() - out, &n);
+        in += p; out += n;
+    }
+    ok = ok && in == pt.size() && e.finish_encrypt(ct.data() + out, ct.size() - out, &n, tag);
+    out += n;
+    CHECK(ok && out == 10000, "10 000 bytes in odd pieces: 10 000 out");
+    CHECK(memcmp(ct.data(), hex("84e85197d3dbbfdc82d2cdd0d66b3a41").data(), 16) == 0 &&
+          memcmp(ct.data() + 9984, hex("28d1937fa323e31b4c3709fc24e069c1").data(), 16) == 0 &&
+          memcmp(tag, hex("c8543f4e4c332efa128bdf886093ddb7").data(), 16) == 0,
+          "ciphertext and tag match Python's AESGCM");
+
+    const auto decrypt = [&](const uint8_t* c, const uint8_t* a, const uint8_t* t, size_t piece) {
+        Gcm d;
+        size_t o = 0, m = 0;
+        bool r = d.begin(key.data(), nonce, a, sizeof aad, false);
+        for (size_t i = 0; r && i < 10000; i += piece) {
+            const size_t len = i + piece > 10000 ? 10000 - i : piece;
+            r = d.update(c + i, len, back.data() + o, back.size() - o, &m);
+            o += m;
+        }
+        r = r && d.finish_decrypt(back.data() + o, back.size() - o, &m, t);
+        return r && o + m == 10000 && memcmp(back.data(), pt.data(), 10000) == 0;
+    };
+    CHECK(decrypt(ct.data(), aad, tag, 333), "decrypted in other pieces: the plaintext, tag accepted");
+    ct[5000] ^= 1;
+    CHECK(!decrypt(ct.data(), aad, tag, 4096), "one ciphertext bit flipped: refused");
+    ct[5000] ^= 1;
+    aad[100] ^= 1;
+    CHECK(!decrypt(ct.data(), aad, tag, 4096), "one header bit flipped: refused");
+    aad[100] ^= 1;
+    tag[15] ^= 1;
+    CHECK(!decrypt(ct.data(), aad, tag, 4096), "a wrong tag: refused");
+    tag[15] ^= 1;
+    CHECK(decrypt(ct.data(), aad, tag, 4096), "restored: accepted again");
+
+    // Every Gcm gives its key back (a leak would grow with each backup on the hub).
+    mbedtls_psa_stats_t before, after;
+    mbedtls_psa_get_stats(&before);
+    bool all = true;
+    for (int i = 0; i < 100; i++) { Gcm g; all = all && g.begin(key.data(), nonce, aad, sizeof aad, true); }
+    { Gcm g; all = all && g.begin(key.data(), nonce, aad, sizeof aad, false); }   // dropped mid-stream
+    mbedtls_psa_get_stats(&after);
+    CHECK(all && after.MBEDTLS_PRIVATE(volatile_slots) == before.MBEDTLS_PRIVATE(volatile_slots),
+          "101 in a row, one dropped unfinished: no key left behind");
+    Gcm twice;
+    CHECK(twice.begin(key.data(), nonce, aad, sizeof aad, true) && twice.begin(key.data(), nonce, aad, sizeof aad, false),
+          "begin again on the same object: starts over");
+}
+
+static void test_sha() {
+    printf("SHA-256, streamed\n");
+    Sha256 h;
+    uint8_t d[32];
+    CHECK(h.begin() && h.update((const uint8_t*)"a", 1) && h.update((const uint8_t*)"bc", 2) && h.finish(d) &&
+          memcmp(d, hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").data(), 32) == 0,
+          "\"abc\" in two pieces");
+}
+
 int main() {
+    if (!crypto_init()) { printf("crypto_init failed\n"); return 99; }
     test_header();
     test_stage();
     test_fc_target();
     test_versions();
     test_parts_match();
+    test_kdf();
+    test_gcm();
+    test_sha();
     printf("%s (%d failed)\n", s_fail ? "FAILED" : "all ok", s_fail);
     return s_fail;
 }
