@@ -90,7 +90,7 @@ bool with_device(uint64_t ieee, HaDeviceCb cb, void* ctx) {
 
     const HaDeviceSnapshot snap{ieee, dev.friendly_name, vendor[0] ? vendor : dev.manufacturer_name,
                                 model[0] ? model : dev.model_id, exposes, attrs,
-                                ha_battery_powered(dev.power_source)};
+                                ha_battery_powered(dev.power_source), zhac_adapter_device_offline(ieee)};
     cb(snap, ctx);
     heap_caps_free(exposes);
     heap_caps_free(attrs);
@@ -195,6 +195,14 @@ void on_device_leave(const Event& e) {
     if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) > 0) mqtt_gw_publish(topic, "", 0, 0, true);
 }
 
+// The availability ping's verdict, to Home Assistant (research 2026-11-18 B7): DEVICE_OFFLINE when a mains device let
+// its ping go unanswered, DEVICE_SEEN when it is heard again.
+void on_availability(const Event& e) {
+    uint64_t ieee = 0;
+    memcpy(&ieee, e.data, sizeof(ieee));
+    ha_bridge_device_online(ieee, e.type == EventType::DEVICE_SEEN);
+}
+
 // What the hub itself publishes under the root, back from the broker: device
 // state, logs, metrics, availability. Never news to the rule engine or Lua --
 // and a script that logs on every message would feed itself (research
@@ -258,6 +266,8 @@ void mqtt_glue_start() {
         ha_bridge_device_changed(ieee);
     });
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave);
+    event_bus_subscribe(EventType::DEVICE_OFFLINE, on_availability, nullptr, 4);   // at most 4 per ping tick
+    event_bus_subscribe(EventType::DEVICE_SEEN, on_availability, nullptr, 4);      // one per answered ping
 
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, on_got_ip, nullptr);
 #ifdef CONFIG_ZHAC_WIFI_HOSTED

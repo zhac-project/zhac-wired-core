@@ -39,6 +39,10 @@ bool mqtt_gw_publish(const char* topic, const char* payload, size_t n, int, bool
 static int g_removed = 0;
 void ha_bridge_publish_state(uint64_t, const char*, const char*) {}
 void ha_bridge_device_removed(uint64_t) { g_removed++; }
+static int      g_online_calls = 0;
+static uint64_t g_online_ieee  = 0;
+static bool     g_online       = false;
+void ha_bridge_device_online(uint64_t ieee, bool online) { g_online_calls++; g_online_ieee = ieee; g_online = online; }
 
 #include "slice.inc"
 
@@ -139,6 +143,17 @@ int main() {
     expect("removed: Home Assistant told", g_removed == 1);
     expect("removed: retained state cleared", g_pubs.size() == 1 && g_pubs[0].retain && g_pubs[0].payload.empty() &&
                                                   g_pubs[0].topic == "zhac/devices/00158D0007A1B2C3/state");
+
+    // The availability ping's verdict reaches Home Assistant (research 2026-11-18 B7).
+    Event gone{};
+    gone.type = EventType::DEVICE_OFFLINE;
+    std::memcpy(gone.data, &kIeee, sizeof(kIeee));
+    on_availability(gone);
+    expect("ping unanswered: Home Assistant told offline", g_online_calls == 1 && g_online_ieee == kIeee && !g_online);
+    Event back = gone;
+    back.type = EventType::DEVICE_SEEN;
+    on_availability(back);
+    expect("answered again: online", g_online_calls == 2 && g_online_ieee == kIeee && g_online);
 
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "passed", g_fail);
     return g_fail;

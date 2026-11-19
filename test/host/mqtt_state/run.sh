@@ -14,7 +14,7 @@ C=$(cd "$R/../zhac-components/components" && pwd)
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-mqtt-state.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 export PATH=/usr/bin:$PATH   # the ESP32-ULP `as` on PATH poisons g++
-for f in 'bool value_json' 'void add_attrs' 'size_t state_json' 'void publish_state' 'void on_attr' 'void on_device_leave'; do
+for f in 'bool value_json' 'void add_attrs' 'size_t state_json' 'void publish_state' 'void on_attr' 'void on_device_leave' 'void on_availability'; do
     sed -n "/^$f(/,/^}/p" "$R/main/mqtt_glue.cpp" >> "$W/slice.inc"
 done
 grep -q '^void on_attr(' "$W/slice.inc"   # the slice found the entry point
