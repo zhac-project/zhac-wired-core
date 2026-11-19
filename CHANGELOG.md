@@ -13,10 +13,15 @@ contents become the release-tag annotation at `just release`.
 
 ### Added
 
+- **Devices that stop answering the availability ping show offline** (research 2026-11-18 B7): unavailable in Home Assistant, an Offline badge on the hub page (`attr.bulk` entries carry `offline`, and `device.list` / `device.get` list it), and an `Offline#<device>` rule trigger.
+- **Full retained device state on `<root>/devices/<IEEE>/state`** (research A12b): `{"ieee", "attrs":{every attribute}}`, retained, once per report as zigbee2mqtt publishes it; momentary values (`action`) and secrets stay non-retained; cleared when the device is removed.
+- **Home Assistant device triggers for button presses** (research A11).
 - **Hub pins (GPIO control).** Settings › I/O (`GET`/`PUT /api/io`) configures up to 16 free pins as `out`, `pwm`, `in`, `adc` or `strip` (WS2812). Only configured pins can be used, by rules (`gpio.set`, `gpio.toggle`, `pwm.set`), Lua (`zhac.gpio_write`, `gpio_toggle`, `gpio_read`, `pwm_write`, `adc_read`, `ws_write`), the hub page, the cloud and Home Assistant. They show as one **Hub I/O** device whose attributes are the pin names: outputs and PWM are writable, inputs (debounced) and ADC readings (every `interval` s, when moved by `delta`) are published and work as rule triggers. Outputs can start `off`, `on` or at their `last` level after a restart. The pins offered come from `CONFIG_ZHAC_IO_PINS` (per board, narrower on Wi-Fi co-processor builds) minus every pin the build uses itself. Zigbee-only commands (bind, configure, re-interview, groups) refuse the Hub I/O device; the bind-repair pass and a Zigbee reset leave it alone. Docs: zhac-docs `GPIO.md`.
 
 ### Changed
 
+- **Rules and Lua no longer see the hub's own MQTT messages** (research 2026-11-18 A12d): what it publishes under the root (`devices/`, `log/`, `bridge/`, `availability`) is dropped on arrival; `/set` commands and every other topic still pass.
+- **Lua's `on_mqtt` gets the whole payload, up to 1 KB** (research A12c); it was cut at 31 bytes.
 - **More free internal RAM** (P4 and S31, research 2026-11-18 A7/A8):
   - all Lua allocations in PSRAM on the P4 (`LUA_ENGINE_INTERNAL_SMALL_THRESHOLD` 0, as on the S31);
   - `malloc` above 4 KB goes to PSRAM (`SPIRAM_MALLOC_ALWAYSINTERNAL` 16384 → 4096, review XC-02);
@@ -32,6 +37,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **`/set` commands work with Home Assistant discovery off** (research 2026-11-18 A12a).
 - **`main-largest` in the heap log reports the main internal heap only** (P2 review 2026-11-19). It also counted the 32 KB DMA reserve PSRAM keeps aside, and showed that pool's size once the main heap fragmented.
 - **Early crashes put the hub in safe mode before any rollback** (`ota_update`, `boot_guard_rule.h`, research 2026-11-18 A1). Three crashes soon after boot rolled the firmware back before the radio guard or the Lua hold could act, so a stuck C6 or a crashing script downgraded the hub. Now 3–4 early crashes in a row mean safe mode; 5 roll back only an image that has run under 24 h and whose other slot boots.
 - **Crash reports are no longer lost** (`log_cloud`, `api_status`, research A2). The core dump was read only after some panics and marked reported before any upload. It is now read at every boot: `/api/status` (`reset_reason`, `last_crash`) and the Info page show it on the boot right after a crash, and the cloud gets it with the next log tail while cloud logs are on. Nothing is uploaded while they are off.
