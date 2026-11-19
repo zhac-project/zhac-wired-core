@@ -186,6 +186,7 @@ void api_status_fill(JsonObject doc) {
     const bool remote = fill_remote_state(doc);
     doc["remote_available"] = remote;
     doc["full_backup"] = true;   // Settings › Backup offers POST /api/backup/full|restore (research 2026-11-18 C1)
+    doc["device_ota"] = true;    // a device page offers POST /api/device/ota (research 2026-11-18 C2)
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     // The hub page shows its "Allow script changes from the cloud" switch only when this is present.
     doc["remote_scripts"] = sys_remote_scripts();

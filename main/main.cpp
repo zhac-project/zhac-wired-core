@@ -52,6 +52,7 @@
 #include "user_io.h"
 #include "api_scripts.h"
 #include "api_status.h"
+#include "device_ota.h"
 #include "api_system.h"
 #include "device_backend.h"
 #include "device_options.h"
@@ -392,6 +393,7 @@ extern "C" void app_main() {
         api_groups_register(hd);
         api_remote_register(hd);
         backup_register(hd);
+        device_ota_register(hd);   // device firmware updates (research 2026-11-18 C2)
         // The SPA catchall MUST register last: its `/*` pattern would
         // otherwise shadow the specific /api/* routes, because
         // esp_http_server only falls back to a wildcard when no earlier
@@ -475,6 +477,7 @@ extern "C" void app_main() {
         vTaskDelay(pdMS_TO_TICKS(10000));
         if (tick % 30 == 29) eth_ntp_reconcile();   // every 5 min
         log_cloud_tick();   // marks a crash the cloud got as reported
+        device_ota_tick();  // ends an update whose device left; frees an ended update's image
         NetStatus net{};
         eth_get_status(&net);
         ESP_LOGI(TAG,
