@@ -119,13 +119,32 @@ bool group_delete_req(const char* body, size_t len) {
 // when a native ZCL group holds exactly its members (the device pages' group
 // mirror) and none of them sleeps -- a groupcast is a broadcast, which a
 // sleeping device misses -- one groupcast switches them together instead of
-// one after the other. false: not sent (no such group, a member asleep, the
-// broadcast budget spent, the stack refused).
+// one after the other. Every member must have the Groups and genOnOff servers
+// on its endpoint (review 2026-11-19 P4 #1): a Tuya data-point switch (on/off
+// is a DP write) or a device without Groups would ignore the groupcast, so the
+// collection keeps one command per member. false: not sent (no such group, a
+// member that cannot take it or is asleep, the broadcast budget spent, the
+// stack refused).
 static bool groupcast_collection(const GrpRecord& r, uint8_t cmd) {
     if (r.member_count < 2) return false;
+    struct Member { uint8_t ep; bool takes; } m{};
+    const auto takes = [](ZapDevice* d, void* ctx) {   // under the pool lock: no I/O
+        auto* m = static_cast<Member*>(ctx);
+        for (uint8_t e = 0; e < d->endpoint_count && e < 8; e++) {
+            if (d->endpoints[e] != m->ep) continue;
+            bool groups = false, onoff = false;
+            for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP; c++) {   // packed: no range-for
+                groups = groups || d->clusters[e][c] == 0x0004;
+                onoff  = onoff || d->clusters[e][c] == 0x0006;
+            }
+            m->takes = groups && onoff;
+        }
+    };
     uint64_t ieee[GRP_MAX_MEMBERS];
     uint8_t  ep[GRP_MAX_MEMBERS];
     for (uint8_t i = 0; i < r.member_count; i++) {
+        m = {r.members[i].ep, false};
+        if (!zigbee_pool_with_device(r.members[i].ieee, takes, &m) || !m.takes) return false;
         if (esp_zb_is_sleepy(r.members[i].ieee)) return false;
         ieee[i] = r.members[i].ieee;
         ep[i]   = r.members[i].ep;

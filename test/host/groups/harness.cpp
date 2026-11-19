@@ -10,8 +10,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <initializer_list>
 #include "groups_store.h"
 #include "device_cmd.h"
+#include "zap_common.h"
 
 size_t group_list_json(char* out, size_t cap);
 size_t group_cmd(const char* body, size_t len, char* out, size_t cap);
@@ -55,6 +57,24 @@ uint16_t dgm_group_of(const uint64_t* ieee, const uint8_t* ep, uint8_t n) {
     return g_native;
 }
 bool esp_zb_is_sleepy(uint64_t ieee) { return ieee == g_sleepy; }
+// The pool: each member's server clusters per endpoint (review 2026-11-19 P4 #1).
+static ZapDevice g_devs[4];
+static uint8_t   g_dev_count = 0;
+static void pool_device(uint64_t ieee, uint8_t ep, std::initializer_list<uint16_t> clusters) {
+    ZapDevice& d = g_devs[g_dev_count++];
+    d = ZapDevice{};
+    d.ieee_addr = ieee;
+    d.endpoint_count = 1;
+    d.endpoints[0] = ep;
+    uint8_t n = 0;
+    for (uint16_t c : clusters) d.clusters[0][n++] = c;
+}
+bool zigbee_pool_with_device(uint64_t ieee, void (*fn)(ZapDevice*, void*), void* ctx) {
+    for (uint8_t i = 0; i < g_dev_count; i++) {
+        if (g_devs[i].ieee_addr == ieee) { fn(&g_devs[i], ctx); return true; }
+    }
+    return false;
+}
 bool esp_zb_groupcast_onoff(uint16_t gid, uint8_t c) {
     g_gc += std::to_string(gid) + "/" + std::to_string(c) + ";";
     return g_gc_ok;
@@ -134,6 +154,8 @@ int main() {
     }
 
     // A native ZCL group holding exactly the members (B5): one groupcast instead of a command per member.
+    pool_device(0xA4C1380000000000ull, 255, {0x0000, 0x0004, 0x0006});
+    pool_device(0xA4C1380000000001ull, 255, {0x0000, 0x0004, 0x0006, 0x0008});
     g_native = 101;
     std::string res = cmd("{\"id\":7,\"ep\":1,\"cluster\":6,\"cmd\":1}");
     expect("On to a collection that is a native group: one groupcast, no command per member",
@@ -161,6 +183,28 @@ int main() {
     expect("the groupcast not sent (budget, radio): a command per member after all",
            g_gc == "101/1;" && g_sent == "state=ON;state=ON;" && res == "{\"ok\":true,\"sent\":2,\"failed\":0}");
     g_gc_ok = true;
+    // Review P4 #1: only members that switch through genOnOff and can hold a group (both servers on the member's
+    // endpoint) take the groupcast; otherwise every member gets its own command, as before B5.
+    g_devs[1].clusters[0][2] = 0xEF00;   // the second member: a Tuya data-point switch (Basic, Groups, 0xEF00)
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":0}");
+    expect("a member without genOnOff (a Tuya data-point switch): a command per member",
+           g_gc.empty() && g_sent == "state=OFF;state=OFF;");
+    g_devs[1].clusters[0][2] = 0x0006;
+    g_devs[1].clusters[0][1] = 0x0005;   // Scenes instead of Groups
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":0}");
+    expect("a member without a Groups server: a command per member", g_gc.empty() && g_sent == "state=OFF;state=OFF;");
+    g_devs[1].clusters[0][1] = 0x0004;
+    g_devs[1].endpoints[0] = 1;          // Groups and genOnOff on endpoint 1; the collection names 255
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":0}");
+    expect("Groups and genOnOff on another endpoint than the member's: a command per member",
+           g_gc.empty() && g_sent == "state=OFF;state=OFF;");
+    g_devs[1].endpoints[0] = 255;
+    g_devs[1].ieee_addr = 0xA4C13800000000FFull;   // the pool does not know the second member
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":0}");
+    expect("a member the pool does not know: a command per member", g_gc.empty() && g_sent == "state=OFF;state=OFF;");
+    g_devs[1].ieee_addr = 0xA4C1380000000001ull;
+    cmd("{\"id\":7,\"cluster\":6,\"cmd\":0}");
+    expect("  both able again: one groupcast", g_gc == "101/0;" && g_sent.empty());
     g_native = 0;
     cmd("{\"id\":7,\"cluster\":6,\"cmd\":1}");
     expect("no native group holds exactly the members: a command per member",

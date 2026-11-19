@@ -14,16 +14,19 @@ R=$(cd "$H/../../../main" && pwd)
 AJ=$(cd "$H/../../../../zhac-components/components/arduinojson/src" && pwd)
 DC=$(cd "$H/../../../../zhac-components/components/device_cmd" && pwd)
 WS=$(cd "$H/../../../../zhac-net-core/components/ws_server/include" && pwd)   # utf8_seq.h, for json_buf.h
+ZC=$(cd "$H/../../../../zhac-components/components/zap_common/include" && pwd)   # ZapDevice, for the pool fake
 W=$(mktemp -d "${TMPDIR:-/tmp}/wired-host-groups.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
 cp "$R/groups_store.h" "$R/dgm_store.h" "$R/json_buf.h" "$H/harness.cpp" "$DC/include/device_cmd.h" "$DC/include/device_cmd_json.h" \
-   "$DC/device_cmd_json.cpp" "$W/"
+   "$DC/device_cmd_json.cpp" "$ZC/zap_common.h" "$W/"
 echo '#pragma once' > "$W/nvs.h"
 { echo '#include "groups_store.h"'; echo '#include "json_buf.h"'; echo '#include "device_cmd_json.h"'
   echo '#include "dgm_store.h"'
   echo '#include <cstdio>'; echo '#include <cstring>'; echo '#include <memory>'; echo '#include <new>'; echo 'bool grp_find(uint16_t id, GrpRecord& out);'
   echo 'bool esp_zb_groupcast_onoff(uint16_t group_id, uint8_t cmd); bool esp_zb_is_sleepy(uint64_t ieee);'
+  echo '#include "zap_common.h"'
+  echo 'bool zigbee_pool_with_device(uint64_t ieee, void (*fn)(ZapDevice* dev, void* ctx), void* ctx);'
   sed -n '/^size_t grp_to_json/,/^}/p' "$R/groups_store.cpp"
   sed -n '/^size_t group_list_json/,/^}/p' "$R/api_groups.cpp"
   sed -n '/^static bool groupcast_collection/,/^}/p' "$R/api_groups.cpp"
