@@ -5,8 +5,8 @@
     "esp32s31": "v6.1"
   },
   "siblings": {
-    "zhac-components": "e2f453c35be99b3f0781c2000fb359d1b306fdc1",
-    "embedded-zhc": "43028cb3bc43d59f5002e6ac196e150e0e8bbb42",
+    "zhac-components": "08eaa7fa19f8e4da59fe7c6c4870c21092c18c80",
+    "embedded-zhc": "afd00bdc8bb079bc886766d184e7c04182583e36",
     "www-spa": "43df47a01495d812a34a5ddfa0011d7162860bb9",
     "zhac-docs": "c443142b9193b74b9a6d28ab3fae92f19f070647"
   }

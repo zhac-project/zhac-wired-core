@@ -53,6 +53,12 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **A light setting the light never reports keeps the value set** (zhac-components 08eaa7f, embedded-zhc
+  afd00bd; pinned in `release-manifest.json`). `color_power_on_behavior` and `do_not_disturb` on Tuya lights
+  (TS0505B, TS0503B / TS0505B `_hs`, TS0052, YSR-MINI-01 RGB+CCT) were write-only: the hub page offered them on
+  the Commands tab, whose list always starts on the first value (`initial`), and the hub kept nothing it sent.
+  They carry state now, as in zigbee2mqtt, and a text value sent to a key with state is kept until the device
+  reports one.
 - **`/set` commands work with Home Assistant discovery off** (research 2026-11-18 A12a).
 - **`main-largest` in the heap log reports the main internal heap only** (P2 review 2026-11-19). It also counted the 32 KB DMA reserve PSRAM keeps aside, and showed that pool's size once the main heap fragmented.
 - **Early crashes put the hub in safe mode before any rollback** (`ota_update`, `boot_guard_rule.h`, research 2026-11-18 A1). Three crashes soon after boot rolled the firmware back before the radio guard or the Lua hold could act, so a stuck C6 or a crashing script downgraded the hub. Now 3–4 early crashes in a row mean safe mode; 5 roll back only an image that has run under 24 h and whose other slot boots.
