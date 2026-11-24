@@ -1237,8 +1237,16 @@ void ws_push(const char* event, JsonDocument& data) {
     const size_t cap = sizeof(buf);
     const size_t n = serializeJson(data, buf, cap);
     if (n == 0 || n >= cap) {
-        ESP_LOGW(TAG, "ws_push('%s') dropped: payload %u B exceeds %u B buffer",
-                 event, (unsigned)measureJson(data), (unsigned)cap);
+        // More than the stack buffer takes (alarm.changed with eight profiles runs to kilobytes):
+        // sized to fit, from PSRAM.
+        const size_t need = measureJson(data) + 1;
+        char* big = need > cap ? static_cast<char*>(heap_caps_malloc(need, MALLOC_CAP_SPIRAM)) : nullptr;
+        if (!big) {
+            ESP_LOGW(TAG, "ws_push('%s') dropped: payload %u B, no buffer for it", event, (unsigned)(need - 1));
+            return;
+        }
+        push_event(event, big, serializeJson(data, big, need));
+        heap_caps_free(big);
         return;
     }
     push_event(event, buf, n);
@@ -1747,7 +1755,7 @@ static void cmd_alerts_get(int fd, uint32_t id) {
     ws_server_reply(fd, buf, (size_t)n);
 }
 
-// ── alarm.* (security mode, spec 2026-11-24) ──────────────────────────
+// ── alarm.* (Safety profiles, spec 2026-11-24) ────────────────────────
 // The hub page's panel. Not on the cloud link: remote_allow lists none of them.
 static void cmd_alarm_get(int fd, uint32_t id) {
     JsonDocument d;
@@ -1757,18 +1765,29 @@ static void cmd_alarm_get(int fd, uint32_t id) {
     reply_data(fd, id, d);
 }
 
-// {mode, force?} -> {armed:true}, or {armed:false, open:[{ieee, name}]} when doors or
-// windows of the mode are open (the page offers to force it).
+// A command's profile: args.id. False (answered) when it is there and is not text, so that a
+// malformed id never reads as "no id", which for alarm.disarm means every profile.
+static bool alarm_profile_arg(int fd, uint32_t id, JsonDocument& doc, const char** out) {
+    JsonVariantConst v = doc["args"]["id"];
+    if (!v.isNull() && !v.is<const char*>()) { send_err(fd, id, "no such profile"); return false; }
+    *out = v | "";
+    return true;
+}
+
+// {id, force?} (stage 1's "mode" is still read as the id) -> {armed:true}, or {armed:false,
+// open:[{ieee, name}]} when doors or windows of the profile are open (the page offers to force it).
 static void cmd_alarm_arm(int fd, uint32_t id, JsonDocument& doc) {
-    AlarmMode m;
-    if (!alarm_mode_parse(doc["args"]["mode"] | "", &m)) { send_err(fd, id, "mode must be away, home or night"); return; }
+    const char* profile;
+    if (!alarm_profile_arg(fd, id, doc, &profile)) return;
+    if (!profile[0]) profile = doc["args"]["mode"] | "";
     uint64_t open[kAlarmMaxSensors];
     uint8_t n = 0;
-    const AlarmArmResult r = alarm_arm(m, doc["args"]["force"] | false, open, &n);
-    if (r == AlarmArmResult::BUSY) { send_err(fd, id, "the alarm is on: disarm first"); return; }
+    const AlarmReply r = alarm_arm(profile, doc["args"]["force"] | false, open, &n);
+    if (r == AlarmReply::BUSY) { send_err(fd, id, "an alarm is on: disarm first"); return; }
+    if (r == AlarmReply::NO_PROFILE) { send_err(fd, id, "no such profile"); return; }
     JsonDocument d;
-    d["armed"] = r == AlarmArmResult::OK;
-    if (r == AlarmArmResult::OPEN) {
+    d["armed"] = r == AlarmReply::OK;
+    if (r == AlarmReply::OPEN) {
         JsonArray a = d["open"].to<JsonArray>();
         ZapDevice dev{};
         for (uint8_t i = 0; i < n; i++) {
@@ -1783,12 +1802,21 @@ static void cmd_alarm_arm(int fd, uint32_t id, JsonDocument& doc) {
     reply_data(fd, id, d);
 }
 
-static void cmd_alarm_disarm(int fd, uint32_t id) {
-    alarm_disarm();
-    reply_ok_or_err(fd, id, true, nullptr);
+// {id?}: one profile; without it every intrusion profile is disarmed and the others are silenced.
+static void cmd_alarm_disarm(int fd, uint32_t id, JsonDocument& doc) {
+    const char* profile;
+    if (!alarm_profile_arg(fd, id, doc, &profile)) return;
+    reply_ok_or_err(fd, id, alarm_disarm(profile) == AlarmReply::OK, "no such profile");
 }
 
-// {config}: the whole config; "codes" left out keeps the stored ones.
+// {id}: that profile's pending or triggered ends now.
+static void cmd_alarm_silence(int fd, uint32_t id, JsonDocument& doc) {
+    const char* profile;
+    if (!alarm_profile_arg(fd, id, doc, &profile)) return;
+    reply_ok_or_err(fd, id, alarm_silence(profile) == AlarmReply::OK, "no such profile");
+}
+
+// {config}: the whole config; "codes" left out keeps the stored ones. Refused while an alarm is running.
 static void cmd_alarm_config_set(int fd, uint32_t id, JsonDocument& doc) {
     JsonVariantConst cfg = doc["args"]["config"];
     if (!cfg.is<JsonObjectConst>()) { send_err(fd, id, "missing config"); return; }
@@ -1961,7 +1989,8 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "alerts.get")            == 0) { cmd_alerts_get(fd, id);                 return; }
     if (std::strcmp(cmd, "alarm.get")             == 0) { cmd_alarm_get(fd, id);                  return; }
     if (std::strcmp(cmd, "alarm.arm")             == 0) { cmd_alarm_arm(fd, id, doc);             return; }
-    if (std::strcmp(cmd, "alarm.disarm")          == 0) { cmd_alarm_disarm(fd, id);               return; }
+    if (std::strcmp(cmd, "alarm.disarm")          == 0) { cmd_alarm_disarm(fd, id, doc);          return; }
+    if (std::strcmp(cmd, "alarm.silence")         == 0) { cmd_alarm_silence(fd, id, doc);         return; }
     if (std::strcmp(cmd, "alarm.config.set")      == 0) { cmd_alarm_config_set(fd, id, doc);      return; }
     if (std::strcmp(cmd, "group.list")            == 0) { cmd_group_list(fd, id);                  return; }
     if (std::strcmp(cmd, "group.create")          == 0) { cmd_group_create(fd, id, doc);           return; }

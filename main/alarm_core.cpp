@@ -258,8 +258,10 @@ bool parse_profiles(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap)
         if (word_index(id, kReserved) >= 0) return fail(err, cap, "profiles[%u]: id %s is reserved", i, id);
         if (alarm_cfg_profile(*c, id) >= 0) return fail(err, cap, "profiles[%u]: id %s is taken", i, id);
         std::snprintf(p.id, sizeof(p.id), "%s", id);
-        if (!valid_name(o["name"])) return fail(err, cap, "profiles[%u]: name must be 1-24 bytes of text", i);
-        std::snprintf(p.name, sizeof(p.name), "%s", o["name"].as<const char*>());
+        // valid_name leaves no null; the target compiler does not see that across the two lookups and refuses the %s.
+        const char* name = o["name"].as<const char*>();
+        if (!valid_name(o["name"]) || !name) return fail(err, cap, "profiles[%u]: name must be 1-24 bytes of text", i);
+        std::snprintf(p.name, sizeof(p.name), "%s", name);
         const int cls = word_index(o["class"].is<const char*>() ? o["class"].as<const char*>() : nullptr, kClasses);
         if (cls < 0) return fail(err, cap, "profiles[%u]: class must be intrusion, fire, water, gas or other", i);
         p.cls = static_cast<AlarmClass>(cls);

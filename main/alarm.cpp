@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Alarm panel glue. Every change to the panel happens under s_mu in act(), which
-// hands the state change to the "alarm" task; that task does everything that can
-// wait on the radio or the network: sirens, notifications, the Alarm device, NVS.
+// Alarm panel ("Safety") glue. Every change to the panel happens under s_mu in act(), which then
+// wakes the "alarm" task. The task keeps no queue of changes: each pass it asks the panel what is
+// different from what it acted on last, so a burst may collapse steps but never loses a profile's
+// final state or an alarm. The task does everything that can wait on the flash, the radio or the
+// network: the state records, notifications, the Alarm device, rule events, outputs, the page.
 #include "alarm.h"
 
 #include <cinttypes>
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <ctime>
 #include <new>
+#include <utility>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -39,11 +42,14 @@ namespace {
 
 const char* const TAG = "alarm";
 constexpr char     kNs[] = "alarm";
-constexpr size_t   kCfgJsonMax = 8192;
 constexpr size_t   kExposesMax = 2048;
+constexpr size_t   kStatesMax = 256;        // "st2": eight profiles pack to 190 bytes
+constexpr size_t   kSummaryMax = 24;        // "armed_" + an id
+constexpr uint8_t  kEventsMax = 20;         // one pass gives 18 names at most
 constexpr uint32_t kBootAlertDelayS = 60;   // the network and the cloud link come up first
+const char* const  kClassNames[] = {"intrusion", "fire", "water", "gas", "other"};   // by AlarmClass, as the config names them
 
-SemaphoreHandle_t s_mu = nullptr;   // guards everything below up to s_since
+SemaphoreHandle_t s_mu = nullptr;   // guards everything below up to s_ids_changed
 struct Lock {
     Lock() { xSemaphoreTake(s_mu, portMAX_DELAY); }
     ~Lock() { xSemaphoreGive(s_mu); }
@@ -51,31 +57,43 @@ struct Lock {
     Lock& operator=(const Lock&) = delete;
 };
 
-AlarmConfig* s_cfg = nullptr;    // heap: ~2 KB
-AlarmCore*   s_core = nullptr;
-int8_t       s_contact[kAlarmMaxSensors];   // each sensor's last contact: -1 unknown, 0 open, 1 closed
+AlarmConfig* s_cfg = nullptr;     // heap: ~4.4 KB; a save swaps both
+AlarmPanel*  s_panel = nullptr;
 struct PadInput {
     char action[24];
     char code[16];   // a secret: cleared once used
     bool have;
 };
 PadInput     s_pad[kAlarmMaxKeypads];
-uint32_t     s_since = 0;        // wall clock of the last change; 0 while the clock is unset
+AlarmSeen    s_seen[kAlarmMaxProfiles];     // what the task acted on last
+uint32_t     s_since[kAlarmMaxProfiles];    // wall clock of each profile's last change; 0 while the clock is unset
+int8_t       s_follows[kAlarmMaxOutputs];   // by device of the drive plan: the output it was last told to follow, -1
+// What stopping an output takes. A save lists here the outputs that still followed an alarm under
+// the config it replaced; the task stops them before it drives anything by the new one.
+struct Orphan { uint64_t ieee; AlarmOutKind kind; bool value; };
+Orphan       s_orphans[kAlarmMaxOutputs];
+uint8_t      s_n_orphans = 0;
+uint8_t      s_boot_sounding = 0;     // bit i: profile i was triggered when the hub restarted
+bool         s_resync = false;        // a save swapped the config: the task takes a pass over it
+bool         s_ids_changed = false;   // ... and the Alarm device has another list of attributes
 
-QueueHandle_t s_q = nullptr;     // Change, to the task
-TaskHandle_t  s_task = nullptr;
-bool          s_boot_alert = false;   // restarted during pending or triggered
-bool          s_boot_sirens = false;  // restarted while the sirens sounded
-uint8_t       s_saved[2] = {0xFF, 0xFF};   // the state record last written
-
-struct Change {
-    AlarmState from, to, resting;
-    AlarmMode  mode;
-    uint64_t   cause;     // refused: the first open sensor
-    bool       timed;     // an ended delay or siren time, not a person
-    bool       refused;   // not a change: an arm an open door or window refused
-    uint8_t    n_open;
+// An arm refused for open doors or windows, not from the hub page (which lists them itself).
+struct Refusal {
+    char     id[kAlarmIdMax];
+    char     name[kAlarmNameMax];
+    uint64_t first;   // the first open sensor
+    uint8_t  n;       // how many are open
 };
+QueueHandle_t s_refused = nullptr;
+TaskHandle_t  s_task = nullptr;
+
+// The task's own; set at boot before it starts.
+bool     s_boot_alert = false;              // restarted during pending or triggered
+char     s_st2_saved[kStatesMax];           // the "st2" record flash holds
+size_t   s_st2_len = 0;
+uint8_t  s_st_saved[2] = {0xFF, 0xFF};      // the stage 1 "st" record flash holds
+char     s_summary[kSummaryMax] = "disarmed";   // the alarm_state acted on last
+uint64_t s_summary_cause = 0;               // ... and the device behind its alarm_sensor
 
 uint32_t mono_s() { return static_cast<uint32_t>(esp_timer_get_time() / 1000000); }
 
@@ -111,80 +129,111 @@ size_t nvs_get(const char* key, void* data, size_t cap) {
     return e == ESP_OK ? len : 0;
 }
 
-// -1 unknown, 0 open, 1 closed: the last contact report the shadow holds.
-int8_t contact_now(uint64_t ieee) {
-    ShadowAttr a{};
-    if (!device_shadow_get_attr(ieee, "contact", &a) || (a.val_type != VAL_BOOL && a.val_type != VAL_INT)) return -1;
-    return a.int_val ? 1 : 0;
+// ── A sensor's last values, from the device shadow ──
+
+bool key_active(AlarmKey k, int32_t v) { return k == AlarmKey::CONTACT ? v == 0 : v != 0; }   // a contact reports "closed"
+
+// The keys whose last value the panel keeps; motion, presence and vibration are events only.
+const char* const kLevelKeys[] = {"contact", "water_leak", "smoke", "gas", "carbon_monoxide"};
+constexpr size_t kLevelKeyCount = sizeof(kLevelKeys) / sizeof(kLevelKeys[0]);
+struct Seed {
+    uint64_t ieee;
+    int8_t   v[kLevelKeyCount];   // -1 unknown, else 0 or 1
+};
+
+// Never under s_mu: the shadow's lock is not taken under it.
+void read_seeds(Seed* s, uint8_t n) {
+    for (uint8_t i = 0; i < n; i++) {
+        for (size_t k = 0; k < kLevelKeyCount; k++) {
+            ShadowAttr a{};
+            const bool have = device_shadow_get_attr(s[i].ieee, kLevelKeys[k], &a) && (a.val_type == VAL_BOOL || a.val_type == VAL_INT);
+            s[i].v[k] = have ? (a.int_val ? 1 : 0) : -1;
+        }
+    }
 }
 
-// Run `f` on the panel under the lock; a state change goes to the task.
+// What was already open or wet is not a new event. The caller holds s_mu, or nothing else sees `p` yet.
+void apply_seeds(AlarmPanel* p, const AlarmConfig& c, const Seed* s, uint8_t n) {
+    for (uint8_t i = 0; i < n; i++) {
+        const int slot = alarm_cfg_sensor(c, s[i].ieee);
+        for (size_t k = 0; slot >= 0 && k < kLevelKeyCount; k++) {
+            AlarmKey key;
+            if (s[i].v[k] >= 0 && alarm_key_parse(kLevelKeys[k], &key))
+                p->seed(static_cast<uint8_t>(slot), key, key_active(key, s[i].v[k]));
+        }
+    }
+}
+
+// ── In: every change to the panel ──
+
+void wake() {
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+// Run `f` on the panel under the lock, then let the task look at what it did.
 template <typename F>
-void act(bool timed, F&& f) {
-    Change c{};
+void act(F&& f) {
     {
         Lock l;
-        c.from = s_core->state();
         f();
-        c.to      = s_core->state();
-        c.resting = s_core->resting();
-        c.mode    = s_core->mode();
-        c.cause   = s_core->cause();
-        if (c.from != c.to) s_since = wall_s();
     }
-    if (c.from == c.to) return;
-    c.timed = timed;
-    if (xQueueSend(s_q, &c, 0) != pdTRUE)
-        ESP_LOGE(TAG, "%s -> %s: not acted on, queue full", alarm_state_name(c.from), alarm_state_name(c.to));
+    wake();
 }
 
-// An arm refused for open doors or windows, not from the hub page (which lists them itself): the
-// task notifies and fires Event#alarm_arm_failed.
-void arm_refused(AlarmMode m, const uint64_t* open, uint8_t n) {
-    Change c{};
-    {
-        Lock l;
-        c.from = c.to = s_core->state();
-        c.resting = s_core->resting();
+// Arm one profile: by id, or with no id the intrusion profile of `role`. OPEN: the open contact sensors go
+// to `open` (room for kAlarmMaxSensors) when given. `tell`: such a refusal is notified, for a keypad, a button,
+// a rule, Lua, MQTT or Home Assistant: nobody there sees it, and leaving the house unguarded is what an alarm is for.
+AlarmReply arm(const char* id, AlarmRole role, bool force, bool tell, uint64_t* open, uint8_t* n_open) {
+    AlarmReply r = AlarmReply::NO_PROFILE;
+    Refusal ref{};
+    const uint32_t now = mono_s();
+    act([&] {
+        const int p = id ? alarm_cfg_profile(*s_cfg, id) : alarm_cfg_role(*s_cfg, role);
+        if (p < 0) return;
+        uint64_t slots = 0;
+        const AlarmArmResult a = s_panel->arm(static_cast<uint8_t>(p), force, now, &slots);
+        r = a == AlarmArmResult::OK ? AlarmReply::OK : a == AlarmArmResult::OPEN ? AlarmReply::OPEN : AlarmReply::BUSY;
+        if (r != AlarmReply::OPEN) return;
+        for (uint8_t slot = 0; slot < s_cfg->n_sensors; slot++) {
+            if (!(slots >> slot & 1)) continue;
+            if (!ref.n) ref.first = s_cfg->sensors[slot].ieee;
+            if (open) open[ref.n] = s_cfg->sensors[slot].ieee;
+            ref.n++;
+        }
+        std::memcpy(ref.id, s_cfg->profiles[p].id, sizeof(ref.id));
+        std::memcpy(ref.name, s_cfg->profiles[p].name, sizeof(ref.name));
+    });
+    if (n_open) *n_open = ref.n;
+    if (r == AlarmReply::OPEN && tell) {
+        if (xQueueSend(s_refused, &ref, 0) == pdTRUE) wake();
+        else ESP_LOGE(TAG, "arm %s refused, not reported: queue full", ref.id);
     }
-    c.mode    = m;
-    c.cause   = n ? open[0] : 0;
-    c.n_open  = n;
-    c.refused = true;
-    if (xQueueSend(s_q, &c, 0) != pdTRUE) ESP_LOGE(TAG, "arm %s refused, not reported: queue full", alarm_mode_name(m));
+    return r;
 }
 
-// ── Out: the Alarm device, named events, notifications, sirens ──
+// ── Out: named events, notifications, outputs, the Alarm device ──
 
-void publish_state(AlarmState s, uint64_t cause) {
-    char name[32] = "";
-    if (cause && (s == AlarmState::PENDING || s == AlarmState::TRIGGERED)) name_of(cause, name);
-    ZclAttribute a[2]{};
-    zcl_attr_set_str(&a[0], "alarm_sensor", name);   // first: a handler of alarm_state can read it
-    zcl_attr_set_str(&a[1], "alarm_state", alarm_state_name(s));
-    device_shadow_process_ieee(kAlarmIeee, a, 2);
-}
-
-void rule_event(const char* what) {   // Event#alarm_<what>
+void rule_event(const char* name) {   // Event#<name>; the core's names start with alarm_
     Event ev{};
     ev.type = EventType::RULE_EVENT;
     auto* p = reinterpret_cast<RuleEventPayload*>(ev.data);
-    std::snprintf(p->name, sizeof(p->name), "alarm_%s", what);
+    std::snprintf(p->name, sizeof(p->name), "%s", name);
     event_bus_publish(ev);
 }
 
 // The cloud's `alert` (push + inbox) and Telegram. Both queue; neither waits on the network, and
 // both hold a message back until it is up again, so each text says when it happened.
-void notify(const char* kind, uint64_t ieee, const char* message, const char* tg_text) {
+// `profile`: the profile's id, which keeps the alerts of two profiles apart when there is no ieee.
+void notify(const char* kind, uint64_t ieee, const char* profile, const char* message) {
     char at[16] = "";
     if (const time_t t = time(nullptr); t > 1577836800) {
         struct tm lt;
         localtime_r(&t, &lt);
         std::strftime(at, sizeof(at), " at %H:%M", &lt);
     }
-    char text[112], tg[128];
+    char text[160], tg[176];   // a message is 127 bytes at most: nothing is cut
     std::snprintf(text, sizeof(text), "%s%s", message, at);
-    std::snprintf(tg, sizeof(tg), "%s%s", tg_text, at);
+    std::snprintf(tg, sizeof(tg), "Alarm: %s", text);
     JsonDocument d;
     d["kind"]    = kind;
     d["state"]   = true;
@@ -194,64 +243,16 @@ void notify(const char* kind, uint64_t ieee, const char* message, const char* tg
         ieee_str(ieee, id);
         d["ieee"] = static_cast<const char*>(id);
     }
-    char buf[320];
+    if (profile) d["name"] = profile;
+    char buf[448];
     const size_t n = serializeJson(d, buf, sizeof(buf));
     if (n && n < sizeof(buf)) remote_client_publish_event("alert", buf, n);
     tg_gw_send(tg, nullptr, nullptr);
 }
 
-// An arm a keypad, a button, a rule, Lua, MQTT or Home Assistant asked for, refused for open doors or
-// windows: nobody there sees the refusal, and leaving the house unguarded is what an alarm is for.
-void notify_refused(const Change& c) {
-    char name[32], msg[96], tg[112];
-    name_of(c.cause, name);
-    const char* mode = alarm_mode_name(c.mode);
-    if (c.n_open > 1) {
-        std::snprintf(msg, sizeof(msg), "Not armed (%s): %s and %u more are open", mode, name, c.n_open - 1u);
-        std::snprintf(tg, sizeof(tg), "Alarm not armed (%s): %s and %u more are open", mode, name, c.n_open - 1u);
-    } else {
-        std::snprintf(msg, sizeof(msg), "Not armed (%s): %s is open", mode, name);
-        std::snprintf(tg, sizeof(tg), "Alarm not armed (%s): %s is open", mode, name);
-    }
-    notify("alarm_arm_failed", c.cause, msg, tg);
-}
-
-void notify_change(const Change& c) {
-    const char* mode = alarm_mode_name(c.mode);
-    char msg[96], tg[112];
-    if (c.to == AlarmState::TRIGGERED) {
-        bool panic;
-        {
-            Lock l;
-            panic = alarm_cfg_keypad(*s_cfg, c.cause) && !alarm_cfg_sensor(*s_cfg, c.cause);
-        }
-        char name[32];
-        name_of(c.cause, name);
-        if (panic) std::snprintf(msg, sizeof(msg), "Panic button on %s", name);
-        else       std::snprintf(msg, sizeof(msg), "%s (armed %s)", name, mode);
-        std::snprintf(tg, sizeof(tg), "Alarm: %s", msg);
-        notify("alarm", c.cause, msg, tg);
-        return;
-    }
-    bool on;
-    {
-        Lock l;
-        on = s_cfg->notify_arm;
-    }
-    if (!on) return;
-    const bool armed = c.to == AlarmState::ARMED_AWAY || c.to == AlarmState::ARMED_HOME || c.to == AlarmState::ARMED_NIGHT;
-    if (armed && c.from != AlarmState::PENDING && c.from != AlarmState::TRIGGERED) {
-        std::snprintf(msg, sizeof(msg), "Armed (%s)", mode);
-        std::snprintf(tg, sizeof(tg), "Alarm armed (%s)", mode);
-        notify("alarm_armed", 0, msg, tg);
-    } else if (c.to == AlarmState::DISARMED && !c.timed) {
-        notify("alarm_disarmed", 0, "Disarmed", "Alarm disarmed");
-    }
-}
-
 void set(uint64_t ieee, const char* key, const DevCmdValue& v) {
     const DevCmdResult r = device_cmd_set_attr(ieee, 0, key, &v);
-    if (r != DEVCMD_OK) ESP_LOGW(TAG, "siren 0x%016" PRIX64 " %s: %s", ieee, key, device_cmd_result_str(r));
+    if (r != DEVCMD_OK) ESP_LOGW(TAG, "output 0x%016" PRIX64 " %s: %s", ieee, key, device_cmd_result_str(r));
 }
 
 bool exposes_of(uint64_t ieee, JsonDocument& doc) {
@@ -278,7 +279,7 @@ void set_label(uint64_t ieee, const char* key, JsonObjectConst e, const char* la
 }
 
 // A Tuya siren: its tone, volume and own duration, as it exposes them, before alarm=true.
-void tuya_siren_setup(const AlarmSiren& s, uint16_t secs) {
+void tuya_siren_setup(const AlarmOutput& s, uint16_t secs) {
     JsonDocument ex;
     if (!exposes_of(s.ieee, ex)) return;
     if (s.melody[0]) {
@@ -298,65 +299,31 @@ void tuya_siren_setup(const AlarmSiren& s, uint16_t secs) {
     }
 }
 
-void siren(const AlarmSiren& s, bool on, uint16_t secs) {
-    switch (s.kind) {
-    case AlarmSirenKind::WARNING: {
+// Start an output for `secs`, or stop it. Can wait seconds on a sleepy or far device.
+void drive(const AlarmOutput& o, bool on, uint16_t secs) {
+    if (!on && o.keep) return;   // left as it was set: the hub never sends such a device the opposite value
+    switch (o.kind) {
+    case AlarmOutKind::WARNING: {
         // embedded-zhc's warning encoder: "mode,level,strobe,duration" (z2m's warning object).
         char v[48];
-        std::snprintf(v, sizeof(v), "%s,%s,%d,%u", s.wd_mode, s.wd_level, s.strobe ? 1 : 0, secs);
-        set(s.ieee, "warning", on ? device_cmd_str(v) : device_cmd_bool(false));
+        std::snprintf(v, sizeof(v), "%s,%s,%d,%u", o.wd_mode, o.wd_level, o.strobe ? 1 : 0, secs);
+        set(o.ieee, "warning", on ? device_cmd_str(v) : device_cmd_bool(false));
         break;
     }
-    case AlarmSirenKind::ALARM:
-        if (on) tuya_siren_setup(s, secs);
-        set(s.ieee, "alarm", device_cmd_bool(on));
+    case AlarmOutKind::ALARM:
+        if (on) tuya_siren_setup(o, secs);
+        set(o.ieee, "alarm", device_cmd_bool(on));
         break;
-    case AlarmSirenKind::SWITCH:
-        set(s.ieee, "state", device_cmd_bool(on));
+    case AlarmOutKind::STATE:
+        set(o.ieee, "state", device_cmd_bool(on ? o.value : !o.value));
         break;
     }
-}
-
-void sirens(bool on) {
-    AlarmSiren list[kAlarmMaxSirens];
-    uint8_t n;
-    uint16_t secs;
-    {
-        Lock l;
-        n = s_cfg->n_sirens;
-        std::memcpy(list, s_cfg->sirens, n * sizeof(AlarmSiren));
-        secs = s_cfg->siren_time;
-    }
-    for (uint8_t i = 0; i < n; i++) siren(list[i], on, secs);
 }
 
 void push_changed() {
     JsonDocument d;
     alarm_status_json(d.to<JsonObject>());
     ws_push("alarm.changed", d);
-}
-
-void save_state(AlarmState state, AlarmState resting) {
-    const uint8_t rec[2] = {static_cast<uint8_t>(state), static_cast<uint8_t>(resting)};
-    if (std::memcmp(rec, s_saved, sizeof(rec)) == 0) return;
-    if (nvs_put("st", rec, sizeof(rec))) std::memcpy(s_saved, rec, sizeof(rec));
-    else ESP_LOGW(TAG, "state not saved: a restart comes back to the previous one");
-}
-
-void run_change(const Change& c) {
-    if (c.refused) {
-        notify_refused(c);
-        rule_event("arm_failed");
-        return;
-    }
-    ESP_LOGI(TAG, "%s -> %s", alarm_state_name(c.from), alarm_state_name(c.to));
-    save_state(c.to, c.resting);
-    notify_change(c);   // first: it only queues
-    publish_state(c.to, c.cause);
-    rule_event(alarm_state_name(c.to));
-    if (c.to == AlarmState::TRIGGERED) sirens(true);
-    else if (c.from == AlarmState::TRIGGERED) sirens(false);
-    push_changed();
 }
 
 void touch_last_seen() {   // the device is always there
@@ -367,63 +334,248 @@ void touch_last_seen() {   // the device is always there
     zigbee_pool_unlock();
 }
 
+// ── The task: one look under the lock, then the work outside it ──
+
+struct Act {
+    bool        on;      // start, else stop
+    uint8_t     index;   // of `out` in the config's outputs
+    uint16_t    secs;    // start: the alarm time left
+    AlarmOutput out;
+};
+
+// What one look found, copied under the lock. The task's only, and static: too big for its stack.
+struct Pass {
+    uint8_t      n_ch, n_prof, n_ev, n_orphans, n_act;
+    bool         running, resync, ids_changed;
+    AlarmChange  ch[kAlarmMaxProfiles];
+    bool         panic[kAlarmMaxProfiles];   // by change: the alarm came from a keypad, not from a sensor
+    AlarmProfile prof[kAlarmMaxProfiles];    // the profiles and their states as of this look
+    AlarmState   state[kAlarmMaxProfiles];
+    char         summary[kSummaryMax];
+    uint64_t     summary_cause;              // the device behind the summary's pending or triggered, else 0
+    char         events[kEventsMax][kAlarmEventMax];
+    char         st2[kStatesMax];
+    size_t       st2_len;
+    uint8_t      st[2];
+    Orphan       orphans[kAlarmMaxOutputs];
+    Act          acts[kAlarmMaxOutputs];
+};
+
+// `boot_stop`: a minute after a restart during an alarm, what sounded before it and does not sound now is stopped.
+void look(uint32_t now, bool boot_stop, Pass& p) {
+    static AlarmDrive plan[kAlarmMaxOutputs];
+    const uint32_t wall = wall_s();
+    Lock l;
+    s_panel->tick(now);   // before the plan: it counts the time left from the deadlines
+    p.n_ch = alarm_changes(*s_panel, s_seen, p.ch);
+    alarm_seen(*s_panel, s_seen);
+    p.running     = s_panel->running();
+    p.resync      = s_resync;
+    p.ids_changed = s_ids_changed;
+    s_resync = s_ids_changed = false;
+    p.n_prof = s_cfg->n_profiles;
+    for (uint8_t i = 0; i < p.n_prof; i++) {
+        p.prof[i]  = s_cfg->profiles[i];
+        p.state[i] = s_panel->at(i).state;
+    }
+    for (uint8_t i = 0; i < p.n_ch; i++) {
+        const AlarmChange& c = p.ch[i];
+        p.panic[i] = c.alarm && alarm_cfg_keypad(*s_cfg, c.cause) && alarm_cfg_sensor(*s_cfg, c.cause) < 0;
+        if (c.from != c.to) s_since[c.profile] = wall;
+    }
+    alarm_summary_name(*s_cfg, *s_panel, p.summary, sizeof(p.summary));
+    const int sp = s_panel->summary_profile();
+    const AlarmState ss = sp >= 0 ? s_panel->at(static_cast<uint8_t>(sp)).state : AlarmState::DISARMED;
+    p.summary_cause = ss == AlarmState::PENDING || ss == AlarmState::TRIGGERED ? s_panel->at(static_cast<uint8_t>(sp)).cause : 0;
+    p.n_ev    = alarm_events(*s_cfg, p.ch, p.n_ch, s_summary, p.summary, p.events, kEventsMax);
+    p.st2_len = alarm_states_pack(*s_cfg, *s_panel, p.st2, sizeof(p.st2));
+    alarm_legacy_record(*s_cfg, *s_panel, p.st);
+
+    p.n_orphans = s_n_orphans;
+    std::memcpy(p.orphans, s_orphans, s_n_orphans * sizeof(Orphan));
+    s_n_orphans = 0;
+    p.n_act = 0;
+    const uint8_t n = alarm_drive_plan(*s_cfg, *s_panel, now, plan);
+    for (uint8_t e = 0; e < n; e++) {
+        int8_t was = s_follows[e];
+        for (uint8_t k = 0; boot_stop && was < 0 && plan[e].output < 0 && k < s_cfg->n_outputs; k++)
+            if (s_cfg->outputs[k].ieee == plan[e].ieee && (s_boot_sounding >> s_cfg->outputs[k].profile & 1)) was = static_cast<int8_t>(k);
+        const AlarmOutAct a = alarm_output_step(*s_cfg, was, plan[e].output);
+        s_follows[e] = plan[e].output;
+        if (a == AlarmOutAct::NONE) continue;
+        // In the order the profiles list their outputs, so that a valve comes before the sirens also when an
+        // earlier profile lists that siren too (the plan has each device where it is listed first).
+        const uint8_t k = static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was);
+        uint8_t at = p.n_act++;
+        for (; at > 0 && p.acts[at - 1].index > k; at--) p.acts[at] = p.acts[at - 1];
+        p.acts[at] = {a == AlarmOutAct::START, k, plan[e].secs, s_cfg->outputs[k]};
+    }
+    if (boot_stop) s_boot_sounding = 0;
+}
+
+// The states of all profiles ("st2") and the stage 1 record ("st") that follows the intrusion profiles, each when
+// it differs from what flash holds. A write that fails is logged and the change still takes effect.
+void save_states(const Pass& p) {
+    if (p.st2_len != s_st2_len || std::memcmp(p.st2, s_st2_saved, p.st2_len) != 0) {
+        if (p.st2_len && nvs_put("st2", p.st2, p.st2_len)) {
+            std::memcpy(s_st2_saved, p.st2, p.st2_len);
+            s_st2_len = p.st2_len;
+        } else {
+            ESP_LOGW(TAG, "states not saved: a restart comes back to the ones saved last");
+        }
+    }
+    if (std::memcmp(p.st, s_st_saved, sizeof(p.st)) != 0) {
+        if (nvs_put("st", p.st, sizeof(p.st))) std::memcpy(s_st_saved, p.st, sizeof(p.st));
+        else ESP_LOGW(TAG, "stage 1 state record not saved: a fall back to that firmware finds the one saved last");
+    }
+}
+
+void tell_changes(const Pass& p) {
+    char dev[32], msg[128];
+    for (uint8_t i = 0; i < p.n_ch; i++) {
+        const AlarmChange& c = p.ch[i];
+        if (c.profile >= p.n_prof) continue;
+        const AlarmProfile& pr = p.prof[c.profile];
+        ESP_LOGI(TAG, "%s: %s -> %s%s", pr.id, alarm_state_name(c.from), alarm_state_name(c.to), c.alarm ? " (alarm)" : "");
+        if (c.alarm) {   // also when it is over again by now
+            name_of(c.cause, dev);
+            alarm_text(p.panic[i] ? AlarmText::PANIC : AlarmText::TRIGGERED, pr.name, dev, 0, msg, sizeof(msg));
+            notify("alarm", c.cause, nullptr, msg);
+        }
+        if (!pr.notify_arm) continue;
+        if (c.to == AlarmState::ARMED && (c.from == AlarmState::DISARMED || c.from == AlarmState::ARMING)) {
+            alarm_text(AlarmText::ARMED, pr.name, nullptr, 0, msg, sizeof(msg));
+            notify("alarm_armed", 0, pr.id, msg);
+        } else if (c.to == AlarmState::DISARMED && c.from != c.to && c.by_command) {   // not for a profile another one replaced
+            alarm_text(AlarmText::DISARMED, pr.name, nullptr, 0, msg, sizeof(msg));
+            notify("alarm_disarmed", 0, pr.id, msg);
+        }
+    }
+}
+
+void tell_refused(const Refusal& r) {
+    char dev[32], msg[128], ev[kAlarmEventMax];
+    name_of(r.first, dev);
+    alarm_text(AlarmText::REFUSED, r.name, dev, r.n ? r.n - 1u : 0, msg, sizeof(msg));
+    notify("alarm_arm_failed", r.first, r.id, msg);
+    std::snprintf(ev, sizeof(ev), "alarm_arm_failed_%s", r.id);
+    rule_event(ev);
+    rule_event("alarm_arm_failed");
+}
+
+// The Alarm device's attributes, in the order handlers see them. `all`: every profile's, else those of the
+// profiles whose state moved. `summary`: alarm_sensor and alarm_state too.
+void publish_attrs(const Pass& p, bool all, bool summary) {
+    static ZclAttribute a[kAlarmMaxProfiles + 2];
+    std::memset(a, 0, sizeof(a));
+    uint8_t n = 0;
+    if (summary) {   // first: a handler of alarm_state can read it
+        char name[32] = "";
+        if (p.summary_cause) name_of(p.summary_cause, name);
+        zcl_attr_set_str(&a[n++], "alarm_sensor", name);
+    }
+    for (uint8_t i = 0; all && i < p.n_prof; i++) zcl_attr_set_str(&a[n++], p.prof[i].id, alarm_state_name(p.state[i]));
+    for (uint8_t i = 0; !all && i < p.n_ch; i++) {
+        const AlarmChange& c = p.ch[i];
+        if (c.from != c.to && c.profile < p.n_prof) zcl_attr_set_str(&a[n++], p.prof[c.profile].id, alarm_state_name(c.to));
+    }
+    if (summary) zcl_attr_set_str(&a[n++], "alarm_state", p.summary);
+    if (n) device_shadow_process_ieee(kAlarmIeee, a, n);
+}
+
+// A save removed profiles: their attributes leave the device. Whatever it holds that is no profile of now
+// goes (as Hub I/O drops the pins it lost), so one a hurried second save removed is not left behind either.
+void drop_gone_attrs(const Pass& p) {
+    constexpr uint8_t kMax = 32;
+    auto* attrs = static_cast<ShadowAttr*>(heap_caps_malloc(kMax * sizeof(ShadowAttr), MALLOC_CAP_SPIRAM));
+    if (!attrs) return;
+    const uint8_t n = device_shadow_get_attrs(kAlarmIeee, attrs, kMax);
+    for (uint8_t k = 0; k < n; k++) {
+        bool live = attrs[k].key[0] == '_' ||   // the shadow's own (_last_seen)
+                    std::strcmp(attrs[k].key, "alarm_state") == 0 || std::strcmp(attrs[k].key, "alarm_sensor") == 0;
+        for (uint8_t i = 0; !live && i < p.n_prof; i++) live = std::strcmp(attrs[k].key, p.prof[i].id) == 0;
+        if (!live) device_shadow_remove_attr(kAlarmIeee, attrs[k].key);
+    }
+    heap_caps_free(attrs);
+}
+
+// The work of one pass, in this order: what must not be lost first, what can wait on a device after it.
+void run(const Pass& p, bool boot_due) {
+    const bool moved = std::strcmp(p.summary, s_summary) != 0 || p.summary_cause != s_summary_cause;
+    if (!boot_due) save_states(p);   // 1
+    if (boot_due) {                  // 2: these only queue
+        char msg[128];
+        alarm_text(AlarmText::RESTARTED, nullptr, nullptr, 0, msg, sizeof(msg));
+        notify("alarm", 0, nullptr, msg);
+    }
+    tell_changes(p);
+    if (p.ids_changed) drop_gone_attrs(p);   // 3
+    publish_attrs(p, p.ids_changed, moved);
+    if (p.ids_changed) {   // hub page, cloud and HA re-read the device: its exposes changed (as Hub I/O does)
+        Event ev{};
+        ev.type = EventType::DEVICE_JOIN;
+        std::memcpy(ev.data, &kAlarmIeee, sizeof(kAlarmIeee));
+        event_bus_publish(ev);
+    }
+    for (uint8_t i = 0; i < p.n_ev; i++) rule_event(p.events[i]);   // 4
+    for (uint8_t i = 0; i < p.n_orphans; i++) {                     // 5
+        AlarmOutput o{};
+        o.ieee  = p.orphans[i].ieee;
+        o.kind  = p.orphans[i].kind;
+        o.value = p.orphans[i].value;
+        drive(o, false, 0);
+    }
+    for (uint8_t i = 0; i < p.n_act; i++) drive(p.acts[i].out, p.acts[i].on, p.acts[i].secs);
+    // Told and stopped: only now is the next restart not "during an alarm" again.
+    if (boot_due) save_states(p);
+    push_changed();   // 6
+    std::memcpy(s_summary, p.summary, sizeof(s_summary));
+    s_summary_cause = p.summary_cause;
+}
+
 void alarm_task(void*) {
+    static Pass p;
     uint32_t boot_alert_at = s_boot_alert ? mono_s() + kBootAlertDelayS : 0;
     uint32_t next_seen = 0;
-    bool stack_logged = false;
+    bool first = true, stack_logged = false;
     for (;;) {
-        bool timed;
-        {
-            Lock l;
-            const AlarmState s = s_core->state();
-            timed = s == AlarmState::ARMING || s == AlarmState::PENDING || s == AlarmState::TRIGGERED;
+        const uint32_t now = mono_s();
+        const bool boot_due = boot_alert_at && now >= boot_alert_at;
+        if (boot_due) boot_alert_at = 0;
+        look(now, boot_due, p);
+        if (first) {   // the device as it stands at boot: every attribute, no event
+            first = false;
+            publish_attrs(p, true, true);
         }
-        Change c;
-        if (xQueueReceive(s_q, &c, pdMS_TO_TICKS(timed || boot_alert_at ? 1000 : 30000)) == pdTRUE) {
-            run_change(c);
-            if (!stack_logged) {   // for the hardware check: sirens and NVS are this task's deepest paths
+        const bool work = p.n_ch || p.resync || p.n_orphans || p.n_act || boot_due;
+        if (work) {
+            run(p, boot_due);
+            if (!stack_logged) {   // for the hardware check: outputs and NVS are this task's deepest paths
                 stack_logged = true;
                 ESP_LOGI(TAG, "task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
         }
-        const uint32_t now = mono_s();
-        act(true, [&] { s_core->tick(now); });
-        if (boot_alert_at && now >= boot_alert_at) {
-            boot_alert_at = 0;
-            notify("alarm", 0, "The hub restarted during an alarm", "Alarm: the hub restarted during an alarm");
-            AlarmState st, rest;
-            {
-                Lock l;
-                st   = s_core->state();
-                rest = s_core->resting();
-            }
-            // The panel came back armed, but a switch siren has no duration of its own: stop what the
-            // alarm before the restart started, unless a new alarm sounds them by now.
-            if (s_boot_sirens && st != AlarmState::TRIGGERED) sirens(false);
-            save_state(st, rest);   // told once: the next restart is not "during an alarm" again
-        }
+        Refusal r;
+        while (xQueueReceive(s_refused, &r, 0) == pdTRUE) tell_refused(r);
         if (now >= next_seen) {
             next_seen = now + 60;
             touch_last_seen();
         }
+        if (work) continue;   // again, until a pass finds nothing: the panel may have moved while this one worked
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(p.running || boot_alert_at ? 1000 : 30000));
     }
 }
 
 // ── In: sensors and keypads ──
 
-bool momentary_key(const char* k) {
-    return std::strcmp(k, "occupancy") == 0 || std::strcmp(k, "presence") == 0 || std::strcmp(k, "vibration") == 0;
-}
-bool sensor_key(const char* k) { return std::strcmp(k, "contact") == 0 || momentary_key(k); }
-
-// In the publisher's task: only the configured sensors' and keypads' values reach the queue,
-// so a chatty device elsewhere cannot push them out of it.
+// In the publisher's task: only the configured sensors' and keypads' values go on to on_attr.
 bool attr_filter(const Event& e) {
     const auto& z = *reinterpret_cast<const ZclAttrEvent*>(e.data);
     if (z.ieee == kAlarmIeee) return false;
-    const bool skey = sensor_key(z.key);
+    AlarmKey key;
+    const bool skey = alarm_key_parse(z.key, &key);
     Lock l;
-    return (skey && alarm_cfg_sensor(*s_cfg, z.ieee)) || alarm_cfg_keypad(*s_cfg, z.ieee);
+    return (skey && alarm_cfg_sensor(*s_cfg, z.ieee) >= 0) || alarm_cfg_keypad(*s_cfg, z.ieee);
 }
 
 void copy_str(char* dst, size_t cap, const ZclAttrEvent& z) {   // str_val need not end in NUL
@@ -452,52 +604,45 @@ void on_keypad(const ZclAttrEvent& z) {
         in = p;
         p = PadInput{};
     }
-    // IAS ACE arm modes as embedded-zhc names them (z2m's armMode).
-    static constexpr struct { const char* action; AlarmMode mode; } kArm[] = {
-        {"arm_all_zones", AlarmMode::AWAY}, {"arm_day_zones", AlarmMode::HOME}, {"arm_night_zones", AlarmMode::NIGHT}};
+    // IAS ACE arm modes as embedded-zhc names them (z2m's armMode): each arms the intrusion profile with that role.
+    static constexpr struct { const char* action; AlarmRole role; } kArm[] = {
+        {"arm_all_zones", AlarmRole::AWAY}, {"arm_day_zones", AlarmRole::HOME}, {"arm_night_zones", AlarmRole::NIGHT}};
     if (std::strcmp(in.action, "disarm") == 0) {
-        bool ok;
-        {
-            Lock l;
+        bool ok = false;
+        act([&] {
             ok = alarm_keypad_may_disarm(*s_cfg, z.ieee, in.code);
-        }
-        if (ok) alarm_disarm();
-        else ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": disarm refused, wrong or no code", z.ieee);
+            if (ok) s_panel->disarm_all();
+        });
+        if (!ok) ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": disarm refused, wrong or no code", z.ieee);
     } else if (std::strcmp(in.action, "emergency") == 0 || std::strcmp(in.action, "panic") == 0 ||
                std::strcmp(in.action, "fire") == 0) {
+        bool ok = false;
         const uint32_t now = mono_s();
-        act(false, [&] { s_core->panic(z.ieee, now); });
+        act([&] { ok = s_panel->panic(z.ieee, now); });
+        if (!ok) ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": %s ignored, there is no intrusion profile", z.ieee, in.action);
     }
     for (const auto& a : kArm) {
         if (std::strcmp(in.action, a.action) != 0) continue;
-        uint64_t open[kAlarmMaxSensors];
-        uint8_t n = 0;
-        const AlarmArmResult r = alarm_arm(a.mode, false, open, &n);
-        if (r != AlarmArmResult::OK)
-            ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": arm %s refused (%s)", z.ieee, alarm_mode_name(a.mode),
-                     r == AlarmArmResult::OPEN ? "a door or window is open" : "the alarm is on");
-        if (r == AlarmArmResult::OPEN) arm_refused(a.mode, open, n);
+        const AlarmReply r = arm(nullptr, a.role, false, true, nullptr, nullptr);
+        if (r == AlarmReply::NO_PROFILE)
+            ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": %s ignored, no profile has that role", z.ieee, in.action);
+        else if (r != AlarmReply::OK)
+            ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": %s refused (%s)", z.ieee, in.action,
+                     r == AlarmReply::OPEN ? "a door or window is open" : "an alarm is on");
     }
     std::memset(&in, 0, sizeof(in));
 }
 
 void on_attr(const Event& e) {
     const auto& z = *reinterpret_cast<const ZclAttrEvent*>(e.data);
-    if (sensor_key(z.key) && (z.val_type == VAL_BOOL || z.val_type == VAL_INT)) {
+    AlarmKey key;
+    if (alarm_key_parse(z.key, &key) && (z.val_type == VAL_BOOL || z.val_type == VAL_INT)) {
+        const bool active = key_active(key, z.int_val);
         const uint32_t now = mono_s();
-        act(false, [&] {
-            const AlarmSensor* s = alarm_cfg_sensor(*s_cfg, z.ieee);
-            if (!s) return;
-            bool active;
-            if (std::strcmp(z.key, "contact") == 0) {
-                // Opened: a repeated "open" report is not a new opening.
-                int8_t& last = s_contact[s - s_cfg->sensors];
-                active = z.int_val == 0 && last != 0;
-                last = z.int_val ? 1 : 0;
-            } else {
-                active = z.int_val != 0;   // motion, presence, vibration: every report of it
-            }
-            if (active) s_core->sensor_active(z.ieee, now);
+        act([&] {
+            // The panel knows what counts: a contact that opens, a hazard that turns true, every motion report.
+            const int slot = alarm_cfg_sensor(*s_cfg, z.ieee);
+            if (slot >= 0) s_panel->sensor(static_cast<uint8_t>(slot), key, active, now);
         });
     }
     on_keypad(z);
@@ -505,36 +650,80 @@ void on_attr(const Event& e) {
 
 // ── The Alarm device ──
 
+// alarm_state takes disarmed (all) and armed_<id> of an intrusion profile; a profile's own attribute takes
+// armed and disarmed. arming, pending and triggered are the panel's own.
 DevCmdResult local_cmd(uint64_t ieee, const char* key, const DevCmdValue* v) {
     if (ieee != kAlarmIeee) return DEVCMD_NOT_FOUND;
-    if (std::strcmp(key, "alarm_state") != 0) return DEVCMD_NO_CONVERTER;
-    AlarmState s;
-    if (v->kind != DEVCMD_STR || !v->s || !alarm_state_parse(v->s, &s)) return DEVCMD_BAD_VALUE;
-    AlarmMode m;
-    switch (s) {
-    case AlarmState::DISARMED:    alarm_disarm(); return DEVCMD_OK;
-    case AlarmState::ARMED_AWAY:  m = AlarmMode::AWAY; break;
-    case AlarmState::ARMED_HOME:  m = AlarmMode::HOME; break;
-    case AlarmState::ARMED_NIGHT: m = AlarmMode::NIGHT; break;
-    default:                      return DEVCMD_BAD_VALUE;   // arming, pending, triggered: the panel's own
+    const bool summary = std::strcmp(key, "alarm_state") == 0;
+    if (!summary) {
+        Lock l;
+        if (alarm_cfg_profile(*s_cfg, key) < 0) return DEVCMD_NO_CONVERTER;
     }
-    uint64_t open[kAlarmMaxSensors];
-    uint8_t n = 0;
-    const AlarmArmResult r = alarm_arm(m, false, open, &n);
-    if (r == AlarmArmResult::OK) return DEVCMD_OK;
-    ESP_LOGW(TAG, "arm %s refused: %s", alarm_mode_name(m),
-             r == AlarmArmResult::OPEN ? "a door or window is open (the hub page can force it)" : "the alarm is on, disarm first");
-    if (r == AlarmArmResult::OPEN) arm_refused(m, open, n);
+    if (v->kind != DEVCMD_STR || !v->s) return DEVCMD_BAD_VALUE;
+    if (std::strcmp(v->s, "disarmed") == 0)
+        return alarm_disarm(summary ? nullptr : key) == AlarmReply::OK ? DEVCMD_OK : DEVCMD_BAD_VALUE;
+    const char* id = key;
+    if (summary) {
+        if (std::strncmp(v->s, "armed_", 6) != 0) return DEVCMD_BAD_VALUE;
+        id = v->s + 6;
+        Lock l;
+        const int p = alarm_cfg_profile(*s_cfg, id);
+        if (p < 0 || s_cfg->profiles[p].cls != AlarmClass::INTRUSION) return DEVCMD_BAD_VALUE;
+    } else if (std::strcmp(v->s, "armed") != 0) {
+        return DEVCMD_BAD_VALUE;
+    }
+    const AlarmReply r = arm(id, AlarmRole::NONE, false, true, nullptr, nullptr);
+    if (r == AlarmReply::OK) return DEVCMD_OK;
+    ESP_LOGW(TAG, "arm %s refused: %s", id,
+             r == AlarmReply::OPEN ? "a door or window is open (the hub page can force it)"
+             : r == AlarmReply::BUSY ? "an alarm is on, disarm first" : "no such profile");
     return DEVCMD_BAD_VALUE;
 }
 
+// One enum per profile, named by its id; then the stage 1 pair, alarm_state and alarm_sensor.
 size_t local_exposes(uint64_t ieee, char* buf, size_t cap) {
     if (ieee != kAlarmIeee) return 0;
-    const int n = std::snprintf(buf, cap,
-        "[{\"name\":\"alarm_state\",\"type\":\"enum\",\"access\":7,\"values\":[\"disarmed\",\"arming\","
-        "\"armed_away\",\"armed_home\",\"armed_night\",\"pending\",\"triggered\"]},"
-        "{\"name\":\"alarm_sensor\",\"type\":\"text\",\"access\":1}]");
-    return n > 0 && static_cast<size_t>(n) < cap ? static_cast<size_t>(n) : 0;
+    JsonDocument d;
+    JsonArray list = d.to<JsonArray>();
+    auto add = [&](const char* name, const char* type, int access) {
+        JsonObject e = list.add<JsonObject>();
+        e["name"]   = name;   // a pointer: copied
+        e["type"]   = type;
+        e["access"] = access;
+        return e;
+    };
+    {
+        Lock l;
+        for (uint8_t i = 0; i < s_cfg->n_profiles; i++) {
+            JsonArray v = add(s_cfg->profiles[i].id, "enum", 7)["values"].to<JsonArray>();
+            for (uint8_t s = 0; s <= static_cast<uint8_t>(AlarmState::TRIGGERED); s++) v.add(alarm_state_name(static_cast<AlarmState>(s)));
+        }
+        JsonArray v = add("alarm_state", "enum", 7)["values"].to<JsonArray>();
+        v.add("disarmed");
+        v.add("arming");
+        for (uint8_t i = 0; i < s_cfg->n_profiles; i++) {
+            if (s_cfg->profiles[i].cls != AlarmClass::INTRUSION) continue;
+            char word[kSummaryMax];
+            std::snprintf(word, sizeof(word), "armed_%s", s_cfg->profiles[i].id);
+            v.add(static_cast<const char*>(word));   // a copy: word is reused
+        }
+        v.add("pending");
+        v.add("triggered");
+    }
+    add("alarm_sensor", "text", 1);
+    const size_t n = measureJson(d);
+    return !d.overflowed() && n < cap ? serializeJson(d, buf, cap) : 0;
+}
+
+// Does the device report something a profile can watch? `exposes`: the JSON array the adapter builds.
+bool has_sensor_key(const char* exposes, size_t len) {
+    JsonDocument filter, doc;   // a device's exposes run to kilobytes: keep only the names
+    filter[0]["name"] = true;
+    if (deserializeJson(doc, exposes, len, DeserializationOption::Filter(filter)) != DeserializationError::Ok) return false;
+    AlarmKey key;
+    for (JsonObjectConst e : doc.as<JsonArrayConst>())
+        if (alarm_key_parse(e["name"] | "", &key)) return true;
+    return false;
 }
 
 }  // namespace
@@ -542,34 +731,50 @@ size_t local_exposes(uint64_t ieee, char* buf, size_t cap) {
 // ── Public ──
 
 void alarm_early_init() {
-    s_mu   = xSemaphoreCreateMutex();
-    s_q    = xQueueCreate(8, sizeof(Change));
-    s_cfg  = new (std::nothrow) AlarmConfig();
-    s_core = s_cfg ? new (std::nothrow) AlarmCore(s_cfg) : nullptr;
-    configASSERT(s_mu && s_q && s_core);
-    std::memset(s_contact, -1, sizeof(s_contact));
+    s_mu      = xSemaphoreCreateMutex();
+    s_refused = xQueueCreate(16, sizeof(Refusal));
+    s_cfg     = new (std::nothrow) AlarmConfig();
+    s_panel   = s_cfg ? new (std::nothrow) AlarmPanel(s_cfg) : nullptr;
+    configASSERT(s_mu && s_refused && s_panel);
+    std::memset(s_follows, -1, sizeof(s_follows));
 
-    char* json = static_cast<char*>(heap_caps_malloc(kCfgJsonMax, MALLOC_CAP_SPIRAM));
-    const size_t len = json ? nvs_get("cfg", json, kCfgJsonMax) : 0;
-    char err[96] = "";
-    // Nothing else reads s_cfg yet: parse straight into it (too big for app_main's stack).
-    if (len && !alarm_cfg_from_json(json, len, nullptr, s_cfg, err, sizeof(err))) {
-        ESP_LOGE(TAG, "stored config unreadable (%s): no sensors this boot", err);
-        new (s_cfg) AlarmConfig();
+    // The config: "cfg2", else the stage 1 "cfg" (read only, for good), else the defaults. Nothing else reads
+    // s_cfg yet, so each loader builds it in place (too big for app_main's stack) and from scratch.
+    char* buf = static_cast<char*>(heap_caps_malloc(kAlarmStoredMax, MALLOC_CAP_SPIRAM));
+    bool have = false;
+    if (const size_t len = buf ? nvs_get("cfg2", buf, kAlarmStoredMax) : 0) {
+        have = alarm_cfg_unpack(buf, len, s_cfg);
+        if (!have) ESP_LOGE(TAG, "stored config unreadable: trying the stage 1 one");
     }
-    heap_caps_free(json);
+    if (!have) {
+        if (const size_t len = buf ? nvs_get("cfg", buf, kAlarmStoredMax) : 0) {
+            char err[96] = "";
+            have = alarm_cfg_from_json(buf, len, nullptr, s_cfg, err, sizeof(err));
+            if (!have) ESP_LOGE(TAG, "stage 1 config unreadable (%s): empty profiles this boot", err);
+        }
+    }
+    if (!have) alarm_cfg_defaults(s_cfg);
+    heap_caps_free(buf);
 
-    uint8_t st[2];
-    if (nvs_get("st", st, sizeof(st)) == sizeof(st) && st[1] <= static_cast<uint8_t>(AlarmState::TRIGGERED)) {
-        s_core->restore(static_cast<AlarmState>(st[1]));
-        s_boot_sirens = st[0] == static_cast<uint8_t>(AlarmState::TRIGGERED);
-        s_boot_alert = st[0] == static_cast<uint8_t>(AlarmState::PENDING) ||
-                       st[0] == static_cast<uint8_t>(AlarmState::TRIGGERED);
-        std::memcpy(s_saved, st, sizeof(st));
+    // The states: "st2", else the stage 1 "st". Both are kept as read: the task writes one only when it differs.
+    uint8_t in_alarm = 0;
+    s_st2_len = nvs_get("st2", s_st2_saved, sizeof(s_st2_saved));
+    const bool have_st = nvs_get("st", s_st_saved, sizeof(s_st_saved)) == sizeof(s_st_saved);
+    if (!have_st) std::memset(s_st_saved, 0xFF, sizeof(s_st_saved));
+    bool restored = s_st2_len && alarm_states_unpack(s_st2_saved, s_st2_len, *s_cfg, s_panel, &in_alarm, &s_boot_sounding);
+    if (s_st2_len && !restored) ESP_LOGE(TAG, "stored states unreadable: trying the stage 1 record");
+    if (!restored && have_st) {
+        restored = alarm_legacy_restore(s_st_saved, *s_cfg, s_panel, &in_alarm, &s_boot_sounding);
+        if (!restored) ESP_LOGE(TAG, "stage 1 state record unreadable: every profile starts disarmed");
     }
+    s_boot_alert = in_alarm != 0;
+    alarm_seen(*s_panel, s_seen);   // the restored states are where the task starts from, not changes
+    alarm_summary_name(*s_cfg, *s_panel, s_summary, sizeof(s_summary));
+
     local_dev_register(kAlarmIeee, local_cmd, local_exposes);
-    ESP_LOGI(TAG, "%s%s; %u sensor(s), %u siren(s), %u keypad(s)", alarm_state_name(s_core->state()),
-             s_boot_alert ? " (restarted during an alarm)" : "", s_cfg->n_sensors, s_cfg->n_sirens, s_cfg->n_keypads);
+    ESP_LOGI(TAG, "%s%s; %u profile(s), %u sensor(s), %u output(s), %u keypad(s)", s_summary,
+             s_boot_alert ? " (restarted during an alarm)" : "", s_cfg->n_profiles, s_cfg->n_sensors, s_cfg->n_outputs,
+             s_cfg->n_keypads);
 }
 
 void alarm_attach_device() {
@@ -609,148 +814,228 @@ void alarm_attach_device() {
 }
 
 void alarm_start() {
-    // Contacts read outside s_mu: the shadow's lock is never taken under it.
-    static uint64_t ids[kAlarmMaxSensors];   // app_main's stack is tight
-    static int8_t seed[kAlarmMaxSensors];
+    static Seed seeds[kAlarmMaxSensors];   // app_main's stack is tight
     uint8_t n;
     {
         Lock l;
         n = s_cfg->n_sensors;
-        for (uint8_t i = 0; i < n; i++) ids[i] = s_cfg->sensors[i].ieee;
+        for (uint8_t i = 0; i < n; i++) seeds[i].ieee = s_cfg->sensors[i].ieee;
     }
-    for (uint8_t i = 0; i < n; i++) seed[i] = contact_now(ids[i]);
-    AlarmState st;
+    read_seeds(seeds, n);
     {
         Lock l;
-        if (s_cfg->n_sensors == n) std::memcpy(s_contact, seed, n);
-        st = s_core->state();
+        apply_seeds(s_panel, *s_cfg, seeds, n);
     }
-    publish_state(st, 0);
     if (event_bus_subscribe(EventType::ZCL_ATTR, on_attr, attr_filter) == EVENT_SUB_INVALID)
         ESP_LOGE(TAG, "not subscribed: sensors and keypads are not watched");
-    // Internal RAM (xTaskCreate): it writes NVS, so its stack cannot sit in PSRAM.
+    // Internal RAM (xTaskCreate): it writes NVS, so its stack cannot sit in PSRAM. Its first pass
+    // publishes the Alarm device's attributes.
     if (xTaskCreate(alarm_task, "alarm", 8192, nullptr, 3, &s_task) != pdPASS)
-        ESP_LOGE(TAG, "task not started: no sirens, notifications or delays");
+        ESP_LOGE(TAG, "task not started: no outputs, notifications or delays");
 }
 
-AlarmArmResult alarm_arm(AlarmMode m, bool force, uint64_t* open, uint8_t* n_open) {
-    uint64_t ids[kAlarmMaxSensors];
-    uint8_t n = 0;
-    {
-        Lock l;
-        for (uint8_t i = 0; i < s_cfg->n_sensors; i++)
-            if (s_cfg->sensors[i].modes & (1u << static_cast<uint8_t>(m))) ids[n++] = s_cfg->sensors[i].ieee;
-    }
-    uint8_t no = 0;
-    for (uint8_t i = 0; i < n; i++) if (contact_now(ids[i]) == 0) open[no++] = ids[i];   // only contacts block
-    AlarmArmResult r = AlarmArmResult::OK;
-    const uint32_t now = mono_s();
-    act(false, [&] { r = s_core->arm(m, force, open, no, now); });
-    *n_open = no;
+AlarmReply alarm_arm(const char* id, bool force, uint64_t* open, uint8_t* n_open) {
+    return arm(id ? id : "", AlarmRole::NONE, force, false, open, n_open);
+}
+
+AlarmReply alarm_disarm(const char* id) {
+    AlarmReply r = AlarmReply::OK;
+    act([&] {
+        if (!id || !id[0]) {
+            s_panel->disarm_all();
+            return;
+        }
+        const int p = alarm_cfg_profile(*s_cfg, id);
+        if (p < 0) r = AlarmReply::NO_PROFILE;
+        else s_panel->disarm(static_cast<uint8_t>(p));
+    });
     return r;
 }
 
-void alarm_disarm() {
-    act(false, [] { s_core->disarm(); });
+AlarmReply alarm_silence(const char* id) {
+    AlarmReply r = AlarmReply::NO_PROFILE;
+    act([&] {
+        const int p = alarm_cfg_profile(*s_cfg, id);
+        if (p < 0) return;
+        s_panel->silence(static_cast<uint8_t>(p));
+        r = AlarmReply::OK;
+    });
+    return r;
 }
 
 bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
-    auto* next = new (std::nothrow) AlarmConfig();
-    auto* dev  = new (std::nothrow) ZapDevice();
-    char* buf  = static_cast<char*>(heap_caps_malloc(kCfgJsonMax, MALLOC_CAP_SPIRAM));
-    bool ok = next && dev && buf;
+    auto* next  = new (std::nothrow) AlarmConfig();
+    auto* panel = next ? new (std::nothrow) AlarmPanel(next) : nullptr;
+    auto* dev   = new (std::nothrow) ZapDevice();
+    auto* seeds = static_cast<Seed*>(heap_caps_malloc(kAlarmMaxSensors * sizeof(Seed), MALLOC_CAP_SPIRAM));
+    char* buf   = static_cast<char*>(heap_caps_malloc(kAlarmStoredMax, MALLOC_CAP_SPIRAM));
+    bool ok = panel && dev && seeds && buf;
     if (!ok) std::snprintf(err, cap, "out of memory");
     if (ok) {
         Lock l;   // the stored codes are read while parsing
-        ok = alarm_cfg_from_json(json, len, s_cfg, next, err, cap);
-    }
-    // Every entry is a device on this hub; a sensor has something to watch.
-    auto known = [&](const char* list, unsigned i, uint64_t ieee) {
-        if (ieee != kAlarmIeee && zigbee_pool_snapshot(ieee, dev) && !zap_dev_is_removed(dev)) return true;
-        char id[19];
-        ieee_str(ieee, id);
-        std::snprintf(err, cap, "%s[%u]: %s is not a device on this hub", list, i, id);
-        return false;
-    };
-    for (uint8_t i = 0; ok && i < next->n_sensors; i++) {
-        ok = known("sensors", i, next->sensors[i].ieee);
-        if (!ok) break;
-        const size_t n = zhac_adapter_build_exposes_json(dev->ieee_addr, dev->model_id, dev->manufacturer_name,
-                                                         buf, kCfgJsonMax);
-        buf[n < kCfgJsonMax ? n : 0] = '\0';
-        ok = std::strstr(buf, "\"name\":\"contact\"") || std::strstr(buf, "\"name\":\"occupancy\"") ||
-             std::strstr(buf, "\"name\":\"presence\"") || std::strstr(buf, "\"name\":\"vibration\"");
-        if (!ok) std::snprintf(err, cap, "sensors[%u]: %s has no contact, occupancy, presence or vibration", i,
-                               dev->friendly_name);
-    }
-    // A siren needs something settable for its kind: a smoke sensor's `alarm` is only a reading.
-    for (uint8_t i = 0; ok && i < next->n_sirens; i++) {
-        ok = known("sirens", i, next->sirens[i].ieee);
-        if (!ok) break;
-        const size_t n = zhac_adapter_build_exposes_json(dev->ieee_addr, dev->model_id, dev->manufacturer_name,
-                                                         buf, kCfgJsonMax);
-        if (const char* why = alarm_siren_misfit(next->sirens[i].kind, buf, n < kCfgJsonMax ? n : 0)) {
-            std::snprintf(err, cap, "sirens[%u]: %s %s", i, dev->friendly_name, why);
+        // First: no edit meets a running timer or a sounding output.
+        ok = !s_panel->running();
+        if (!ok) std::snprintf(err, cap, "an alarm is running: disarm or wait, then save");
+        else ok = alarm_cfg_from_json(json, len, s_cfg, next, err, cap);
+        // A profile that keeps its id keeps its class: the summary, the outputs' order and the user's rules hang on it.
+        for (uint8_t i = 0; ok && i < next->n_profiles; i++) {
+            const int was = alarm_cfg_profile(*s_cfg, next->profiles[i].id);
+            if (was < 0 || s_cfg->profiles[was].cls == next->profiles[i].cls) continue;
+            std::snprintf(err, cap, "profiles[%u]: the class of a saved profile cannot change", i);
             ok = false;
         }
     }
-    for (uint8_t i = 0; ok && i < next->n_keypads; i++) ok = known("keypads", i, next->keypads[i].ieee);
-    if (ok) {
-        const size_t n = alarm_cfg_to_json(*next, true, buf, kCfgJsonMax);
-        ok = n && nvs_put("cfg", buf, n);
+    // Every entry is a device on this hub; a sensor has something to watch, an output something to set.
+    char where[48];
+    auto known = [&](uint64_t ieee) {
+        if (ieee != kAlarmIeee && zigbee_pool_snapshot(ieee, dev) && !zap_dev_is_removed(dev)) return true;
+        char id[19];
+        ieee_str(ieee, id);
+        std::snprintf(err, cap, "%s: %s is not a device on this hub", where, id);
+        return false;
+    };
+    auto exposes = [&] {   // of `dev`, into buf
+        const size_t n = zhac_adapter_build_exposes_json(dev->ieee_addr, dev->model_id, dev->manufacturer_name, buf, kAlarmStoredMax);
+        return n < kAlarmStoredMax ? n : 0;
+    };
+    for (uint8_t k = 0; ok && k < next->n_sensors; k++) {
+        // Where the page has it: its first profile, and its place among that profile's sensors.
+        const uint8_t in = next->sensors[k].profiles;
+        const unsigned i = in ? static_cast<unsigned>(__builtin_ctz(in)) : 0;
+        unsigned j = 0;
+        for (uint8_t s = 0; s < k; s++) j += next->sensors[s].profiles >> i & 1;
+        std::snprintf(where, sizeof(where), "profiles[%u].sensors[%u]", i, j);
+        ok = known(next->sensors[k].ieee);
+        if (ok && !has_sensor_key(buf, exposes())) {
+            std::snprintf(err, cap, "%s: %s has no contact, occupancy, presence, vibration, water_leak, smoke, gas or carbon_monoxide",
+                          where, dev->friendly_name);
+            ok = false;
+        }
+    }
+    unsigned place = 0;   // of an output in its profile: they are grouped by profile, each group in the listed order
+    for (uint8_t k = 0; ok && k < next->n_outputs; k++) {
+        const AlarmOutput& o = next->outputs[k];
+        place = k && next->outputs[k - 1].profile == o.profile ? place + 1 : 0;
+        std::snprintf(where, sizeof(where), "profiles[%u].outputs[%u]", o.profile, place);
+        ok = known(o.ieee);
+        if (!ok) break;
+        // A smoke sensor's `alarm` is only a reading: the device needs something settable for the kind.
+        if (const char* why = alarm_output_misfit(o.kind, buf, exposes())) {
+            std::snprintf(err, cap, "%s: %s %s", where, dev->friendly_name, why);
+            ok = false;
+        }
+    }
+    for (uint8_t i = 0; ok && i < next->n_keypads; i++) {
+        std::snprintf(where, sizeof(where), "keypads[%u]", i);
+        ok = known(next->keypads[i].ieee);
+    }
+    if (ok) {   // "cfg2" only: the stage 1 "cfg" stays as it is, for a hub that falls back to that firmware
+        const size_t n = alarm_cfg_pack(*next, buf, kAlarmStoredMax);
+        ok = n && nvs_put("cfg2", buf, n);
         if (!ok) std::snprintf(err, cap, "could not save the config");
+        else ESP_LOGI(TAG, "config saved: %u profile(s), %u sensor(s), %u output(s), %u keypad(s), %u code(s)", next->n_profiles,
+                      next->n_sensors, next->n_outputs, next->n_keypads, next->n_codes);
     }
     if (ok) {
-        int8_t seed[kAlarmMaxSensors];
-        for (uint8_t i = 0; i < next->n_sensors; i++) seed[i] = contact_now(next->sensors[i].ieee);
-        Lock l;
-        *s_cfg = *next;
-        std::memcpy(s_contact, seed, sizeof(seed));
-        std::memset(s_pad, 0, sizeof(s_pad));
-        ESP_LOGI(TAG, "config saved: %u sensor(s), %u siren(s), %u keypad(s), %u code(s)", s_cfg->n_sensors,
-                 s_cfg->n_sirens, s_cfg->n_keypads, s_cfg->n_codes);
+        for (uint8_t i = 0; i < next->n_sensors; i++) seeds[i].ieee = next->sensors[i].ieee;
+        read_seeds(seeds, next->n_sensors);
+        const uint32_t now = mono_s();
+        {
+            Lock l;
+            // The new panel: every sensor's last value from the shadow, then what the old panel knows better
+            // (states and counters by profile id, last values and bypass by ieee).
+            apply_seeds(panel, *next, seeds, next->n_sensors);
+            panel->adopt(*s_panel, *s_cfg);
+            AlarmSeen seen[kAlarmMaxProfiles] = {};
+            uint32_t since[kAlarmMaxProfiles] = {};
+            uint8_t sounding = 0;
+            bool ids = next->n_profiles != s_cfg->n_profiles;
+            for (uint8_t i = 0; i < next->n_profiles; i++) {
+                const int j = alarm_cfg_profile(*s_cfg, next->profiles[i].id);
+                ids = ids || j != i;   // another list or another order (a class never changes: refused above)
+                if (j < 0) {
+                    // A new profile that is not intrusion guards at once, like any arm without force: the arm
+                    // delay runs, and an open contact leaves it disarmed.
+                    if (next->profiles[i].cls != AlarmClass::INTRUSION) panel->arm(i, false, now, nullptr);
+                    continue;
+                }
+                seen[i]  = s_seen[j];
+                since[i] = s_since[j];
+                if (s_boot_sounding >> j & 1) sounding |= static_cast<uint8_t>(1u << i);
+            }
+            // An output that still follows an alarm (a disarm the task has not acted on yet, or an alarm that began
+            // while the devices were checked) is stopped by its old entry; the new plan then starts what still sounds.
+            for (int8_t& k : s_follows) {
+                if (k >= 0 && !s_cfg->outputs[k].keep && s_n_orphans < kAlarmMaxOutputs)
+                    s_orphans[s_n_orphans++] = {s_cfg->outputs[k].ieee, s_cfg->outputs[k].kind, s_cfg->outputs[k].value};
+                k = -1;
+            }
+            for (uint8_t i = 0; i < kAlarmMaxProfiles; i++) {
+                s_seen[i]  = seen[i];
+                s_since[i] = since[i];
+            }
+            std::memset(s_pad, 0, sizeof(s_pad));
+            s_boot_sounding = sounding;
+            s_resync        = true;
+            s_ids_changed   = s_ids_changed || ids;
+            std::swap(s_cfg, next);   // `next` and `panel` now hold the old ones, freed below
+            std::swap(s_panel, panel);
+        }
+        wake();   // the task saves the states, publishes the attributes and announces the device
     }
     heap_caps_free(buf);
+    heap_caps_free(seeds);
     delete dev;
+    delete panel;
     delete next;
     return ok;
 }
 
 void alarm_status_json(JsonObject o) {
-    AlarmState st;
-    AlarmMode m;
-    uint64_t cause, byp[kAlarmMaxSensors];
-    uint32_t deadline, since;
-    uint8_t nb;
+    uint64_t cause[kAlarmMaxProfiles] = {}, top = 0;
+    char id[19];
+    JsonArray list;
+    const uint32_t now = mono_s();
     {
         Lock l;
-        st = s_core->state();
-        m = s_core->mode();
-        cause = s_core->cause();
-        deadline = s_core->deadline();
-        since = s_since;
-        nb = s_core->bypass_count();
-        for (uint8_t i = 0; i < nb; i++) byp[i] = s_core->bypass_at(i);
+        char summary[kSummaryMax];
+        alarm_summary_name(*s_cfg, *s_panel, summary, sizeof(summary));
+        o["state"] = static_cast<const char*>(summary);
+        list = o["profiles"].to<JsonArray>();
+        for (uint8_t i = 0; i < s_cfg->n_profiles; i++) {
+            const AlarmProfile& p = s_cfg->profiles[i];
+            const AlarmProfileStatus& st = s_panel->at(i);
+            JsonObject j = list.add<JsonObject>();
+            j["id"]    = static_cast<const char*>(p.id);   // a copy: the array would be kept by pointer
+            j["name"]  = static_cast<const char*>(p.name);
+            j["class"] = kClassNames[static_cast<size_t>(p.cls)];
+            j["state"] = alarm_state_name(st.state);
+            j["since"] = s_since[i];
+            if (st.state != AlarmState::DISARMED && st.state != AlarmState::ARMED) j["left"] = st.deadline > now ? st.deadline - now : 0;
+            if ((st.state == AlarmState::PENDING || st.state == AlarmState::TRIGGERED) && st.cause) {
+                cause[i] = st.cause;
+                ieee_str(st.cause, id);
+                j["cause"] = static_cast<const char*>(id);
+            }
+            JsonArray b = j["bypassed"].to<JsonArray>();
+            for (uint8_t slot = 0; slot < s_cfg->n_sensors; slot++) {
+                if (!(st.bypass >> slot & 1)) continue;
+                ieee_str(s_cfg->sensors[slot].ieee, id);
+                b.add(static_cast<const char*>(id));
+            }
+        }
+        if (const int sp = s_panel->summary_profile(); sp >= 0) top = cause[sp];
     }
-    o["state"] = alarm_state_name(st);
-    o["mode"]  = alarm_mode_name(m);
-    o["since"] = since;
-    if (st == AlarmState::ARMING || st == AlarmState::PENDING || st == AlarmState::TRIGGERED) {
-        const uint32_t now = mono_s();
-        o["left"] = deadline > now ? deadline - now : 0;
-    }
-    char id[19];
-    if (cause) {
-        char name[32];
-        ieee_str(cause, id);
-        name_of(cause, name);
-        o["cause"]  = static_cast<const char*>(id);
+    // The names come from the device pool: never under s_mu.
+    char name[32];
+    if (top) {
+        name_of(top, name);
         o["sensor"] = static_cast<const char*>(name);
     }
-    JsonArray b = o["bypassed"].to<JsonArray>();
-    for (uint8_t i = 0; i < nb; i++) {
-        ieee_str(byp[i], id);
-        b.add(static_cast<const char*>(id));
+    for (uint8_t i = 0; i < kAlarmMaxProfiles; i++) {
+        if (!cause[i]) continue;
+        name_of(cause[i], name);
+        list[i]["sensor"] = static_cast<const char*>(name);
     }
 }
 
