@@ -95,16 +95,20 @@ bool bool_field(JsonObjectConst o, const char* key, bool* out) {
     return true;
 }
 
-// A string field that fits `cap` (NUL included), without control characters (each takes 6 bytes in the stored form,
-// and the largest config must fit 8 KB there); absent leaves `out` empty.
+// A string field that fits `cap` (NUL included): UTF-8 (replies carry it as it is, and a text frame that is not UTF-8
+// is dropped), without control characters (each takes 6 bytes in the stored form, and the largest config must fit
+// 8 KB there); absent leaves `out` empty.
 bool str_field(JsonObjectConst o, const char* key, char* out, size_t cap) {
     JsonVariantConst v = o[key];
     out[0] = '\0';
     if (v.isNull()) return true;
-    if (!v.is<const char*>() || std::strlen(v.as<const char*>()) >= cap) return false;
-    for (const char* p = v.as<const char*>(); *p; p++)
+    if (!v.is<const char*>()) return false;
+    const char* s = v.as<const char*>();
+    const size_t n = std::strlen(s);
+    if (n >= cap || !utf8_valid(s, n)) return false;
+    for (const char* p = s; *p; p++)
         if (static_cast<unsigned char>(*p) < 0x20 || *p == 0x7F) return false;
-    std::snprintf(out, cap, "%s", v.as<const char*>());
+    std::snprintf(out, cap, "%s", s);
     return true;
 }
 
@@ -150,9 +154,9 @@ bool parse_output(JsonObjectConst o, const char* where, bool stage1, uint8_t pro
         if (!bool_field(o, "strobe", &s.strobe)) return fail(err, cap, "%s: strobe must be true or false", where);
     } else if (s.kind == AlarmOutKind::ALARM) {
         if (!str_field(o, "melody", s.melody, sizeof(s.melody)))
-            return fail(err, cap, "%s: melody must be plain text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+            return fail(err, cap, "%s: melody must be plain text of up to %u bytes", where, static_cast<unsigned>(kAlarmEnumMax - 1));
         if (!str_field(o, "volume", s.volume, sizeof(s.volume)))
-            return fail(err, cap, "%s: volume must be plain text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+            return fail(err, cap, "%s: volume must be plain text of up to %u bytes", where, static_cast<unsigned>(kAlarmEnumMax - 1));
     } else {
         s.value = true;
     }
@@ -530,16 +534,27 @@ bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* 
     return false;
 }
 
-bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
-                         ArduinoJson::Allocator* pool) {
+static bool cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
+                          ArduinoJson::Allocator* pool, bool stage1) {
     err[0] = '\0';
     JsonDocument doc = pool ? JsonDocument(pool) : JsonDocument();
     if (!json || deserializeJson(doc, json, len) || !doc.is<JsonObjectConst>()) return fail(err, cap, "the config must be a JSON object");
     JsonObjectConst root = doc.as<JsonObjectConst>();
+    // Before `out` is touched: a body without its profiles changes nothing.
+    if (!stage1 && !root["profiles"].is<JsonArrayConst>()) return fail(err, cap, "profiles must be a list");
     // The defaults, in place: a config is ~4.4 KB, too much for a boot-time stack.
     AlarmConfig& c = *new (out) AlarmConfig();
     return (root["profiles"].isNull() ? parse_stage1(root, &c, err, cap) : parse_profiles(root, &c, err, cap)) &&
            parse_keypads(root, &c, err, cap) && parse_codes(root, keep, &c, err, cap);
+}
+
+bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
+                         ArduinoJson::Allocator* pool) {
+    return cfg_from_json(json, len, keep, out, err, cap, pool, false);
+}
+
+bool alarm_cfg_from_stage1(const char* json, size_t len, AlarmConfig* out, char* err, size_t cap, ArduinoJson::Allocator* pool) {
+    return cfg_from_json(json, len, nullptr, out, err, cap, pool, true);
 }
 
 void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject doc) {
@@ -724,14 +739,25 @@ bool alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out, ArduinoJso
 }
 
 size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap, const uint8_t* st) {
+    AlarmState state[kAlarmMaxProfiles];
+    bool rests[kAlarmMaxProfiles];
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        state[i] = p.at(i).state;
+        rests[i] = p.rests_armed(i);
+    }
+    return alarm_states_pack(c.profiles, state, rests, c.n_profiles, buf, cap, st);
+}
+
+size_t alarm_states_pack(const AlarmProfile* prof, const AlarmState* state, const bool* rests, uint8_t n, char* buf, size_t cap,
+                         const uint8_t* st) {
     Appender w{buf, cap};
     w.f("{\"v\":1,");
     if (st) w.f("\"l\":[%u,%u],", static_cast<unsigned>(st[0]), static_cast<unsigned>(st[1]));
     w.f("\"p\":[");
-    for (uint8_t i = 0; i < c.n_profiles; i++) {
+    for (uint8_t i = 0; i < n; i++) {
         w.f("%s[", i ? "," : "");
-        w.str(c.profiles[i].id);
-        w.f(",%u,%u]", static_cast<unsigned>(p.at(i).state), static_cast<unsigned>(p.rests_armed(i)));
+        w.str(prof[i].id);
+        w.f(",%u,%u]", static_cast<unsigned>(state[i]), static_cast<unsigned>(rests[i]));
     }
     w.f("]}");
     return w.length();
@@ -842,27 +868,35 @@ const char* alarm_output_misfit(AlarmOutKind kind, const char* exposes, size_t l
 
 bool AlarmPanel::intrusion(uint8_t p) const { return cfg_->profiles[p].cls == AlarmClass::INTRUSION; }
 
-bool AlarmPanel::remember(uint8_t slot, AlarmKey key, bool active) {
+bool AlarmPanel::remember(uint8_t slot, AlarmKey key, bool active, bool* changed) {
     Last& l = last_[slot];
+    *changed = false;
     if (key == AlarmKey::MOTION) return active;   // every report counts, nothing kept
     if (key == AlarmKey::CONTACT) {
+        const Contact now = active ? Contact::OPEN : Contact::CLOSED;
         const bool was = l.contact == Contact::OPEN;
-        l.contact = active ? Contact::OPEN : Contact::CLOSED;
+        *changed = l.contact != now;
+        l.contact = now;
         return active && !was;
     }
     const uint8_t bit = static_cast<uint8_t>(1u << (static_cast<uint8_t>(key) - static_cast<uint8_t>(AlarmKey::WATER_LEAK)));
     const bool was = l.hazards & bit;
+    *changed = was != active;
     l.hazards = active ? (l.hazards | bit) : (l.hazards & ~bit);
     return active && !was;
 }
 
 void AlarmPanel::seed(uint8_t slot, AlarmKey key, bool active) {
-    if (slot < cfg_->n_sensors) remember(slot, key, active);
+    bool changed;
+    if (slot < cfg_->n_sensors) remember(slot, key, active, &changed);
 }
 
-void AlarmPanel::sensor(uint8_t slot, AlarmKey key, bool active, uint32_t now) {
-    if (slot >= cfg_->n_sensors || !remember(slot, key, active)) return;
-    for (uint8_t i = 0; i < cfg_->n_profiles; i++) go_off(i, slot, now);
+bool AlarmPanel::sensor(uint8_t slot, AlarmKey key, bool active, uint32_t now) {
+    bool changed = false;
+    if (slot >= cfg_->n_sensors) return false;
+    if (remember(slot, key, active, &changed))
+        for (uint8_t i = 0; i < cfg_->n_profiles; i++) go_off(i, slot, now);
+    return changed;
 }
 
 // Sensor `slot` went off in profile `p` (if it is in it and not bypassed).

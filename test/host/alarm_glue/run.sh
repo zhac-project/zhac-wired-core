@@ -31,7 +31,7 @@ case "${MUTANT:-}" in
     "") ;;
     cfg_overwritten) mutate 's/nvs_put("cfg2", buf, n)/nvs_put("cfg", buf, n)/' ;;                     # the stage 1 config is rewritten
     no_orphans)      mutate 's/if (k >= 0 && !s_cfg->outputs\[k\].keep && s_n_orphans < kAlarmMaxOutputs)/if (false)/' ;;   # a save forgets what still sounds
-    no_keep_follow)  mutate 's/for (uint8_t k = 0; p.ch\[i\].alarm && k < s_cfg->n_outputs; k++) {/for (uint8_t k = 0; false \&\& k < s_cfg->n_outputs; k++) {/' ;;   # a collapsed alarm closes no valve
+    no_keep_follow)  mutate 's/for (uint8_t k = 0; kept && k < s_cfg->n_outputs; k++) {/for (uint8_t k = 0; false \&\& k < s_cfg->n_outputs; k++) {/' ;;   # a collapsed alarm closes no valve
     st_ignored)      mutate 's/s_st_have ? s_st_saved : nullptr, \*s_cfg, s_panel/nullptr, *s_cfg, s_panel/' ;;   # a newer stage 1 state is not read at boot
     *) echo "unknown MUTANT" >&2; exit 98 ;;
 esac

@@ -14,11 +14,13 @@ enum { NVS_READONLY, NVS_READWRITE };
 extern std::map<std::string, std::string> g_nvs;      // key -> blob (namespace "alarm" only)
 extern bool                               g_nvs_fail;       // every write fails
 extern std::string                        g_nvs_fail_key;   // writes of this key fail
+extern void (*g_nvs_hook)(const char* key);                 // run inside each write that lands: what happens while it waits
 inline esp_err_t nvs_open(const char* ns, int, nvs_handle_t* h) { OUTSIDE_LOCK("nvs_open"); *h = 1; return std::strcmp(ns, "alarm") == 0 ? ESP_OK : ESP_FAIL; }
 inline esp_err_t nvs_set_blob(nvs_handle_t, const char* k, const void* d, size_t n) {
     if (g_nvs_fail || g_nvs_fail_key == k) return ESP_FAIL;
     g_nvs[k] = std::string(static_cast<const char*>(d), n);
     g_trace.push_back(std::string("nvs:") + k);
+    if (g_nvs_hook) g_nvs_hook(k);
     return ESP_OK;
 }
 inline esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }

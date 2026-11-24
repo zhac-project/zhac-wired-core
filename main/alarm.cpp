@@ -172,11 +172,14 @@ void wake() {
     if (s_task) xTaskNotifyGive(s_task);
 }
 
-// Run `f` on the panel under the lock, then let the task look at what it did.
+// Run `f` on the panel under the lock, then let the task look at what it did. Time moves the panel first: an input
+// meets the panel of now, not of the task's last look (an arm delay that ran out while an output blocked is armed).
 template <typename F>
 void act(F&& f) {
+    const uint32_t now = mono_s();
     {
         Lock l;
+        s_panel->tick(now);
         f();
     }
     wake();
@@ -353,6 +356,7 @@ struct Pass {
     bool         panic[kAlarmMaxProfiles];   // by change: the alarm came from a keypad, not from a sensor
     AlarmProfile prof[kAlarmMaxProfiles];    // the profiles and their states as of this look
     AlarmState   state[kAlarmMaxProfiles];
+    bool         rests[kAlarmMaxProfiles];   // ... and where a restart comes back to (rests_armed)
     char         summary[kSummaryMax];
     uint64_t     summary_cause;              // the device behind the summary's pending or triggered, else 0
     char         events[kEventsMax][kAlarmEventMax];
@@ -387,6 +391,7 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     for (uint8_t i = 0; i < p.n_prof; i++) {
         p.prof[i]  = s_cfg->profiles[i];
         p.state[i] = s_panel->at(i).state;
+        p.rests[i] = s_panel->rests_armed(i);
     }
     for (uint8_t i = 0; i < p.n_ch; i++) {
         const AlarmChange& c = p.ch[i];
@@ -404,33 +409,41 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     std::memcpy(p.orphans, s_orphans, s_n_orphans * sizeof(Orphan));
     s_n_orphans = 0;
     p.n_act = 0;
+    // The profiles with a new alarm since the last look. Their outputs start again also when they follow that profile
+    // already: a siren was told the time of the alarm before (silenced and set off again inside one busy pass, or a
+    // panic's end in the arm delay that sets off a hazard still on, in one tick).
+    uint8_t alarmed = 0;
+    for (uint8_t i = 0; i < p.n_ch; i++) if (p.ch[i].alarm) alarmed |= static_cast<uint8_t>(1u << p.ch[i].profile);
     const uint8_t n = alarm_drive_plan(*s_cfg, *s_panel, now, plan);
     for (uint8_t e = 0; e < n; e++) {
         int8_t was = s_follows[e];
         for (uint8_t k = 0; boot_stop && was < 0 && plan[e].output < 0 && k < s_cfg->n_outputs; k++)
             if (s_cfg->outputs[k].ieee == plan[e].ieee && (s_boot_sounding >> s_cfg->outputs[k].profile & 1)) was = static_cast<int8_t>(k);
-        const AlarmOutAct a = alarm_output_step(*s_cfg, was, plan[e].output);
+        AlarmOutAct a = alarm_output_step(*s_cfg, was, plan[e].output);
+        if (plan[e].output >= 0 && (alarmed >> s_cfg->outputs[plan[e].output].profile & 1)) a = AlarmOutAct::START;
         s_follows[e] = plan[e].output;
         if (a != AlarmOutAct::NONE) add_act(p, a == AlarmOutAct::START, static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was), plan[e].secs);
     }
-    if (boot_stop) s_boot_sounding = 0;
-    // An alarm that is over before the task looks (silenced inside one busy pass) still sets the outputs that are
-    // left as set: a valve closes for every leak alarm, however short. The other outputs follow the state of now.
-    for (uint8_t i = 0; i < p.n_ch; i++) {
-        for (uint8_t k = 0; p.ch[i].alarm && k < s_cfg->n_outputs; k++) {
-            const AlarmOutput& o = s_cfg->outputs[k];
-            if (o.profile != p.ch[i].profile || o.kind != AlarmOutKind::STATE || !o.keep) continue;
-            bool set = false;   // by the plan, in this pass
-            for (uint8_t a = 0; a < p.n_act; a++) set = set || (p.acts[a].on && p.acts[a].out.ieee == o.ieee);
-            if (!set) add_act(p, true, k, 0);
-        }
+    // The outputs left as set are set for every alarm, also one that is over before the task looks (silenced inside one
+    // busy pass: a valve closes for every leak alarm, however short), and again by the boot stop for what sounded at the
+    // restart: the states are saved before the outputs are set, so the restart may have come in between. It is the same
+    // command each time. The other outputs follow the state of now.
+    const uint8_t kept = alarmed | (boot_stop ? s_boot_sounding : 0);   // the profiles whose kept outputs are set
+    for (uint8_t k = 0; kept && k < s_cfg->n_outputs; k++) {
+        const AlarmOutput& o = s_cfg->outputs[k];
+        if (!(kept >> o.profile & 1) || o.kind != AlarmOutKind::STATE || !o.keep) continue;
+        bool set = false;   // by the plan, in this pass
+        for (uint8_t a = 0; a < p.n_act; a++) set = set || (p.acts[a].on && p.acts[a].out.ieee == o.ieee);
+        if (!set) add_act(p, true, k, 0);
     }
+    if (boot_stop) s_boot_sounding = 0;
 }
 
-// The stage 1 record ("st", which follows the intrusion profiles) and the states of all profiles ("st2"), each when
-// it differs from what flash holds. "st" goes first, and "st2" carries the "st" that flash holds then: a boot that
-// finds another "st" beside it knows the stage 1 firmware wrote that one since (alarm_states_restore). A write that
-// fails is logged and the change still takes effect; a failed "st" leaves the two agreeing.
+// The stage 1 record ("st", which follows the intrusion profiles) and the states of all profiles ("st2") as of the look,
+// each when it differs from what flash holds. "st" goes first, and "st2" carries the "st" that flash holds then: a boot
+// that finds another "st" beside it knows the stage 1 firmware wrote that one since (alarm_states_restore). Both
+// describe the one instant of the look: what happens while they are written is the next look's. A write that fails is
+// logged and the change still takes effect; a failed "st" leaves the two agreeing.
 void save_states(const Pass& p) {
     if (!s_st_have || std::memcmp(p.st, s_st_saved, sizeof(p.st)) != 0) {
         if (nvs_put("st", p.st, sizeof(p.st))) {
@@ -441,11 +454,7 @@ void save_states(const Pass& p) {
         }
     }
     static char st2[kStatesMax];
-    size_t len;
-    {
-        Lock l;   // the states of now: never older than the "st" just written
-        len = alarm_states_pack(*s_cfg, *s_panel, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
-    }
+    const size_t len = alarm_states_pack(p.prof, p.state, p.rests, p.n_prof, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
     if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) return;
     if (len && nvs_put("st2", st2, len)) {
         std::memcpy(s_st2_saved, st2, len);
@@ -579,6 +588,11 @@ void alarm_task(void*) {
                 stack_logged = true;
                 ESP_LOGI(TAG, "task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
+        } else if (!boot_alert_at) {
+            // Nothing new, and flash may still hold other states: a write that failed, steps the look did not see as a
+            // change (a disarm and an arm), a boot that read other records. Not in the minute after a restart during
+            // an alarm: its record waits for the boot stop.
+            save_states(p);
         }
         Refusal r;
         while (xQueueReceive(s_refused, &r, 0) == pdTRUE) tell_refused(r);
@@ -664,11 +678,16 @@ void on_attr(const Event& e) {
     if (alarm_key_parse(z.key, &key) && (z.val_type == VAL_BOOL || z.val_type == VAL_INT)) {
         const bool active = key_active(key, z.int_val);
         const uint32_t now = mono_s();
+        bool kept = false;
         act([&] {
             // The panel knows what counts: a contact that opens, a hazard that turns true, every motion report.
             const int slot = alarm_cfg_sensor(*s_cfg, z.ieee);
-            if (slot >= 0) s_panel->sensor(static_cast<uint8_t>(slot), key, active, now);
+            if (slot >= 0) kept = s_panel->sensor(static_cast<uint8_t>(slot), key, active, now);
         });
+        // A door's or a hazard's new value is what a restart seeds the panel with: to flash at the shadow's next
+        // sweep, not up to 30 minutes later, or a power cut brings back an "open" or a "wet" that is over and the
+        // next real one does not count. Motion keeps no value (a restart takes no "occupied" from flash).
+        if (kept) device_shadow_persist_soon(z.ieee);
     }
     on_keypad(z);
 }
@@ -774,7 +793,7 @@ void alarm_early_init() {
     if (!have) {
         if (const size_t len = buf ? nvs_get("cfg", buf, kAlarmStoredMax) : 0) {
             char err[96] = "";
-            have = alarm_cfg_from_json(buf, len, nullptr, s_cfg, err, sizeof(err), psram_json());
+            have = alarm_cfg_from_stage1(buf, len, s_cfg, err, sizeof(err), psram_json());
             if (!have) ESP_LOGE(TAG, "stage 1 config unreadable (%s): empty profiles this boot", err);
         }
     }
@@ -847,6 +866,10 @@ void alarm_attach_device() {
 
 void alarm_start() {
     static Seed seeds[kAlarmMaxSensors];   // app_main's stack is tight
+    // Subscribed first: a report that comes while the seeds are read is queued for the event pump, which app_main
+    // starts after this returns, so it lands after the seeds instead of between the read and the subscription, lost.
+    if (event_bus_subscribe(EventType::ZCL_ATTR, on_attr, attr_filter) == EVENT_SUB_INVALID)
+        ESP_LOGE(TAG, "not subscribed: sensors and keypads are not watched");
     uint8_t n;
     {
         Lock l;
@@ -858,8 +881,6 @@ void alarm_start() {
         Lock l;
         apply_seeds(s_panel, *s_cfg, seeds, n);
     }
-    if (event_bus_subscribe(EventType::ZCL_ATTR, on_attr, attr_filter) == EVENT_SUB_INVALID)
-        ESP_LOGE(TAG, "not subscribed: sensors and keypads are not watched");
     // Internal RAM (xTaskCreate): it writes NVS, so its stack cannot sit in PSRAM. Its first pass
     // publishes the Alarm device's attributes.
     if (xTaskCreate(alarm_task, "alarm", 8192, nullptr, 3, &s_task) != pdPASS)

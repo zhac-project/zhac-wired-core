@@ -84,13 +84,17 @@ int  alarm_cfg_role(const AlarmConfig& c, AlarmRole r);         // the intrusion
 int  alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee);     // slot, -1
 const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
 
-// The API form (alarm.config.set, alarm.get). An object without "profiles" is the stage 1 form and is converted.
-// "codes" left out keeps `keep`'s codes; "codes":[] clears them. False with the first problem in `err`.
-// `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack) and is partly filled on failure.
-// `pool`: where the parse takes its memory; null is the default allocator. The firmware gives PSRAM: the largest
-// config parses to tens of KB.
+// The API form (alarm.config.set, alarm.get). "profiles" must be a list: without one, the body is refused before
+// `out` is touched. "codes" left out keeps `keep`'s codes; "codes":[] clears them. False with the first problem in
+// `err`. `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack) and is partly filled
+// on any later failure. `pool`: where the parse takes its memory; null is the default allocator. The firmware gives
+// PSRAM: the largest config parses to tens of KB.
 bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
                          ArduinoJson::Allocator* pool = nullptr);
+// The stage 1 record ("cfg"), read at boot only: an object without "profiles" is the stage 1 form and is converted
+// (one with them reads as the API form). Otherwise as above, with no codes to keep.
+bool alarm_cfg_from_stage1(const char* json, size_t len, AlarmConfig* out, char* err, size_t cap,
+                           ArduinoJson::Allocator* pool = nullptr);
 void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject o);   // with_codes false: "codes_count"
 void alarm_cfg_defaults(AlarmConfig* out);                                   // a hub with no record: away, home, night
 
@@ -120,7 +124,9 @@ class AlarmPanel {
 public:
     explicit AlarmPanel(const AlarmConfig* cfg) : cfg_(cfg) {}
     void seed(uint8_t slot, AlarmKey key, bool active);                   // a last known value: never an event
-    void sensor(uint8_t slot, AlarmKey key, bool active, uint32_t now);   // a report; CONTACT: active = open
+    // A report; CONTACT: active = open. True when it changed the value kept for a contact or a hazard (motion keeps
+    // none): what a restart seeds the panel with, so the glue has the shadow write it to flash at once.
+    bool sensor(uint8_t slot, AlarmKey key, bool active, uint32_t now);
     // `open`: the profile's sensor slots whose contact is open now (set for OPEN and for a forced arm).
     // Arming an intrusion profile disarms the other intrusion profiles (not counted as disarms).
     AlarmArmResult arm(uint8_t profile, bool force, uint32_t now, uint64_t* open);
@@ -144,7 +150,7 @@ private:
     struct Last { Contact contact = Contact::UNKNOWN; uint8_t hazards = 0; };   // hazards: bit (key - WATER_LEAK)
 
     bool intrusion(uint8_t profile) const;
-    bool remember(uint8_t slot, AlarmKey key, bool active);   // true: the report counts
+    bool remember(uint8_t slot, AlarmKey key, bool active, bool* changed);   // true: the report counts
     void go_off(uint8_t profile, uint8_t slot, uint32_t now);
     void hazard_check(uint8_t profile, uint32_t now);
     void trigger(uint8_t profile, uint64_t cause, uint32_t now);
@@ -170,6 +176,9 @@ bool   alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out, ArduinoJ
 // The stored states ("st2"): {"v":1,"l":[state, resting],"p":[[id, state, rests_armed], ...]} for every profile.
 // "l" is the stage 1 record ("st") as flash holds it when this is written; left out when `st` is null.
 size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap, const uint8_t* st = nullptr);
+// The same from a copy (the alarm task's look): profile i is `prof[i].id`, in `state[i]`, resting armed when `rests[i]`.
+size_t alarm_states_pack(const AlarmProfile* prof, const AlarmState* state, const bool* rests, uint8_t n, char* buf, size_t cap,
+                         const uint8_t* st = nullptr);
 // Restores each profile named in the record that the config still has; a damaged record restores nothing. `in_alarm` /
 // `sounding`: bit i set when profile i was pending or triggered / triggered when the record was written.
 bool   alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);

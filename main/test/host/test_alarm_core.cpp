@@ -147,6 +147,18 @@ static void hazards() {
     CHECK(s.at(kFire).alarms == 2, "another hazard key of the same device going active is a new event");
 }
 
+// What sensor() reports as a change of a kept value: the glue then has the shadow write it to flash at once (review F1).
+static void kept_changes() {
+    AlarmConfig c = config(); AlarmPanel p(&c);
+    CHECK(p.sensor(sDoor, AlarmKey::CONTACT, true, 1) && !p.sensor(sDoor, AlarmKey::CONTACT, true, 2) &&
+          p.sensor(sDoor, AlarmKey::CONTACT, false, 3) && !p.sensor(sDoor, AlarmKey::CONTACT, false, 4),
+          "a contact: unknown to open and open to closed change it; the same again does not");
+    CHECK(p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 5) && !p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 6) &&
+          p.sensor(sLeak, AlarmKey::WATER_LEAK, false, 7), "a hazard: wet and dry change it; wet again does not");
+    CHECK(!p.sensor(sHall, AlarmKey::MOTION, true, 8) && !p.sensor(sHall, AlarmKey::MOTION, false, 9), "motion keeps nothing: never a change");
+    CHECK(!p.sensor(c.n_sensors, AlarmKey::CONTACT, true, 10), "not a sensor: nothing");
+}
+
 static void group() {
     AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0;
     p.arm(kHome, false, 0, &open); p.arm(kFlood, false, 0, &open);
@@ -275,6 +287,9 @@ static void siren_fit() {
 static bool parse(const char* j, AlarmConfig* c, char* err, size_t cap, const AlarmConfig* keep = nullptr) {
     return alarm_cfg_from_json(j, std::strlen(j), keep, c, err, cap);
 }
+static bool parse1(const char* j, AlarmConfig* c, char* err, size_t cap) {   // the stage 1 record, at boot
+    return alarm_cfg_from_stage1(j, std::strlen(j), c, err, cap);
+}
 // Two configs are the same when they write the same: struct padding does not count.
 static bool same(const AlarmConfig& a, const AlarmConfig& b) {
     static char x[32768], y[32768]; JsonDocument da, db;
@@ -357,6 +372,17 @@ static void config_errors() {
         "profiles[1].outputs[0]: the same switch has another value or another keep in a", "a valve another profile would reopen");
     bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x1","kind":"alarm","melody":"a\u0001b"}]}]})", "melody must be plain text",
         "a melody with a control character (it would not fit the stored form)");
+    // Not UTF-8: alarm.get and every reply carrying it would be text frames a browser drops (review F7). A lone surrogate
+    // gets here as raw bytes (ED A0 80, what a WTF-8 encoder sends); as an escape, ArduinoJson drops a lone high one
+    // and makes a lone low one U+10000, valid either way (checked below).
+    bad("{\"profiles\":[{\"id\":\"a\",\"name\":\"A\",\"class\":\"fire\",\"outputs\":[{\"ieee\":\"0x1\",\"kind\":\"alarm\",\"melody\":\"a\xED\xA0\x80\"}]}]}",
+        "melody must be plain text", "a melody with a lone surrogate (not UTF-8)");
+    bad("{\"profiles\":[{\"id\":\"a\",\"name\":\"A\",\"class\":\"fire\",\"outputs\":[{\"ieee\":\"0x1\",\"kind\":\"alarm\",\"volume\":\"\xC3\x28\"}]}]}",
+        "volume must be plain text", "a volume that is not UTF-8");
+    CHECK(parse(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x1","kind":"alarm","melody":"a\uD800b","volume":"\uDC00"}]}]})",
+                &c, err, sizeof(err)) &&
+          utf8_valid(c.outputs[0].melody, std::strlen(c.outputs[0].melody)) && utf8_valid(c.outputs[0].volume, std::strlen(c.outputs[0].volume)),
+          "lone surrogate escapes: what the parser makes of them is UTF-8, and kept");
     const std::string p1 = R"({"id":"a","name":"A","class":"fire",)", w = R"(,"kind":"warning")";
     bad((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(]},{"id":"b","name":"B","class":"gas","sensors":[)" + items(49, 1) + "]}]}").c_str(),
         "profiles[1].sensors[0]: more than 48 different sensors", "a 49th different sensor");
@@ -368,8 +394,22 @@ static void config_errors() {
     bad((five + "]}").c_str(), "profiles[4].outputs[0]: more than 32 outputs in all", "a 33rd output");
     static AlarmConfig big;
     CHECK(parse((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + "]}]}").c_str(), &big, err, sizeof(err)) && big.n_sensors == 48, "48 sensors are allowed");
-    bad(R"({"sensors":[{"ieee":"0x1","modes":["away"]},{"ieee":"0x1","modes":["home"]}]})", "sensors[1]: 0x0000000000000001 is listed twice", "stage 1: a sensor twice keeps its message");
-    bad(R"({"sirens":[{"ieee":"0x1","kind":"horn"}]})", "sirens[0]: kind must be warning, alarm or state", "stage 1: a siren kind keeps its message");
+    CHECK(!parse1(R"({"sensors":[{"ieee":"0x1","modes":["away"]},{"ieee":"0x1","modes":["home"]}]})", &c, err, sizeof(err)) &&
+          std::strstr(err, "sensors[1]: 0x0000000000000001 is listed twice"), "stage 1: a sensor twice keeps its message");
+    CHECK(!parse1(R"({"sirens":[{"ieee":"0x1","kind":"horn"}]})", &c, err, sizeof(err)) &&
+          std::strstr(err, "sirens[0]: kind must be warning, alarm or state"), "stage 1: a siren kind keeps its message");
+}
+// The API form must list its profiles: a body without them is not a stage 1 config to convert (review F6, W19).
+static void config_needs_profiles() {
+    static AlarmConfig c, before; char err[160];
+    CHECK(parse(R"({"profiles":[{"id":"flood","name":"Flood","class":"water","sensors":[{"ieee":"0x3"}]}],"codes":["1234"]})",
+                &c, err, sizeof(err)), "a config to keep");
+    std::memcpy(static_cast<void*>(&before), &c, sizeof(c));
+    for (const char* j : {"{}", R"({"sensors":[{"ieee":"0x1","modes":["away"]}]})", R"({"profiles":null})", R"({"profiles":{}})"}) {
+        std::string what = std::string(j) + ": refused, the config unchanged";
+        const bool ok = parse(j, &c, err, sizeof(err), &before);
+        CHECK(!ok && std::strcmp(err, "profiles must be a list") == 0 && same(c, before), what.c_str());
+    }
 }
 static void stage1_config() {
     static AlarmConfig c; char err[160];
@@ -377,7 +417,7 @@ static void stage1_config() {
       "sensors":[{"ieee":"0x1","modes":["away","home","night"],"entry":true},{"ieee":"0x2","modes":["away"],"entry":false}],
       "sirens":[{"ieee":"0x5","kind":"warning","mode":"burglar","level":"very_high","strobe":false},{"ieee":"0x6","kind":"state"}],
       "keypads":[{"ieee":"0x10","trusted":false}],"codes":["4321"]})";
-    CHECK(parse(old, &c, err, sizeof(err)), "a stage 1 config loads");
+    CHECK(parse1(old, &c, err, sizeof(err)), "a stage 1 config loads");
     CHECK(c.n_profiles == 3 && std::strcmp(c.profiles[0].id, "away") == 0 && std::strcmp(c.profiles[1].id, "home") == 0 &&
           std::strcmp(c.profiles[2].id, "night") == 0 && std::strcmp(c.profiles[2].name, "Night") == 0, "as away, home, night");
     CHECK(c.profiles[0].arm_delay == 45 && c.profiles[1].arm_delay == 0 && c.profiles[2].arm_delay == 0, "the exit delay is away's");
@@ -388,9 +428,9 @@ static void stage1_config() {
           std::strcmp(c.outputs[4].wd_level, "very_high") == 0 && !c.outputs[4].strobe &&
           c.outputs[1].kind == AlarmOutKind::STATE && c.outputs[1].value && !c.outputs[1].keep, "each siren sounds in all three");
     CHECK(c.n_keypads == 1 && c.n_codes == 1 && std::strcmp(c.codes[0], "4321") == 0, "keypads and codes carry over");
-    CHECK(parse(largest_stage1().c_str(), &c, err, sizeof(err)) && c.n_sensors == 48 && c.n_outputs == 24 &&
+    CHECK(parse1(largest_stage1().c_str(), &c, err, sizeof(err)) && c.n_sensors == 48 && c.n_outputs == 24 &&
           c.sensors[47].profiles == 0x07, "the largest stage 1 config loads whole");
-    CHECK(parse("{}", &c, err, sizeof(err)) && c.n_profiles == 3 && c.profiles[0].arm_delay == 30, "an empty stage 1 config is the defaults");
+    CHECK(parse1("{}", &c, err, sizeof(err)) && c.n_profiles == 3 && c.profiles[0].arm_delay == 30, "an empty stage 1 config is the defaults");
 }
 
 // ── What goes to flash ──
@@ -760,6 +800,7 @@ int main() {
     arming_rules();
     edges();
     hazards();
+    kept_changes();
     group();
     silence_and_disarm_all();
     panic_and_restore();
@@ -769,6 +810,7 @@ int main() {
     siren_fit();
     config_json();
     config_errors();
+    config_needs_profiles();
     stage1_config();
     stored_config();
     stored_config_shape();
