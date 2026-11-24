@@ -65,6 +65,7 @@ uint32_t     s_since = 0;        // wall clock of the last change; 0 while the c
 QueueHandle_t s_q = nullptr;     // Change, to the task
 TaskHandle_t  s_task = nullptr;
 bool          s_boot_alert = false;   // restarted during pending or triggered
+bool          s_boot_sirens = false;  // restarted while the sirens sounded
 uint8_t       s_saved[2] = {0xFF, 0xFF};   // the state record last written
 
 struct Change {
@@ -341,6 +342,14 @@ void alarm_task(void*) {
         if (boot_alert_at && now >= boot_alert_at) {
             boot_alert_at = 0;
             notify("alarm", 0, "The hub restarted during an alarm", "Alarm: the hub restarted during an alarm");
+            // The panel came back armed, but a switch siren has no duration of its own: stop what the
+            // alarm before the restart started, unless a new alarm sounds them by now.
+            bool on;
+            {
+                Lock l;
+                on = s_core->state() == AlarmState::TRIGGERED;
+            }
+            if (s_boot_sirens && !on) sirens(false);
         }
         if (now >= next_seen) {
             next_seen = now + 60;
@@ -500,6 +509,7 @@ void alarm_early_init() {
     uint8_t st[2];
     if (nvs_get("st", st, sizeof(st)) == sizeof(st) && st[1] <= static_cast<uint8_t>(AlarmState::TRIGGERED)) {
         s_core->restore(static_cast<AlarmState>(st[1]));
+        s_boot_sirens = st[0] == static_cast<uint8_t>(AlarmState::TRIGGERED);
         s_boot_alert = st[0] == static_cast<uint8_t>(AlarmState::PENDING) ||
                        st[0] == static_cast<uint8_t>(AlarmState::TRIGGERED);
         std::memcpy(s_saved, st, sizeof(st));
