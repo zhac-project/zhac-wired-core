@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 static int g_fail = 0;
 #define CHECK(c, m) do { if (c) std::printf("PASS: %s\n", m); else { std::printf("FAIL: %s\n", m); g_fail++; } } while (0)
@@ -267,6 +268,127 @@ static void siren_fit() {
     CHECK(why && std::strstr(why, "alarm"), "the reason names what is missing");
 }
 
+// ── The config JSON ──
+
+static bool parse(const char* j, AlarmConfig* c, char* err, size_t cap, const AlarmConfig* keep = nullptr) {
+    return alarm_cfg_from_json(j, std::strlen(j), keep, c, err, cap);
+}
+// Two configs are the same when they write the same: struct padding does not count.
+static bool same(const AlarmConfig& a, const AlarmConfig& b) {
+    static char x[32768], y[32768]; JsonDocument da, db;
+    alarm_cfg_write(a, true, da.to<JsonObject>()); alarm_cfg_write(b, true, db.to<JsonObject>());
+    return serializeJson(da, x, sizeof(x)) && serializeJson(db, y, sizeof(y)) && std::strcmp(x, y) == 0;
+}
+// {"ieee":"0x<first>"},{"ieee":"0x<first+1>"}, ... `count` of them, numbered in hex; `extra` is put after each ieee,
+// e.g. ,"kind":"warning".
+static std::string items(unsigned first, unsigned count, const char* extra = "") {
+    std::string s;
+    for (unsigned i = 0; i < count; i++) {
+        char b[64]; std::snprintf(b, sizeof(b), "%s{\"ieee\":\"0x%X\"%s}", i ? "," : "", first + i, extra);
+        s += b;
+    }
+    return s;
+}
+// A stage 1 config with 48 sensors in away, home and night and 8 sirens of kind warning.
+static std::string largest_stage1() {
+    std::string s = R"({"sensors":[)";
+    for (unsigned i = 0; i < 48; i++) {
+        char b[96]; std::snprintf(b, sizeof(b), "%s{\"ieee\":\"0x%X\",\"modes\":[\"away\",\"home\",\"night\"]}", i ? "," : "", 1 + i);
+        s += b;
+    }
+    return s + R"(],"sirens":[)" + items(0x100, 8, R"(,"kind":"warning")") + "]}";
+}
+static void config_json() {
+    static AlarmConfig c, k; char err[160];
+    const char* j = R"({"profiles":[
+      {"id":"flood","name":"Flood","class":"water","siren_time":60,"notify_arm":true,
+       "sensors":[{"ieee":"0x00158D0001020304"}],
+       "outputs":[{"ieee":"0x00158D0005060708","kind":"state","value":"off","keep":true},
+                  {"ieee":"0x00158D00090A0B0C","kind":"warning","mode":"emergency"}]},
+      {"id":"night","name":"Ніч","class":"intrusion","role":"night","trigger_delay":20,
+       "sensors":[{"ieee":"0x00158D0001020304","entry":true},{"ieee":"0x1"}]}],
+     "keypads":[{"ieee":"0x10","trusted":true}],"codes":["1234"]})";
+    CHECK(parse(j, &c, err, sizeof(err)), "the API form parses");
+    CHECK(c.n_profiles == 2 && c.n_sensors == 2 && c.n_outputs == 2 && c.n_keypads == 1 && c.n_codes == 1, "counts");
+    CHECK(c.profiles[0].cls == AlarmClass::WATER && c.profiles[0].siren_time == 60 && c.profiles[0].arm_delay == 0 &&
+          c.profiles[0].notify_arm && c.profiles[1].role == AlarmRole::NIGHT && c.profiles[1].siren_time == 180, "fields and defaults");
+    CHECK(c.sensors[0].profiles == 0x03 && c.sensors[0].entry == 0x02 && c.sensors[1].profiles == 0x02, "a sensor once, with its profiles and its delays");
+    CHECK(c.outputs[0].profile == 0 && c.outputs[0].kind == AlarmOutKind::STATE && !c.outputs[0].value && c.outputs[0].keep, "a valve");
+    CHECK(std::strcmp(c.outputs[1].wd_mode, "emergency") == 0 && std::strcmp(c.outputs[1].wd_level, "high") == 0 && c.outputs[1].strobe, "siren defaults");
+    JsonDocument d; alarm_cfg_write(c, true, d.to<JsonObject>());
+    char buf[2048]; serializeJson(d, buf, sizeof(buf));
+    CHECK(parse(buf, &k, err, sizeof(err)) && same(c, k) && k.sensors[0].entry == 0x02 && !k.outputs[0].value && k.outputs[0].keep,
+          "written and read back: the same config");
+    CHECK(std::strstr(buf, "\"role\":\"night\"") && !std::strstr(buf, "\"role\":\"\""), "role is written for intrusion profiles only");
+    JsonDocument e; alarm_cfg_write(c, false, e.to<JsonObject>());
+    CHECK(e["codes"].isNull() && e["codes_count"] == 1, "reads never carry the codes");
+    CHECK(parse(R"({"profiles":[]})", &k, err, sizeof(err), &c) && k.n_codes == 1 && k.n_profiles == 0, "codes left out are kept; no profile is allowed");
+    CHECK(parse(R"({"profiles":[],"codes":[]})", &k, err, sizeof(err), &c) && k.n_codes == 0, "an empty list clears the codes");
+    alarm_cfg_defaults(&k);
+    CHECK(k.n_profiles == 3 && std::strcmp(k.profiles[0].id, "away") == 0 && k.profiles[0].arm_delay == 30 &&
+          k.profiles[2].role == AlarmRole::NIGHT && k.profiles[2].arm_delay == 0 && k.profiles[1].trigger_delay == 30 && k.n_sensors == 0, "defaults");
+}
+static void config_errors() {
+    static AlarmConfig c; char err[160];
+    auto bad = [&](const char* j, const char* part, const char* what) {
+        const bool ok = parse(j, &c, err, sizeof(err));
+        CHECK(!ok && std::strstr(err, part), what);
+    };
+    bad(R"({"profiles":[{"id":"Away","name":"A","class":"intrusion"}]})", "id must be", "an id in capitals");
+    bad(R"({"profiles":[{"id":"abcdefghijklmn","name":"A","class":"fire"}]})", "id must be", "an id of 14 characters");
+    bad(R"({"profiles":[{"id":"armed","name":"A","class":"fire"}]})", "is reserved", "a state word as id");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire"},{"id":"a","name":"B","class":"gas"}]})", "profiles[1]: id a is taken", "an id twice");
+    bad(R"({"profiles":[{"id":"a","name":"","class":"fire"}]})", "name must be", "an empty name");
+    bad("{\"profiles\":[{\"id\":\"a\",\"name\":\"\xC3\x28\",\"class\":\"fire\"}]}", "name must be", "a name that is not UTF-8");
+    bad(R"({"profiles":[{"id":"a","name":"1234567890123456789012345","class":"fire"}]})", "name must be", "a name of 25 bytes");
+    bad(R"({"profiles":[{"id":"a","name":"A\nB","class":"fire"}]})", "name must be", "a name with a control character");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"burglary"}]})", "class must be", "an unknown class");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","role":"away"}]})", "role is", "a role outside intrusion");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"intrusion","role":"away"},{"id":"b","name":"B","class":"intrusion","role":"away"}]})",
+        "role away is taken by a", "a role twice");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","arm_delay":301}]})", "arm_delay must be 0-300", "an arm delay over the limit");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","siren_time":9}]})", "siren_time must be 10-1800", "a siren time under the limit");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","sensors":[{"ieee":"0x1"},{"ieee":"0x1"}]}]})", "sensors[1]: listed twice", "a sensor twice");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x1","kind":"warning","keep":true}]}]})", "for kind state", "keep on a siren");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"water","outputs":[{"ieee":"0x1","kind":"state","value":"off","keep":true}]},
+                        {"id":"b","name":"B","class":"fire","outputs":[{"ieee":"0x1","kind":"state","value":"off"}]}]})",
+        "profiles[1].outputs[0]: the same switch has another value or another keep in a", "a valve another profile would reopen");
+    const std::string p1 = R"({"id":"a","name":"A","class":"fire",)", w = R"(,"kind":"warning")";
+    bad((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(]},{"id":"b","name":"B","class":"gas","sensors":[)" + items(49, 1) + "]}]}").c_str(),
+        "profiles[1].sensors[0]: more than 48 different sensors", "a 49th different sensor");
+    bad((R"({"profiles":[)" + p1 + R"("outputs":[)" + items(1, 9, w.c_str()) + "]}]}").c_str(), "profiles[0].outputs: at most 8", "nine outputs in a profile");
+    std::string five = R"({"profiles":[)";
+    for (int i = 0; i < 5; i++)
+        five += std::string(i ? "," : "") + R"({"id":"p)" + char('a' + i) + R"(","name":"P","class":"other","outputs":[)" +
+                items(1 + 8 * i, i < 4 ? 8 : 1, w.c_str()) + "]}";
+    bad((five + "]}").c_str(), "profiles[4].outputs[0]: more than 32 outputs in all", "a 33rd output");
+    static AlarmConfig big;
+    CHECK(parse((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + "]}]}").c_str(), &big, err, sizeof(err)) && big.n_sensors == 48, "48 sensors are allowed");
+    bad(R"({"sensors":[{"ieee":"0x1","modes":["away"]},{"ieee":"0x1","modes":["home"]}]})", "sensors[1]: 0x0000000000000001 is listed twice", "stage 1: a sensor twice keeps its message");
+    bad(R"({"sirens":[{"ieee":"0x1","kind":"horn"}]})", "sirens[0]: kind must be warning, alarm or state", "stage 1: a siren kind keeps its message");
+}
+static void stage1_config() {
+    static AlarmConfig c; char err[160];
+    const char* old = R"({"exit_delay":45,"entry_delay":20,"siren_time":120,"notify_arm":true,
+      "sensors":[{"ieee":"0x1","modes":["away","home","night"],"entry":true},{"ieee":"0x2","modes":["away"],"entry":false}],
+      "sirens":[{"ieee":"0x5","kind":"warning","mode":"burglar","level":"very_high","strobe":false},{"ieee":"0x6","kind":"state"}],
+      "keypads":[{"ieee":"0x10","trusted":false}],"codes":["4321"]})";
+    CHECK(parse(old, &c, err, sizeof(err)), "a stage 1 config loads");
+    CHECK(c.n_profiles == 3 && std::strcmp(c.profiles[0].id, "away") == 0 && std::strcmp(c.profiles[1].id, "home") == 0 &&
+          std::strcmp(c.profiles[2].id, "night") == 0 && std::strcmp(c.profiles[2].name, "Night") == 0, "as away, home, night");
+    CHECK(c.profiles[0].arm_delay == 45 && c.profiles[1].arm_delay == 0 && c.profiles[2].arm_delay == 0, "the exit delay is away's");
+    CHECK(c.profiles[1].trigger_delay == 20 && c.profiles[2].siren_time == 120 && c.profiles[0].notify_arm && c.profiles[2].notify_arm &&
+          c.profiles[1].role == AlarmRole::HOME && c.profiles[0].cls == AlarmClass::INTRUSION, "the rest goes to all three");
+    CHECK(c.sensors[0].profiles == 0x07 && c.sensors[0].entry == 0x07 && c.sensors[1].profiles == 0x01 && c.sensors[1].entry == 0, "sensors keep their modes");
+    CHECK(c.n_outputs == 6 && c.outputs[0].profile == 0 && c.outputs[1].profile == 0 && c.outputs[2].profile == 1 && c.outputs[5].profile == 2 &&
+          std::strcmp(c.outputs[4].wd_level, "very_high") == 0 && !c.outputs[4].strobe &&
+          c.outputs[1].kind == AlarmOutKind::STATE && c.outputs[1].value && !c.outputs[1].keep, "each siren sounds in all three");
+    CHECK(c.n_keypads == 1 && c.n_codes == 1 && std::strcmp(c.codes[0], "4321") == 0, "keypads and codes carry over");
+    CHECK(parse(largest_stage1().c_str(), &c, err, sizeof(err)) && c.n_sensors == 48 && c.n_outputs == 24 &&
+          c.sensors[47].profiles == 0x07, "the largest stage 1 config loads whole");
+    CHECK(parse("{}", &c, err, sizeof(err)) && c.n_profiles == 3 && c.profiles[0].arm_delay == 30, "an empty stage 1 config is the defaults");
+}
+
 int main() {
     transitions();
     arming_rules();
@@ -279,6 +401,9 @@ int main() {
     keypad_codes();
     names();
     siren_fit();
+    config_json();
+    config_errors();
+    stage1_config();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

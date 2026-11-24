@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <ArduinoJson.h>
+
 enum class AlarmState   : uint8_t { DISARMED = 0, ARMING, ARMED, PENDING, TRIGGERED };   // of one profile
 enum class AlarmClass   : uint8_t { INTRUSION = 0, FIRE, WATER, GAS, OTHER };
 enum class AlarmRole    : uint8_t { NONE = 0, AWAY, HOME, NIGHT };                     // the keypad button; intrusion only
@@ -81,6 +83,13 @@ int  alarm_cfg_profile(const AlarmConfig& c, const char* id);   // index, -1
 int  alarm_cfg_role(const AlarmConfig& c, AlarmRole r);         // the intrusion profile with that role, -1
 int  alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee);     // slot, -1
 const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
+
+// The API form (alarm.config.set, alarm.get). An object without "profiles" is the stage 1 form and is converted.
+// "codes" left out keeps `keep`'s codes; "codes":[] clears them. False with the first problem in `err`.
+// `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack) and is partly filled on failure.
+bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap);
+void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject o);   // with_codes false: "codes_count"
+void alarm_cfg_defaults(AlarmConfig* out);                                   // a hub with no record: away, home, night
 
 // May this keypad disarm with this code? A trusted keypad always may; otherwise the
 // code must be one of the configured ones, and with none configured nobody may.

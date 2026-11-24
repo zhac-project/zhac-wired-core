@@ -1,24 +1,31 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Alarm panel: one state machine per profile, the keypad code policy and the output fit.
+// Alarm panel: one state machine per profile, the config JSON, the keypad code policy and the output fit.
 // Spec: extra/docs/superpowers/specs/2026-11-24-safety-profiles-design.md.
 #include "alarm_core.h"
 
 #include <cinttypes>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
-#include <ArduinoJson.h>
+#include "utf8_seq.h"
 
 namespace {
 
 const char* const kStates[] = {"disarmed", "arming", "armed", "pending", "triggered"};
-// The config parser's words (the parser returns with the stored config).
-[[maybe_unused]] const char* const kKinds[] = {"warning", "alarm", "state"};
+const char* const kClasses[] = {"intrusion", "fire", "water", "gas", "other"};   // by AlarmClass
+const char* const kModes[] = {"away", "home", "night"};                         // a role is index + 1; stage 1's modes
+const char* const kReserved[] = {"alarm_state", "alarm_sensor", "armed", "disarmed", "arming", "pending", "triggered"};
+const char* const kKinds[] = {"warning", "alarm", "state"};
+const char* const kOnOff[] = {"on", "off"};
 // z2m's warning object (toZigbee.ts warning / modernExtend iasWarning).
-[[maybe_unused]] const char* const kWdModes[] = {"burglar", "fire", "emergency", "police_panic", "fire_panic", "emergency_panic"};
-[[maybe_unused]] const char* const kWdLevels[] = {"low", "medium", "high", "very_high"};
+const char* const kWdModes[] = {"burglar", "fire", "emergency", "police_panic", "fire_panic", "emergency_panic"};
+const char* const kWdLevels[] = {"low", "medium", "high", "very_high"};
+// Stage 1's defaults, which a hub with no config keeps.
+constexpr uint16_t kExitDefault = 30, kEntryDefault = 30, kSirenDefault = 180;
 
 template <size_t N>
 int word_index(const char* s, const char* const (&words)[N]) {
@@ -27,7 +34,14 @@ int word_index(const char* s, const char* const (&words)[N]) {
     return -1;
 }
 
-// The JSON helpers below wait for the config parser and writer.
+// Writes the message into `err` and returns false, so a check reads `return fail(...)`.
+__attribute__((format(printf, 3, 4))) bool fail(char* err, size_t cap, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(err, cap, fmt, ap);
+    va_end(ap);
+    return false;
+}
 
 int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -37,7 +51,7 @@ int hex_digit(char c) {
 }
 
 // "0x" and 1-16 hex digits, not zero.
-[[maybe_unused]] bool parse_ieee(JsonVariantConst v, uint64_t* out) {
+bool parse_ieee(JsonVariantConst v, uint64_t* out) {
     const char* s = v.is<const char*>() ? v.as<const char*>() : nullptr;
     if (!s || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return false;
     uint64_t x = 0;
@@ -52,9 +66,9 @@ int hex_digit(char c) {
     return true;
 }
 
-[[maybe_unused]] void ieee_str(uint64_t ieee, char (&buf)[19]) { std::snprintf(buf, sizeof(buf), "0x%016" PRIX64, ieee); }
+void ieee_str(uint64_t ieee, char (&buf)[19]) { std::snprintf(buf, sizeof(buf), "0x%016" PRIX64, ieee); }
 
-[[maybe_unused]] bool is_code(JsonVariantConst v) {
+bool is_code(JsonVariantConst v) {
     const char* s = v.is<const char*>() ? v.as<const char*>() : nullptr;
     if (!s) return false;
     const size_t n = std::strlen(s);
@@ -64,7 +78,7 @@ int hex_digit(char c) {
 }
 
 // A number field in [lo, hi]; absent keeps `*out`.
-[[maybe_unused]] bool num_field(JsonObjectConst o, const char* key, long lo, long hi, uint16_t* out) {
+bool num_field(JsonObjectConst o, const char* key, long lo, long hi, uint16_t* out) {
     JsonVariantConst v = o[key];
     if (v.isNull()) return true;
     if (!v.is<long>() || v.as<long>() < lo || v.as<long>() > hi) return false;
@@ -73,7 +87,7 @@ int hex_digit(char c) {
 }
 
 // A bool field; absent keeps `*out`.
-[[maybe_unused]] bool bool_field(JsonObjectConst o, const char* key, bool* out) {
+bool bool_field(JsonObjectConst o, const char* key, bool* out) {
     JsonVariantConst v = o[key];
     if (v.isNull()) return true;
     if (!v.is<bool>()) return false;
@@ -82,7 +96,7 @@ int hex_digit(char c) {
 }
 
 // A string field that fits `cap` (NUL included); absent leaves `out` empty.
-[[maybe_unused]] bool str_field(JsonObjectConst o, const char* key, char* out, size_t cap) {
+bool str_field(JsonObjectConst o, const char* key, char* out, size_t cap) {
     JsonVariantConst v = o[key];
     out[0] = '\0';
     if (v.isNull()) return true;
@@ -91,14 +105,300 @@ int hex_digit(char c) {
     return true;
 }
 
-// Common to every list: an array (or absent) of at most `max` objects.
-[[maybe_unused]] bool list_field(JsonObjectConst root, const char* key, size_t max, JsonArrayConst* out, char* err,
-                                 size_t cap) {
+// Common to every list: an array (or absent) of at most `max` objects. `prefix` is the path of `root`
+// ("" or "profiles[2].") in the messages.
+bool list_field(JsonObjectConst root, const char* prefix, const char* key, size_t max, JsonArrayConst* out,
+                char* err, size_t cap) {
     JsonVariantConst v = root[key];
     if (v.isNull()) { *out = JsonArrayConst(); return true; }
-    if (!v.is<JsonArrayConst>()) { std::snprintf(err, cap, "%s must be a list", key); return false; }
+    if (!v.is<JsonArrayConst>()) return fail(err, cap, "%s%s must be a list", prefix, key);
     *out = v.as<JsonArrayConst>();
-    if (out->size() > max) { std::snprintf(err, cap, "%s: at most %u", key, static_cast<unsigned>(max)); return false; }
+    if (out->size() > max) return fail(err, cap, "%s%s: at most %u", prefix, key, static_cast<unsigned>(max));
+    return true;
+}
+
+// One output for profile `profile`, appended to `c`. `where` names it in messages; the outputs from `first` on
+// are the profile's own. A stage 1 siren has no value or keep: they are not read.
+bool parse_output(JsonObjectConst o, const char* where, bool stage1, uint8_t profile, uint8_t first,
+                  AlarmConfig* c, char* err, size_t cap) {
+    AlarmOutput s{};
+    s.profile = profile;
+    if (!parse_ieee(o["ieee"], &s.ieee)) return fail(err, cap, "%s: ieee must be 0x and up to 16 hex digits", where);
+    for (uint8_t k = first; k < c->n_outputs; k++)
+        if (c->outputs[k].ieee == s.ieee) return fail(err, cap, "%s: listed twice", where);
+    const int kind = word_index(o["kind"].is<const char*>() ? o["kind"].as<const char*>() : nullptr, kKinds);
+    if (kind < 0) return fail(err, cap, "%s: kind must be warning, alarm or state", where);
+    s.kind = static_cast<AlarmOutKind>(kind);
+    if (s.kind == AlarmOutKind::WARNING) {
+        std::snprintf(s.wd_mode, sizeof(s.wd_mode), "burglar");
+        std::snprintf(s.wd_level, sizeof(s.wd_level), "high");
+        s.strobe = true;
+        JsonVariantConst m = o["mode"], l = o["level"];
+        if (!m.isNull()) {
+            if (word_index(m.is<const char*>() ? m.as<const char*>() : nullptr, kWdModes) < 0)
+                return fail(err, cap, "%s: mode must be burglar, fire, emergency, police_panic, fire_panic or emergency_panic", where);
+            std::snprintf(s.wd_mode, sizeof(s.wd_mode), "%s", m.as<const char*>());
+        }
+        if (!l.isNull()) {
+            if (word_index(l.is<const char*>() ? l.as<const char*>() : nullptr, kWdLevels) < 0)
+                return fail(err, cap, "%s: level must be low, medium, high or very_high", where);
+            std::snprintf(s.wd_level, sizeof(s.wd_level), "%s", l.as<const char*>());
+        }
+        if (!bool_field(o, "strobe", &s.strobe)) return fail(err, cap, "%s: strobe must be true or false", where);
+    } else if (s.kind == AlarmOutKind::ALARM) {
+        if (!str_field(o, "melody", s.melody, sizeof(s.melody)))
+            return fail(err, cap, "%s: melody must be text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+        if (!str_field(o, "volume", s.volume, sizeof(s.volume)))
+            return fail(err, cap, "%s: volume must be text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+    } else {
+        s.value = true;
+    }
+    if (!stage1) {
+        if (s.kind != AlarmOutKind::STATE) {
+            if (!o["value"].isNull() || !o["keep"].isNull()) return fail(err, cap, "%s: value and keep are for kind state", where);
+        } else {
+            JsonVariantConst v = o["value"];
+            if (!v.isNull()) {
+                const char* w = v.is<const char*>() ? v.as<const char*>() : nullptr;
+                if (word_index(w, kOnOff) < 0) return fail(err, cap, "%s: value must be on or off", where);
+                s.value = std::strcmp(w, "on") == 0;
+            }
+            if (!bool_field(o, "keep", &s.keep)) return fail(err, cap, "%s: keep must be true or false", where);
+            // The outputs before `first` are other profiles': one switch must mean the same in all of them.
+            for (uint8_t k = 0; k < first; k++) {
+                const AlarmOutput& e = c->outputs[k];
+                if (e.ieee == s.ieee && e.kind == AlarmOutKind::STATE && (e.value != s.value || e.keep != s.keep))
+                    return fail(err, cap, "%s: the same switch has another value or another keep in %s", where, c->profiles[e.profile].id);
+            }
+        }
+    }
+    if (c->n_outputs >= kAlarmMaxOutputs) return fail(err, cap, "%s: more than %u outputs in all", where, static_cast<unsigned>(kAlarmMaxOutputs));
+    c->outputs[c->n_outputs++] = s;
+    return true;
+}
+
+// 1-13 of a-z, 0-9, _, starting with a letter.
+bool valid_id(const char* s) {
+    const size_t n = std::strlen(s);
+    if (n < 1 || n >= kAlarmIdMax || s[0] < 'a' || s[0] > 'z') return false;
+    for (size_t i = 1; i < n; i++)
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_')) return false;
+    return true;
+}
+
+// 1-24 bytes of UTF-8 without control characters (a NUL from "\u0000" counts as one).
+bool valid_name(JsonVariantConst v) {
+    if (!v.is<const char*>()) return false;
+    const char* s = v.as<const char*>();
+    const size_t n = v.as<JsonString>().size();
+    if (n < 1 || n >= kAlarmNameMax || !utf8_valid(s, n)) return false;
+    for (size_t i = 0; i < n; i++)
+        if (static_cast<unsigned char>(s[i]) < 0x20 || s[i] == 0x7F) return false;
+    return true;
+}
+
+// The sensors of profile `pi`. A device is stored once, with a bit per profile.
+bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
+    char prefix[16];
+    std::snprintf(prefix, sizeof(prefix), "profiles[%u].", static_cast<unsigned>(pi));
+    JsonArrayConst arr;
+    if (!list_field(po, prefix, "sensors", kAlarmMaxSensors, &arr, err, cap)) return false;
+    unsigned j = 0;
+    for (JsonVariantConst item : arr) {
+        char where[40];
+        std::snprintf(where, sizeof(where), "%ssensors[%u]", prefix, j++);
+        JsonObjectConst o = item.as<JsonObjectConst>();
+        uint64_t ieee;
+        if (!parse_ieee(o["ieee"], &ieee)) return fail(err, cap, "%s: ieee must be 0x and up to 16 hex digits", where);
+        int slot = alarm_cfg_sensor(*c, ieee);
+        if (slot >= 0 && (c->sensors[slot].profiles >> pi & 1)) return fail(err, cap, "%s: listed twice", where);
+        bool entry = false;
+        if (!bool_field(o, "entry", &entry)) return fail(err, cap, "%s: entry must be true or false", where);
+        if (slot < 0) {
+            if (c->n_sensors >= kAlarmMaxSensors)
+                return fail(err, cap, "%s: more than %u different sensors", where, static_cast<unsigned>(kAlarmMaxSensors));
+            slot = c->n_sensors++;
+            c->sensors[slot].ieee = ieee;
+        }
+        c->sensors[slot].profiles |= static_cast<uint8_t>(1u << pi);
+        if (entry) c->sensors[slot].entry |= static_cast<uint8_t>(1u << pi);
+    }
+    return true;
+}
+
+bool parse_profile_outputs(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
+    char prefix[16];
+    std::snprintf(prefix, sizeof(prefix), "profiles[%u].", static_cast<unsigned>(pi));
+    JsonArrayConst arr;
+    if (!list_field(po, prefix, "outputs", kAlarmMaxProfileOutputs, &arr, err, cap)) return false;
+    const uint8_t first = c->n_outputs;
+    unsigned j = 0;
+    for (JsonVariantConst item : arr) {
+        char where[40];
+        std::snprintf(where, sizeof(where), "%soutputs[%u]", prefix, j++);
+        if (!parse_output(item.as<JsonObjectConst>(), where, false, pi, first, c, err, cap)) return false;
+    }
+    return true;
+}
+
+bool parse_profiles(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap) {
+    JsonArrayConst arr;
+    if (!list_field(root, "", "profiles", kAlarmMaxProfiles, &arr, err, cap)) return false;
+    for (JsonVariantConst item : arr) {
+        const uint8_t pi = c->n_profiles;
+        const unsigned i = pi;
+        JsonObjectConst o = item.as<JsonObjectConst>();
+        AlarmProfile& p = c->profiles[pi];
+        p.siren_time = kSirenDefault;
+        const char* id = o["id"].is<const char*>() ? o["id"].as<const char*>() : "";
+        if (!valid_id(id)) return fail(err, cap, "profiles[%u]: id must be 1-13 of a-z, 0-9 and _, starting with a letter", i);
+        if (word_index(id, kReserved) >= 0) return fail(err, cap, "profiles[%u]: id %s is reserved", i, id);
+        if (alarm_cfg_profile(*c, id) >= 0) return fail(err, cap, "profiles[%u]: id %s is taken", i, id);
+        std::snprintf(p.id, sizeof(p.id), "%s", id);
+        if (!valid_name(o["name"])) return fail(err, cap, "profiles[%u]: name must be 1-24 bytes of text", i);
+        std::snprintf(p.name, sizeof(p.name), "%s", o["name"].as<const char*>());
+        const int cls = word_index(o["class"].is<const char*>() ? o["class"].as<const char*>() : nullptr, kClasses);
+        if (cls < 0) return fail(err, cap, "profiles[%u]: class must be intrusion, fire, water, gas or other", i);
+        p.cls = static_cast<AlarmClass>(cls);
+        JsonVariantConst rv = o["role"];   // "" is none
+        if (!rv.isNull()) {
+            const char* r = rv.is<const char*>() ? rv.as<const char*>() : nullptr;
+            const int k = word_index(r, kModes);
+            if (!r || (*r && (k < 0 || p.cls != AlarmClass::INTRUSION)))
+                return fail(err, cap, "profiles[%u]: role is away, home or night, for an intrusion profile only", i);
+            if (*r) {
+                p.role = static_cast<AlarmRole>(k + 1);
+                const int other = alarm_cfg_role(*c, p.role);
+                if (other >= 0) return fail(err, cap, "profiles[%u]: role %s is taken by %s", i, r, c->profiles[other].id);
+            }
+        }
+        if (!num_field(o, "arm_delay", 0, kAlarmDelayMax, &p.arm_delay))
+            return fail(err, cap, "profiles[%u]: arm_delay must be 0-%u s", i, kAlarmDelayMax);
+        if (!num_field(o, "trigger_delay", 0, kAlarmDelayMax, &p.trigger_delay))
+            return fail(err, cap, "profiles[%u]: trigger_delay must be 0-%u s", i, kAlarmDelayMax);
+        if (!num_field(o, "siren_time", kAlarmSirenMin, kAlarmSirenMax, &p.siren_time))
+            return fail(err, cap, "profiles[%u]: siren_time must be %u-%u s", i, kAlarmSirenMin, kAlarmSirenMax);
+        if (!bool_field(o, "notify_arm", &p.notify_arm)) return fail(err, cap, "profiles[%u]: notify_arm must be true or false", i);
+        if (!parse_profile_sensors(o, pi, c, err, cap) || !parse_profile_outputs(o, pi, c, err, cap)) return false;
+        c->n_profiles++;
+    }
+    return true;
+}
+
+// ── Stage 1: sensors with modes, sirens, one delay set. Its messages stay; the result is three profiles. ──
+
+// away, home, night, as a hub with no config has them: only away has an arm delay.
+void three_profiles(AlarmConfig* c, uint16_t exit_delay, uint16_t entry_delay, uint16_t siren_time, bool notify_arm) {
+    static const char* const kNames[] = {"Away", "Home", "Night"};
+    for (uint8_t i = 0; i < 3; i++) {
+        AlarmProfile& p = c->profiles[i];
+        std::snprintf(p.id, sizeof(p.id), "%s", kModes[i]);
+        std::snprintf(p.name, sizeof(p.name), "%s", kNames[i]);
+        p.cls = AlarmClass::INTRUSION;
+        p.role = static_cast<AlarmRole>(i + 1);
+        p.arm_delay = i ? 0 : exit_delay;
+        p.trigger_delay = entry_delay;
+        p.siren_time = siren_time;
+        p.notify_arm = notify_arm;
+    }
+    c->n_profiles = 3;
+}
+
+// A sensor's modes are its profiles (away, home, night are profiles 0, 1, 2); `entry` delays it in all of them.
+bool parse_sensors_v1(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap) {
+    JsonArrayConst arr;
+    if (!list_field(root, "", "sensors", kAlarmMaxSensors, &arr, err, cap)) return false;
+    for (JsonVariantConst item : arr) {
+        const unsigned i = c->n_sensors;
+        JsonObjectConst o = item.as<JsonObjectConst>();
+        AlarmSensor s{};
+        if (!parse_ieee(o["ieee"], &s.ieee)) return fail(err, cap, "sensors[%u]: ieee must be 0x and up to 16 hex digits", i);
+        if (alarm_cfg_sensor(*c, s.ieee) >= 0) {
+            char id[19];
+            ieee_str(s.ieee, id);
+            return fail(err, cap, "sensors[%u]: %s is listed twice", i, id);
+        }
+        JsonVariantConst modes = o["modes"];
+        if (!modes.is<JsonArrayConst>()) return fail(err, cap, "sensors[%u]: modes must be a list", i);
+        for (JsonVariantConst m : modes.as<JsonArrayConst>()) {
+            const int k = word_index(m.is<const char*>() ? m.as<const char*>() : nullptr, kModes);
+            if (k < 0) return fail(err, cap, "sensors[%u]: mode must be away, home or night", i);
+            s.profiles |= static_cast<uint8_t>(1u << k);
+        }
+        if (!s.profiles) return fail(err, cap, "sensors[%u]: no mode, so it never guards", i);
+        bool entry = false;
+        if (!bool_field(o, "entry", &entry)) return fail(err, cap, "sensors[%u]: entry must be true or false", i);
+        if (entry) s.entry = s.profiles;
+        c->sensors[c->n_sensors++] = s;
+    }
+    return true;
+}
+
+// Each siren sounds in all three profiles: away's group first, then home's, then night's.
+bool parse_sirens_v1(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap) {
+    JsonArrayConst arr;
+    if (!list_field(root, "", "sirens", kAlarmMaxProfileOutputs, &arr, err, cap)) return false;
+    for (JsonVariantConst item : arr) {
+        char where[16];
+        std::snprintf(where, sizeof(where), "sirens[%u]", static_cast<unsigned>(c->n_outputs));
+        if (!parse_output(item.as<JsonObjectConst>(), where, true, 0, 0, c, err, cap)) return false;
+    }
+    const uint8_t n = c->n_outputs;
+    for (uint8_t p = 1; p < 3; p++) {
+        for (uint8_t k = 0; k < n; k++) {
+            c->outputs[p * n + k] = c->outputs[k];
+            c->outputs[p * n + k].profile = p;
+        }
+    }
+    c->n_outputs = static_cast<uint8_t>(3 * n);
+    return true;
+}
+
+bool parse_stage1(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap) {
+    uint16_t exit_delay = kExitDefault, entry_delay = kEntryDefault, siren_time = kSirenDefault;
+    bool notify_arm = false;
+    if (!num_field(root, "exit_delay", 0, kAlarmDelayMax, &exit_delay)) return fail(err, cap, "exit_delay must be 0-%u s", kAlarmDelayMax);
+    if (!num_field(root, "entry_delay", 0, kAlarmDelayMax, &entry_delay)) return fail(err, cap, "entry_delay must be 0-%u s", kAlarmDelayMax);
+    if (!num_field(root, "siren_time", kAlarmSirenMin, kAlarmSirenMax, &siren_time))
+        return fail(err, cap, "siren_time must be %u-%u s", kAlarmSirenMin, kAlarmSirenMax);
+    if (!bool_field(root, "notify_arm", &notify_arm)) return fail(err, cap, "notify_arm must be true or false");
+    three_profiles(c, exit_delay, entry_delay, siren_time, notify_arm);
+    return parse_sensors_v1(root, c, err, cap) && parse_sirens_v1(root, c, err, cap);
+}
+
+bool parse_keypads(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap) {
+    JsonArrayConst arr;
+    if (!list_field(root, "", "keypads", kAlarmMaxKeypads, &arr, err, cap)) return false;
+    for (JsonVariantConst item : arr) {
+        const unsigned i = c->n_keypads;
+        JsonObjectConst o = item.as<JsonObjectConst>();
+        AlarmKeypad k{};
+        if (!parse_ieee(o["ieee"], &k.ieee)) return fail(err, cap, "keypads[%u]: ieee must be 0x and up to 16 hex digits", i);
+        if (alarm_cfg_keypad(*c, k.ieee)) return fail(err, cap, "keypads[%u]: listed twice", i);
+        if (!bool_field(o, "trusted", &k.trusted)) return fail(err, cap, "keypads[%u]: trusted must be true or false", i);
+        c->keypads[c->n_keypads++] = k;
+    }
+    return true;
+}
+
+bool parse_codes(JsonObjectConst root, const AlarmConfig* keep, AlarmConfig* c, char* err, size_t cap) {
+    JsonVariantConst v = root["codes"];
+    if (v.isNull()) {
+        if (keep) {
+            c->n_codes = keep->n_codes;
+            std::memcpy(c->codes, keep->codes, sizeof(c->codes));
+        }
+        return true;
+    }
+    JsonArrayConst arr;
+    if (!list_field(root, "", "codes", kAlarmMaxCodes, &arr, err, cap)) return false;
+    for (JsonVariantConst item : arr) {
+        const unsigned i = c->n_codes;
+        if (!is_code(item)) return fail(err, cap, "codes[%u]: a code is 4-8 digits, as text", i);
+        for (uint8_t k = 0; k < c->n_codes; k++)
+            if (std::strcmp(c->codes[k], item.as<const char*>()) == 0) return fail(err, cap, "codes[%u]: listed twice", i);
+        std::snprintf(c->codes[c->n_codes++], kAlarmCodeMax, "%s", item.as<const char*>());
+    }
     return true;
 }
 
@@ -147,6 +447,77 @@ bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* 
     for (uint8_t i = 0; i < c.n_codes; i++) if (std::strcmp(c.codes[i], code) == 0) return true;
     return false;
 }
+
+bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap) {
+    err[0] = '\0';
+    JsonDocument doc;
+    if (!json || deserializeJson(doc, json, len) || !doc.is<JsonObjectConst>()) return fail(err, cap, "the config must be a JSON object");
+    JsonObjectConst root = doc.as<JsonObjectConst>();
+    // The defaults, in place: a config is ~4.4 KB, too much for a boot-time stack.
+    AlarmConfig& c = *new (out) AlarmConfig();
+    return (root["profiles"].isNull() ? parse_stage1(root, &c, err, cap) : parse_profiles(root, &c, err, cap)) &&
+           parse_keypads(root, &c, err, cap) && parse_codes(root, keep, &c, err, cap);
+}
+
+void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject doc) {
+    char id[19];
+    JsonArray profiles = doc["profiles"].to<JsonArray>();
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        const AlarmProfile& p = c.profiles[i];
+        JsonObject o = profiles.add<JsonObject>();
+        o["id"] = static_cast<const char*>(p.id);   // a copy: the array would be kept by pointer
+        o["name"] = static_cast<const char*>(p.name);
+        o["class"] = kClasses[static_cast<size_t>(p.cls)];
+        if (p.cls == AlarmClass::INTRUSION) o["role"] = p.role == AlarmRole::NONE ? "" : kModes[static_cast<size_t>(p.role) - 1];
+        o["arm_delay"] = p.arm_delay;
+        o["trigger_delay"] = p.trigger_delay;
+        o["siren_time"] = p.siren_time;
+        o["notify_arm"] = p.notify_arm;
+        JsonArray sensors = o["sensors"].to<JsonArray>();
+        for (uint8_t k = 0; k < c.n_sensors; k++) {
+            if (!(c.sensors[k].profiles >> i & 1)) continue;
+            JsonObject s = sensors.add<JsonObject>();
+            ieee_str(c.sensors[k].ieee, id);
+            s["ieee"] = static_cast<const char*>(id);   // a copy: id is reused
+            s["entry"] = static_cast<bool>(c.sensors[k].entry >> i & 1);
+        }
+        JsonArray outputs = o["outputs"].to<JsonArray>();
+        for (uint8_t k = 0; k < c.n_outputs; k++) {
+            const AlarmOutput& out = c.outputs[k];
+            if (out.profile != i) continue;
+            JsonObject s = outputs.add<JsonObject>();
+            ieee_str(out.ieee, id);
+            s["ieee"] = static_cast<const char*>(id);
+            s["kind"] = kKinds[static_cast<size_t>(out.kind)];
+            if (out.kind == AlarmOutKind::WARNING) {
+                s["mode"] = static_cast<const char*>(out.wd_mode);
+                s["level"] = static_cast<const char*>(out.wd_level);
+                s["strobe"] = out.strobe;
+            } else if (out.kind == AlarmOutKind::ALARM) {
+                if (out.melody[0]) s["melody"] = static_cast<const char*>(out.melody);
+                if (out.volume[0]) s["volume"] = static_cast<const char*>(out.volume);
+            } else {
+                s["value"] = kOnOff[out.value ? 0 : 1];
+                s["keep"] = out.keep;
+            }
+        }
+    }
+    JsonArray keypads = doc["keypads"].to<JsonArray>();
+    for (uint8_t i = 0; i < c.n_keypads; i++) {
+        JsonObject o = keypads.add<JsonObject>();
+        ieee_str(c.keypads[i].ieee, id);
+        o["ieee"] = static_cast<const char*>(id);
+        o["trusted"] = c.keypads[i].trusted;
+    }
+    if (with_codes) {
+        JsonArray codes = doc["codes"].to<JsonArray>();
+        for (uint8_t i = 0; i < c.n_codes; i++) codes.add(static_cast<const char*>(c.codes[i]));
+    } else {
+        doc["codes_count"] = c.n_codes;
+    }
+}
+
+void alarm_cfg_defaults(AlarmConfig* out) { three_profiles(new (out) AlarmConfig(), kExitDefault, kEntryDefault, kSirenDefault, false); }
 
 const char* alarm_output_misfit(AlarmOutKind kind, const char* exposes, size_t len) {
     static constexpr struct { const char* key; const char* why; } kNeed[] = {   // by AlarmOutKind

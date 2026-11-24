@@ -56,5 +56,6 @@ add_test(NAME user_io_config COMMAND user_io_config_tests)
 add_executable(alarm_core_tests test_alarm_core.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../alarm_core.cpp)
 target_include_directories(alarm_core_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
-    "${ZHAC_COMPONENTS}/components/arduinojson/src")
+    "${ZHAC_COMPONENTS}/components/arduinojson/src"
+    "${ZHAC_COMPONENTS}/components/ws_server/include")
 add_test(NAME alarm_core COMMAND alarm_core_tests)
