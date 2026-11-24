@@ -312,6 +312,26 @@ static void config_json() {
     CHECK(refuses(many, "at most 48"), "more than 48 sensors");
 }
 
+// A siren must have something writable for its kind; a reading cannot sound.
+static void siren_fit() {
+    auto fits = [](AlarmSirenKind k, const char* ex) { return alarm_siren_misfit(k, ex, std::strlen(ex)) == nullptr; };
+    const char* ias  = R"([{"name":"warning","type":"composite","access":2},{"name":"battery","type":"numeric","access":5}])";
+    const char* tuya = R"([{"name":"alarm","type":"binary","access":7},{"name":"melody","type":"enum","access":7}])";
+    const char* smoke = R"([{"name":"smoke","type":"binary","access":1},{"name":"alarm","type":"binary","access":1}])";
+    const char* plug = R"([{"name":"state","type":"binary","access":7},{"name":"power","type":"numeric","access":5}])";
+    const char* hubio = R"([{"name":"relay1","type":"binary","access":7}])";
+    CHECK(fits(AlarmSirenKind::WARNING, ias), "an IAS siren takes kind warning");
+    CHECK(!fits(AlarmSirenKind::ALARM, ias), "an IAS siren has no alarm switch");
+    CHECK(fits(AlarmSirenKind::ALARM, tuya), "a Tuya siren takes kind alarm");
+    CHECK(!fits(AlarmSirenKind::WARNING, tuya), "a Tuya siren takes no warning");
+    CHECK(!fits(AlarmSirenKind::ALARM, smoke), "a smoke sensor's alarm is a reading, not a siren");
+    CHECK(fits(AlarmSirenKind::SWITCH, plug), "a plug takes kind state");
+    CHECK(!fits(AlarmSirenKind::SWITCH, hubio), "a Hub I/O output named relay1 has no state");
+    CHECK(!fits(AlarmSirenKind::SWITCH, "not json"), "unreadable exposes do not fit");
+    const char* why = alarm_siren_misfit(AlarmSirenKind::ALARM, smoke, std::strlen(smoke));
+    CHECK(why && std::strstr(why, "alarm"), "the reason names what is missing");
+}
+
 int main() {
     transitions();
     arming_rules();
@@ -319,6 +339,7 @@ int main() {
     keypad_codes();
     names();
     config_json();
+    siren_fit();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

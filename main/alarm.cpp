@@ -71,8 +71,10 @@ uint8_t       s_saved[2] = {0xFF, 0xFF};   // the state record last written
 struct Change {
     AlarmState from, to, resting;
     AlarmMode  mode;
-    uint64_t   cause;
-    bool       timed;   // an ended delay or siren time, not a person
+    uint64_t   cause;     // refused: the first open sensor
+    bool       timed;     // an ended delay or siren time, not a person
+    bool       refused;   // not a change: an arm an open door or window refused
+    uint8_t    n_open;
 };
 
 uint32_t mono_s() { return static_cast<uint32_t>(esp_timer_get_time() / 1000000); }
@@ -136,6 +138,22 @@ void act(bool timed, F&& f) {
         ESP_LOGE(TAG, "%s -> %s: not acted on, queue full", alarm_state_name(c.from), alarm_state_name(c.to));
 }
 
+// An arm refused for open doors or windows, not from the hub page (which lists them itself): the
+// task notifies and fires Event#alarm_arm_failed.
+void arm_refused(AlarmMode m, const uint64_t* open, uint8_t n) {
+    Change c{};
+    {
+        Lock l;
+        c.from = c.to = s_core->state();
+        c.resting = s_core->resting();
+    }
+    c.mode    = m;
+    c.cause   = n ? open[0] : 0;
+    c.n_open  = n;
+    c.refused = true;
+    if (xQueueSend(s_q, &c, 0) != pdTRUE) ESP_LOGE(TAG, "arm %s refused, not reported: queue full", alarm_mode_name(m));
+}
+
 // ── Out: the Alarm device, named events, notifications, sirens ──
 
 void publish_state(AlarmState s, uint64_t cause) {
@@ -147,20 +165,30 @@ void publish_state(AlarmState s, uint64_t cause) {
     device_shadow_process_ieee(kAlarmIeee, a, 2);
 }
 
-void rule_event(AlarmState s) {
+void rule_event(const char* what) {   // Event#alarm_<what>
     Event ev{};
     ev.type = EventType::RULE_EVENT;
     auto* p = reinterpret_cast<RuleEventPayload*>(ev.data);
-    std::snprintf(p->name, sizeof(p->name), "alarm_%s", alarm_state_name(s));
+    std::snprintf(p->name, sizeof(p->name), "alarm_%s", what);
     event_bus_publish(ev);
 }
 
-// The cloud's `alert` (push + inbox) and Telegram. Both queue; neither waits on the network.
+// The cloud's `alert` (push + inbox) and Telegram. Both queue; neither waits on the network, and
+// both hold a message back until it is up again, so each text says when it happened.
 void notify(const char* kind, uint64_t ieee, const char* message, const char* tg_text) {
+    char at[16] = "";
+    if (const time_t t = time(nullptr); t > 1577836800) {
+        struct tm lt;
+        localtime_r(&t, &lt);
+        std::strftime(at, sizeof(at), " at %H:%M", &lt);
+    }
+    char text[112], tg[128];
+    std::snprintf(text, sizeof(text), "%s%s", message, at);
+    std::snprintf(tg, sizeof(tg), "%s%s", tg_text, at);
     JsonDocument d;
     d["kind"]    = kind;
     d["state"]   = true;
-    d["message"] = message;
+    d["message"] = static_cast<const char*>(text);
     char id[19];
     if (ieee) {
         ieee_str(ieee, id);
@@ -169,7 +197,23 @@ void notify(const char* kind, uint64_t ieee, const char* message, const char* tg
     char buf[320];
     const size_t n = serializeJson(d, buf, sizeof(buf));
     if (n && n < sizeof(buf)) remote_client_publish_event("alert", buf, n);
-    tg_gw_send(tg_text, nullptr, nullptr);
+    tg_gw_send(tg, nullptr, nullptr);
+}
+
+// An arm a keypad, a button, a rule, Lua, MQTT or Home Assistant asked for, refused for open doors or
+// windows: nobody there sees the refusal, and leaving the house unguarded is what an alarm is for.
+void notify_refused(const Change& c) {
+    char name[32], msg[96], tg[112];
+    name_of(c.cause, name);
+    const char* mode = alarm_mode_name(c.mode);
+    if (c.n_open > 1) {
+        std::snprintf(msg, sizeof(msg), "Not armed (%s): %s and %u more are open", mode, name, c.n_open - 1u);
+        std::snprintf(tg, sizeof(tg), "Alarm not armed (%s): %s and %u more are open", mode, name, c.n_open - 1u);
+    } else {
+        std::snprintf(msg, sizeof(msg), "Not armed (%s): %s is open", mode, name);
+        std::snprintf(tg, sizeof(tg), "Alarm not armed (%s): %s is open", mode, name);
+    }
+    notify("alarm_arm_failed", c.cause, msg, tg);
 }
 
 void notify_change(const Change& c) {
@@ -300,11 +344,16 @@ void save_state(AlarmState state, AlarmState resting) {
 }
 
 void run_change(const Change& c) {
+    if (c.refused) {
+        notify_refused(c);
+        rule_event("arm_failed");
+        return;
+    }
     ESP_LOGI(TAG, "%s -> %s", alarm_state_name(c.from), alarm_state_name(c.to));
     save_state(c.to, c.resting);
     notify_change(c);   // first: it only queues
     publish_state(c.to, c.cause);
-    rule_event(c.to);
+    rule_event(alarm_state_name(c.to));
     if (c.to == AlarmState::TRIGGERED) sirens(true);
     else if (c.from == AlarmState::TRIGGERED) sirens(false);
     push_changed();
@@ -342,14 +391,16 @@ void alarm_task(void*) {
         if (boot_alert_at && now >= boot_alert_at) {
             boot_alert_at = 0;
             notify("alarm", 0, "The hub restarted during an alarm", "Alarm: the hub restarted during an alarm");
-            // The panel came back armed, but a switch siren has no duration of its own: stop what the
-            // alarm before the restart started, unless a new alarm sounds them by now.
-            bool on;
+            AlarmState st, rest;
             {
                 Lock l;
-                on = s_core->state() == AlarmState::TRIGGERED;
+                st   = s_core->state();
+                rest = s_core->resting();
             }
-            if (s_boot_sirens && !on) sirens(false);
+            // The panel came back armed, but a switch siren has no duration of its own: stop what the
+            // alarm before the restart started, unless a new alarm sounds them by now.
+            if (s_boot_sirens && st != AlarmState::TRIGGERED) sirens(false);
+            save_state(st, rest);   // told once: the next restart is not "during an alarm" again
         }
         if (now >= next_seen) {
             next_seen = now + 60;
@@ -425,6 +476,7 @@ void on_keypad(const ZclAttrEvent& z) {
         if (r != AlarmArmResult::OK)
             ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": arm %s refused (%s)", z.ieee, alarm_mode_name(a.mode),
                      r == AlarmArmResult::OPEN ? "a door or window is open" : "the alarm is on");
+        if (r == AlarmArmResult::OPEN) arm_refused(a.mode, open, n);
     }
     std::memset(&in, 0, sizeof(in));
 }
@@ -472,6 +524,7 @@ DevCmdResult local_cmd(uint64_t ieee, const char* key, const DevCmdValue* v) {
     if (r == AlarmArmResult::OK) return DEVCMD_OK;
     ESP_LOGW(TAG, "arm %s refused: %s", alarm_mode_name(m),
              r == AlarmArmResult::OPEN ? "a door or window is open (the hub page can force it)" : "the alarm is on, disarm first");
+    if (r == AlarmArmResult::OPEN) arm_refused(m, open, n);
     return DEVCMD_BAD_VALUE;
 }
 
@@ -630,7 +683,17 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
         if (!ok) std::snprintf(err, cap, "sensors[%u]: %s has no contact, occupancy, presence or vibration", i,
                                dev->friendly_name);
     }
-    for (uint8_t i = 0; ok && i < next->n_sirens; i++) ok = known("sirens", i, next->sirens[i].ieee);
+    // A siren needs something settable for its kind: a smoke sensor's `alarm` is only a reading.
+    for (uint8_t i = 0; ok && i < next->n_sirens; i++) {
+        ok = known("sirens", i, next->sirens[i].ieee);
+        if (!ok) break;
+        const size_t n = zhac_adapter_build_exposes_json(dev->ieee_addr, dev->model_id, dev->manufacturer_name,
+                                                         buf, kCfgJsonMax);
+        if (const char* why = alarm_siren_misfit(next->sirens[i].kind, buf, n < kCfgJsonMax ? n : 0)) {
+            std::snprintf(err, cap, "sirens[%u]: %s %s", i, dev->friendly_name, why);
+            ok = false;
+        }
+    }
     for (uint8_t i = 0; ok && i < next->n_keypads; i++) ok = known("keypads", i, next->keypads[i].ieee);
     if (ok) {
         const size_t n = alarm_cfg_to_json(*next, true, buf, kCfgJsonMax);

@@ -86,6 +86,11 @@ const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
 // code must be one of the configured ones, and with none configured nobody may.
 bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* code);
 
+// Why a siren of `kind` cannot sound on a device with these exposes (the JSON array the adapter
+// builds), or nullptr when it can: warning needs a settable `warning`, alarm a settable `alarm`
+// (a smoke sensor's alarm is only a reading), state a settable `state`.
+const char* alarm_siren_misfit(AlarmSirenKind kind, const char* exposes, size_t len);
+
 enum class AlarmArmResult : uint8_t {
     OK,
     OPEN,   // contact sensors of the mode are open and force was not given

@@ -371,6 +371,24 @@ bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* 
     return false;
 }
 
+const char* alarm_siren_misfit(AlarmSirenKind kind, const char* exposes, size_t len) {
+    static constexpr struct { const char* key; const char* why; } kNeed[] = {   // by AlarmSirenKind
+        {"warning", "has no warning the hub can send (kind warning is for IAS sirens)"},
+        {"alarm",   "has no alarm switch the hub can set (kind alarm is for Tuya sirens)"},
+        {"state",   "has no state the hub can switch (kind state is for plugs and switches)"},
+    };
+    const auto& need = kNeed[static_cast<uint8_t>(kind)];
+    JsonDocument filter;   // a device's exposes run to kilobytes: keep only what is checked
+    filter[0]["name"]   = true;
+    filter[0]["access"] = true;
+    JsonDocument doc;
+    if (!exposes || deserializeJson(doc, exposes, len, DeserializationOption::Filter(filter)) != DeserializationError::Ok)
+        return "has exposes the hub cannot read";
+    for (JsonObjectConst e : doc.as<JsonArrayConst>())
+        if (std::strcmp(e["name"] | "", need.key) == 0 && ((e["access"] | 0) & 2)) return nullptr;   // 2: settable
+    return need.why;
+}
+
 // ── The panel ──
 
 AlarmArmResult AlarmCore::arm(AlarmMode m, bool force, const uint64_t* open, uint8_t n_open, uint32_t now) {
