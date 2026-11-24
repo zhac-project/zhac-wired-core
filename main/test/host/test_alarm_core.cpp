@@ -198,6 +198,30 @@ static void panic_and_restore() {
           r.at(kNight).bypass == 0 && r.summary_profile() == kNight, "restore");
 }
 
+// A panic during the arm delay: the arm has not reached armed, so a hazard still active raises its
+// alarm once that panic's alarm ends in armed, by its time or by a silence.
+static void panic_before_armed() {
+    AlarmConfig c = config(); c.sensors[sSmoke].profiles |= 1u << kAway; uint64_t open = 0;
+    AlarmPanel p(&c);
+    p.seed(sSmoke, AlarmKey::SMOKE, true);
+    p.arm(kAway, false, 0, &open); p.panic(kPad, 10);
+    CHECK(ST(kAway) == AlarmState::TRIGGERED && p.at(kAway).cause == kPad && p.at(kAway).alarms == 1, "panic during the arm delay");
+    p.tick(190);
+    CHECK(ST(kAway) == AlarmState::TRIGGERED && p.at(kAway).cause == ieee_of(sSmoke) && p.at(kAway).alarms == 2 &&
+          p.at(kAway).rests_armed, "the panic's alarm ends: the smoke's alarm follows at that tick");
+    p.tick(370); p.tick(371);
+    CHECK(ST(kAway) == AlarmState::ARMED && p.at(kAway).alarms == 2, "the smoke's alarm ends: armed, no third alarm");
+    AlarmPanel q(&c);
+    q.seed(sSmoke, AlarmKey::SMOKE, true);
+    q.arm(kAway, false, 0, &open); q.panic(kPad, 10); q.silence(kAway);
+    CHECK(q.at(kAway).state == AlarmState::ARMED && q.at(kAway).alarms == 1, "the panic silenced: armed");
+    q.tick(11);
+    CHECK(q.at(kAway).state == AlarmState::TRIGGERED && q.at(kAway).cause == ieee_of(sSmoke) && q.at(kAway).alarms == 2,
+          "the next tick raises the smoke's alarm");
+    q.tick(191); q.tick(192);
+    CHECK(q.at(kAway).state == AlarmState::ARMED && q.at(kAway).alarms == 2, "and only once");
+}
+
 static void keypad_codes() {
     AlarmConfig c = config();
     CHECK(!alarm_keypad_may_disarm(c, kPad, "1234"), "no codes configured: a keypad may not disarm");
@@ -251,6 +275,7 @@ int main() {
     group();
     silence_and_disarm_all();
     panic_and_restore();
+    panic_before_armed();
     keypad_codes();
     names();
     siren_fit();
