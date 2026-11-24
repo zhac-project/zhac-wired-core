@@ -4,8 +4,10 @@
 // Alarm panel (spec extra/docs/superpowers/specs/2026-11-24-safety-profiles-design.md):
 // every state transition of a profile, the delays on a fake clock, the arming check and
 // force, the bypass, edges and hazards, intrusion profiles replacing each other, silence,
-// disarm all, panic, restore, the keypad code policy and the output fit.
+// disarm all, panic, restore, the keypad code policy and the output fit; what changed between
+// two looks, the rule events, the notification texts and what each output device plays.
 #include "alarm_core.h"
+#include "utf8_seq.h"
 
 #include <cstdio>
 #include <cstring>
@@ -544,6 +546,140 @@ static void adopt_states() {
     CHECK(s.at(0).state == AlarmState::TRIGGERED && s.at(0).cause == ieee_of(sSmoke) && s.at(0).alarms == 2,
           "the hazard check still owed is run at the next tick");
 }
+static void summary_and_keys() {
+    static AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; char s[24]; AlarmKey k;
+    alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "disarmed") == 0, "summary: disarmed");
+    p.arm(kFlood, false, 0, &open); p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 1);
+    alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "disarmed") == 0, "a water alarm does not touch the summary");
+    p.arm(kAway, false, 10, &open); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "arming") == 0, "summary: arming");
+    p.tick(40); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "armed_away") == 0, "summary: armed_away, as in stage 1");
+    p.arm(kNight, false, 50, &open); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "armed_night") == 0, "a switch goes straight to the new value");
+    p.sensor(sDoor, AlarmKey::CONTACT, true, 60); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "pending") == 0, "summary: pending");
+    p.tick(90); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "triggered") == 0, "summary: triggered");
+    CHECK(alarm_key_parse("contact", &k) && k == AlarmKey::CONTACT && alarm_key_parse("vibration", &k) && k == AlarmKey::MOTION &&
+          alarm_key_parse("presence", &k) && k == AlarmKey::MOTION && alarm_key_parse("carbon_monoxide", &k) && k == AlarmKey::CO &&
+          alarm_key_parse("water_leak", &k) && k == AlarmKey::WATER_LEAK && !alarm_key_parse("tamper", &k) && !alarm_key_parse("alarm", &k), "sensor keys");
+}
+static void changes_under_load() {
+    static AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; AlarmSeen seen[kAlarmMaxProfiles]; AlarmChange ch[kAlarmMaxProfiles];
+    alarm_seen(p, seen);
+    CHECK(alarm_changes(p, seen, ch) == 0, "nothing happened: no change");
+    // Everything below happens before the task looks again.
+    p.arm(kNight, false, 0, &open); p.arm(kFlood, false, 0, &open);
+    p.sensor(sDoor, AlarmKey::CONTACT, true, 10);                           // night: pending until 40
+    p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 20); p.silence(kFlood);     // flood: an alarm that came and went
+    p.tick(40);                                                             // night: triggered
+    uint8_t n = alarm_changes(p, seen, ch);
+    CHECK(n == 2 && ch[0].profile == kNight && ch[0].from == AlarmState::DISARMED && ch[0].to == AlarmState::TRIGGERED && ch[0].alarm &&
+          ch[0].cause == ieee_of(sDoor), "skipped steps collapse into one change with the final state");
+    CHECK(ch[1].profile == kFlood && ch[1].from == AlarmState::DISARMED && ch[1].to == AlarmState::ARMED && ch[1].alarm &&
+          ch[1].cause == ieee_of(sLeak), "an alarm that is over again is still reported, with its cause");
+    alarm_seen(p, seen);
+    p.silence(kNight); p.sensor(sWindow, AlarmKey::CONTACT, true, 50);     // night: triggered, armed, triggered again
+    n = alarm_changes(p, seen, ch);
+    CHECK(n == 1 && ch[0].from == AlarmState::TRIGGERED && ch[0].to == AlarmState::TRIGGERED && ch[0].alarm && ch[0].cause == ieee_of(sWindow),
+          "a second alarm behind the same state is a change");
+    alarm_seen(p, seen);
+    p.disarm_all();
+    n = alarm_changes(p, seen, ch);
+    CHECK(n == 1 && ch[0].profile == kNight && ch[0].to == AlarmState::DISARMED && ch[0].by_command && !ch[0].alarm, "a disarm by command");
+    alarm_seen(p, seen);
+    p.sensor(sWindow, AlarmKey::CONTACT, false, 55); p.sensor(sDoor, AlarmKey::CONTACT, false, 56);
+    p.arm(kHome, false, 60, &open); alarm_seen(p, seen); p.arm(kNight, false, 70, &open);
+    n = alarm_changes(p, seen, ch);
+    CHECK(n == 2 && ch[0].profile == kHome && ch[0].to == AlarmState::DISARMED && !ch[0].by_command && ch[1].to == AlarmState::ARMED,
+          "being replaced is not a disarm by command");
+    alarm_seen(p, seen);
+    p.disarm(kNight); p.panic(kPad, 80); p.tick(260);
+    n = alarm_changes(p, seen, ch);
+    CHECK(n == 2 && ch[0].profile == kAway && ch[0].from == AlarmState::DISARMED && ch[0].to == AlarmState::DISARMED && ch[0].alarm && !ch[0].by_command,
+          "a panic alarm that ended by itself: an alarm, not a disarm");
+}
+static void event_names() {
+    static AlarmConfig c = config(); char ev[20][kAlarmEventMax];
+    const AlarmChange a[] = {{kNight, AlarmState::DISARMED, AlarmState::ARMED, 0, false, false}};
+    uint8_t n = alarm_events(c, a, 1, "disarmed", "armed_night", ev, 20);
+    CHECK(n == 1 && std::strcmp(ev[0], "alarm_armed_night") == 0, "armed: one event, the stage 1 name");
+    const AlarmChange b[] = {{kFlood, AlarmState::ARMED, AlarmState::TRIGGERED, 5, true, false}};
+    n = alarm_events(c, b, 1, "armed_night", "armed_night", ev, 20);
+    CHECK(n == 1 && std::strcmp(ev[0], "alarm_triggered_flood") == 0, "a water alarm: its own event, no stage 1 event");
+    const AlarmChange d[] = {{kNight, AlarmState::ARMED, AlarmState::TRIGGERED, 5, true, false}};
+    n = alarm_events(c, d, 1, "armed_night", "triggered", ev, 20);
+    CHECK(n == 2 && std::strcmp(ev[0], "alarm_triggered_night") == 0 && std::strcmp(ev[1], "alarm_triggered") == 0, "an intrusion alarm: both names, once each");
+    const AlarmChange e[] = {{kHome, AlarmState::ARMED, AlarmState::DISARMED, 0, false, false}, {kNight, AlarmState::DISARMED, AlarmState::ARMED, 0, false, false}};
+    n = alarm_events(c, e, 2, "armed_home", "armed_night", ev, 20);
+    CHECK(n == 2 && std::strcmp(ev[0], "alarm_disarmed_home") == 0 && std::strcmp(ev[1], "alarm_armed_night") == 0, "a switch: no stage 1 alarm_disarmed");
+    const AlarmChange f[] = {{kFlood, AlarmState::ARMED, AlarmState::ARMED, 5, true, false}};
+    n = alarm_events(c, f, 1, "disarmed", "disarmed", ev, 20);
+    CHECK(n == 1 && std::strcmp(ev[0], "alarm_triggered_flood") == 0, "an alarm that came and went still fires its event");
+    const AlarmChange g[] = {{kAway, AlarmState::ARMED, AlarmState::DISARMED, 0, false, true}};
+    n = alarm_events(c, g, 1, "armed_away", "disarmed", ev, 20);
+    CHECK(n == 2 && std::strcmp(ev[0], "alarm_disarmed_away") == 0 && std::strcmp(ev[1], "alarm_disarmed") == 0, "a disarm: its own and the stage 1 event");
+    n = alarm_events(c, e, 2, "armed_home", "armed_night", ev, 1);
+    CHECK(n == 1 && std::strcmp(ev[0], "alarm_disarmed_home") == 0, "a full list takes no more names");
+}
+static void texts() {
+    char t[64];
+    alarm_text(AlarmText::TRIGGERED, "Away", "Front door", 0, t, sizeof(t)); CHECK(std::strcmp(t, "Front door (Away)") == 0, "triggered");
+    alarm_text(AlarmText::PANIC, "Away", "Hall keypad", 0, t, sizeof(t)); CHECK(std::strcmp(t, "Panic button on Hall keypad") == 0, "panic");
+    alarm_text(AlarmText::REFUSED, "Away", "Bathroom window", 0, t, sizeof(t)); CHECK(std::strcmp(t, "Not armed (Away): Bathroom window is open") == 0, "refused, one");
+    alarm_text(AlarmText::REFUSED, "Away", "Bathroom window", 2, t, sizeof(t)); CHECK(std::strcmp(t, "Not armed (Away): Bathroom window and 2 more are open") == 0, "refused, more");
+    alarm_text(AlarmText::ARMED, "Night", "", 0, t, sizeof(t)); CHECK(std::strcmp(t, "Armed (Night)") == 0, "armed");
+    alarm_text(AlarmText::DISARMED, "Fire", "", 0, t, sizeof(t)); CHECK(std::strcmp(t, "Disarmed (Fire)") == 0, "disarmed");
+    alarm_text(AlarmText::RESTARTED, "", "", 0, t, sizeof(t)); CHECK(std::strcmp(t, "The hub restarted during an alarm") == 0, "restarted");
+    char cut[15];   // "Датчик " is 13 bytes; the 14 that fit would end inside the next Cyrillic letter
+    const size_t n = alarm_text(AlarmText::TRIGGERED, "Ніч", "Датчик вікна", 0, cut, sizeof(cut));
+    CHECK(n == std::strlen(cut) && n < sizeof(cut) && utf8_valid(cut, n), "a text that does not fit is cut between characters");
+    char edge[13];   // the 12 bytes that fit are "Датчик": whole characters, so nothing is dropped
+    CHECK(alarm_text(AlarmText::TRIGGERED, "Ніч", "Датчик вікна", 0, edge, sizeof(edge)) == 12 && std::strcmp(edge, "Датчик") == 0, "a cut on a character edge keeps everything that fits");
+    char three[4];   // "a" and the first two bytes of the euro sign
+    CHECK(alarm_text(AlarmText::TRIGGERED, "P", "a\xE2\x82\xAC" "b", 0, three, sizeof(three)) == 1 && std::strcmp(three, "a") == 0, "a three-byte character cut after two bytes is dropped");
+}
+static void outputs_plan() {
+    static AlarmConfig c = config(); uint64_t open = 0; AlarmDrive d[kAlarmMaxOutputs];
+    auto out = [&](uint8_t profile, uint64_t ieee, AlarmOutKind kind, bool value = true, bool keep = false) {
+        AlarmOutput o{}; o.profile = profile; o.ieee = ieee; o.kind = kind; o.value = value; o.keep = keep; c.outputs[c.n_outputs++] = o; };
+    out(kNight, 0xA1, AlarmOutKind::WARNING);                       // 0: the hall siren, intrusion
+    out(kFlood, 0xB1, AlarmOutKind::STATE, false, true);            // 1: the valve
+    out(kFlood, 0xA1, AlarmOutKind::WARNING);                       // 2: the hall siren, water
+    out(kFire,  0xA1, AlarmOutKind::WARNING);                       // 3: the hall siren, fire
+    AlarmPanel p(&c);
+    uint8_t n = alarm_drive_plan(c, p, 0, d);
+    CHECK(n == 2 && d[0].ieee == 0xA1 && d[0].output == -1 && d[1].ieee == 0xB1 && d[1].output == -1, "one entry per device; nothing sounds");
+    p.arm(kNight, false, 0, &open); p.arm(kFlood, false, 0, &open); p.arm(kFire, false, 0, &open);
+    p.sensor(sWindow, AlarmKey::CONTACT, true, 100);               // night until 280
+    alarm_drive_plan(c, p, 110, d);
+    CHECK(d[0].output == 0 && d[0].secs == 170 && d[1].output == -1, "the siren follows the intrusion alarm, for the time left");
+    p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 120);              // flood until 300
+    alarm_drive_plan(c, p, 120, d);
+    CHECK(d[0].output == 2 && d[0].secs == 180 && d[1].output == 1, "water outranks intrusion; the valve acts");
+    p.sensor(sSmoke, AlarmKey::SMOKE, true, 130);                  // fire until 310
+    alarm_drive_plan(c, p, 130, d);
+    CHECK(d[0].output == 3 && d[0].secs == 180, "fire outranks water");
+    p.silence(kFire);
+    alarm_drive_plan(c, p, 140, d);
+    CHECK(d[0].output == 2 && d[0].secs == 160, "fire ends: water takes the siren over for its time left");
+    p.tick(300);
+    alarm_drive_plan(c, p, 300, d);
+    CHECK(d[0].output == -1 && d[1].output == -1, "all alarms over: nothing sounds");
+}
+static void outputs_keep() {
+    static AlarmConfig c = config();
+    auto out = [&](uint8_t profile, uint64_t ieee, AlarmOutKind kind, bool value, bool keep) {
+        AlarmOutput o{}; o.profile = profile; o.ieee = ieee; o.kind = kind; o.value = value; o.keep = keep; c.outputs[c.n_outputs++] = o; };
+    out(kNight, 0xC1, AlarmOutKind::STATE, true, false);    // 0: a lamp, switched back off
+    out(kNight, 0xA1, AlarmOutKind::WARNING, true, false);  // 1: the siren, intrusion
+    out(kFlood, 0xB1, AlarmOutKind::STATE, false, true);    // 2: the valve, left closed
+    out(kFire,  0xB1, AlarmOutKind::STATE, false, true);    // 3: the same valve in another profile
+    out(kFire,  0xA1, AlarmOutKind::WARNING, true, false);  // 4: the siren, fire
+    CHECK(alarm_output_step(c, -1, 2) == AlarmOutAct::START, "the valve closes when the alarm starts");
+    CHECK(alarm_output_step(c, 2, -1) == AlarmOutAct::NONE, "and is left closed when it ends");
+    CHECK(alarm_output_step(c, 2, 3) == AlarmOutAct::NONE && alarm_output_step(c, 3, -1) == AlarmOutAct::NONE,
+          "another profile taking the valve over, and ending, sends nothing");
+    CHECK(alarm_output_step(c, -1, 0) == AlarmOutAct::START && alarm_output_step(c, 0, -1) == AlarmOutAct::STOP, "a lamp is switched back");
+    CHECK(alarm_output_step(c, 1, 4) == AlarmOutAct::START && alarm_output_step(c, 4, 4) == AlarmOutAct::NONE &&
+          alarm_output_step(c, 4, -1) == AlarmOutAct::STOP && alarm_output_step(c, -1, -1) == AlarmOutAct::NONE, "a siren: new signal, same signal, stop, nothing");
+}
 int main() {
     transitions();
     arming_rules();
@@ -565,6 +701,12 @@ int main() {
     stored_states();
     stage1_state();
     adopt_states();
+    summary_and_keys();
+    changes_under_load();
+    event_names();
+    texts();
+    outputs_plan();
+    outputs_keep();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

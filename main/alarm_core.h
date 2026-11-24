@@ -172,3 +172,43 @@ bool   alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, A
 // 3 armed_home, 4 armed_night, 5 pending, 6 triggered), describing summary_profile(); {0, 0} with none.
 void   alarm_legacy_record(const AlarmConfig& c, const AlarmPanel& p, uint8_t rec[2]);
 bool   alarm_legacy_restore(const uint8_t rec[2], const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);
+
+// ── The work lists of one pass of the alarm task: what changed, which rule events to fire, the texts, what the outputs play ──
+
+bool alarm_key_parse(const char* key, AlarmKey* out);   // contact; occupancy presence vibration; water_leak smoke gas carbon_monoxide
+
+// "disarmed" | "arming" | "armed_<id>" | "pending" | "triggered": the stage 1 alarm_state, from the intrusion profiles.
+void alarm_summary_name(const AlarmConfig& c, const AlarmPanel& p, char* out, size_t cap);
+
+// The task keeps no queue of changes (stage 1 lost the ones that did not fit): it remembers what it acted on last and asks
+// what is different now. Steps in between may collapse; the final state and every alarm still come out.
+struct AlarmSeen { AlarmState state = AlarmState::DISARMED; uint32_t alarms = 0, disarms = 0; };   // what was acted on last
+struct AlarmChange {
+    uint8_t    profile;
+    AlarmState from, to;
+    uint64_t   cause;        // alarm: of that alarm; else of pending, else 0
+    bool       alarm;        // an alarm started since `seen`, even if it is over again
+    bool       by_command;   // to == disarmed because of a disarm command
+};
+// What took the profiles from `seen` to now: at most one per profile, in profile order.
+uint8_t alarm_changes(const AlarmPanel& p, const AlarmSeen* seen, AlarmChange* out);   // both [kAlarmMaxProfiles]
+void    alarm_seen(const AlarmPanel& p, AlarmSeen* seen);                              // seen := now
+
+constexpr size_t kAlarmEventMax = 40;
+// Rule events of one pass, each name once, in this order: per change "alarm_triggered_<id>" when `alarm`, then
+// "alarm_<to>_<id>" when the state moved and it is not that same name; then the stage 1 names: "alarm_triggered"
+// when an intrusion profile had an alarm, and "alarm_<summary_now>" when the summary moved. Stops when `cap` is full.
+uint8_t alarm_events(const AlarmConfig& c, const AlarmChange* ch, uint8_t n, const char* summary_was, const char* summary_now,
+                     char out[][kAlarmEventMax], uint8_t cap);
+
+enum class AlarmText : uint8_t { TRIGGERED, PANIC, REFUSED, ARMED, DISARMED, RESTARTED };
+// The spec's notification texts without the time. Never ends inside a UTF-8 character. Returns the length.
+size_t alarm_text(AlarmText t, const char* profile, const char* device, unsigned more, char* out, size_t cap);
+
+struct AlarmDrive { uint64_t ieee; int8_t output; uint16_t secs; };   // output: index into cfg.outputs, -1 = nothing sounds
+// One entry per different output device, in the order of cfg.outputs. A device follows the triggered profile that
+// lists it; with several: fire, gas, water, other, intrusion, then the lower profile index. secs: that alarm's time left.
+uint8_t alarm_drive_plan(const AlarmConfig& c, const AlarmPanel& p, uint32_t now, AlarmDrive* out);   // [kAlarmMaxOutputs]
+enum class AlarmOutAct : uint8_t { NONE, START, STOP };
+// A device followed output `was` (-1: none) and now follows `next` (-1: none).
+AlarmOutAct alarm_output_step(const AlarmConfig& c, int8_t was, int8_t next);

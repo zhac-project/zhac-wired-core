@@ -995,3 +995,148 @@ int AlarmPanel::summary_profile() const {
     for (uint8_t i = 0; i < cfg_->n_profiles; i++) if (intrusion(i) && st_[i].state != AlarmState::DISARMED) return i;
     return -1;
 }
+
+// ── The work lists of one pass of the alarm task ──
+
+namespace {
+
+// Which class wins an output device that several triggered profiles list: fire, gas, water, other, intrusion.
+constexpr uint8_t kClassRank[] = {4, 0, 2, 1, 3};   // by AlarmClass: intrusion fire water gas other
+
+// The event names of one pass: a name already in the list is not added again; nothing is added past `cap`.
+struct EventList {
+    char (*out)[kAlarmEventMax];
+    uint8_t cap;
+    uint8_t n = 0;
+
+    __attribute__((format(printf, 2, 3))) void add(const char* fmt, ...) {
+        char name[kAlarmEventMax];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(name, sizeof(name), fmt, ap);
+        va_end(ap);
+        for (uint8_t i = 0; i < n; i++) if (std::strcmp(out[i], name) == 0) return;
+        if (n < cap) std::memcpy(out[n++], name, sizeof(name));
+    }
+};
+
+}  // namespace
+
+bool alarm_key_parse(const char* key, AlarmKey* out) {
+    static constexpr struct { const char* name; AlarmKey key; } kKeys[] = {
+        {"contact", AlarmKey::CONTACT},      {"occupancy", AlarmKey::MOTION}, {"presence", AlarmKey::MOTION},
+        {"vibration", AlarmKey::MOTION},     {"water_leak", AlarmKey::WATER_LEAK}, {"smoke", AlarmKey::SMOKE},
+        {"gas", AlarmKey::GAS},              {"carbon_monoxide", AlarmKey::CO},
+    };
+    for (const auto& k : kKeys) {
+        if (key && std::strcmp(key, k.name) == 0) { *out = k.key; return true; }
+    }
+    return false;
+}
+
+void alarm_summary_name(const AlarmConfig& c, const AlarmPanel& p, char* out, size_t cap) {
+    const int i = p.summary_profile();
+    if (i < 0) { std::snprintf(out, cap, "disarmed"); return; }
+    const AlarmState s = p.at(static_cast<uint8_t>(i)).state;
+    if (s == AlarmState::ARMED) std::snprintf(out, cap, "armed_%s", c.profiles[i].id);
+    else std::snprintf(out, cap, "%s", alarm_state_name(s));
+}
+
+uint8_t alarm_changes(const AlarmPanel& p, const AlarmSeen* seen, AlarmChange* out) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < kAlarmMaxProfiles; i++) {   // slots past the config's profiles never move
+        const AlarmProfileStatus& s = p.at(i);
+        const bool alarm = s.alarms != seen[i].alarms;
+        if (s.state == seen[i].state && !alarm) continue;   // a disarm and an arm in between leave no trace to act on
+        out[n++] = {i, seen[i].state, s.state, alarm ? s.alarm_cause : alerting(s.state) ? s.cause : 0, alarm,
+                    s.state == AlarmState::DISARMED && s.disarms != seen[i].disarms};
+    }
+    return n;
+}
+
+void alarm_seen(const AlarmPanel& p, AlarmSeen* seen) {
+    for (uint8_t i = 0; i < kAlarmMaxProfiles; i++) seen[i] = {p.at(i).state, p.at(i).alarms, p.at(i).disarms};
+}
+
+uint8_t alarm_events(const AlarmConfig& c, const AlarmChange* ch, uint8_t n, const char* summary_was, const char* summary_now,
+                     char out[][kAlarmEventMax], uint8_t cap) {
+    EventList ev{out, cap};
+    bool intrusion_alarm = false;
+    for (uint8_t i = 0; i < n; i++) {
+        if (ch[i].profile >= c.n_profiles) continue;
+        const AlarmProfile& pr = c.profiles[ch[i].profile];
+        if (ch[i].alarm) {
+            ev.add("alarm_triggered_%s", pr.id);
+            intrusion_alarm |= pr.cls == AlarmClass::INTRUSION;
+        }
+        if (ch[i].to != ch[i].from) ev.add("alarm_%s_%s", alarm_state_name(ch[i].to), pr.id);   // the same name as above: once
+    }
+    if (intrusion_alarm) ev.add("alarm_triggered");
+    if (std::strcmp(summary_was, summary_now) != 0) ev.add("alarm_%s", summary_now);
+    return ev.n;
+}
+
+size_t alarm_text(AlarmText t, const char* profile, const char* device, unsigned more, char* out, size_t cap) {
+    if (!cap) return 0;
+    if (!profile) profile = "";
+    if (!device) device = "";
+    out[0] = '\0';
+    int w = 0;
+    switch (t) {
+    case AlarmText::TRIGGERED: w = std::snprintf(out, cap, "%s (%s)", device, profile); break;
+    case AlarmText::PANIC:     w = std::snprintf(out, cap, "Panic button on %s", device); break;
+    case AlarmText::REFUSED:
+        w = more ? std::snprintf(out, cap, "Not armed (%s): %s and %u more are open", profile, device, more)
+                 : std::snprintf(out, cap, "Not armed (%s): %s is open", profile, device);
+        break;
+    case AlarmText::ARMED:     w = std::snprintf(out, cap, "Armed (%s)", profile); break;
+    case AlarmText::DISARMED:  w = std::snprintf(out, cap, "Disarmed (%s)", profile); break;
+    case AlarmText::RESTARTED: w = std::snprintf(out, cap, "The hub restarted during an alarm"); break;
+    }
+    if (w < 0) { out[0] = '\0'; return 0; }
+    size_t n = static_cast<size_t>(w);
+    if (n >= cap) {   // cut: back off to the start of the last character, and drop it unless it is whole
+        n = cap - 1;
+        const auto* u = reinterpret_cast<const unsigned char*>(out);
+        size_t lead = n;
+        while (lead > 0) {
+            lead--;
+            if ((u[lead] & 0xC0) != 0x80 || n - lead >= 4) break;   // a lead byte, or too far back to belong to one
+        }
+        if (n && utf8_seq_len(u + lead, n - lead) != n - lead) n = lead;
+        out[n] = '\0';
+    }
+    return n;
+}
+
+uint8_t alarm_drive_plan(const AlarmConfig& c, const AlarmPanel& p, uint32_t now, AlarmDrive* out) {
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < c.n_outputs; k++) {
+        const AlarmOutput& o = c.outputs[k];
+        uint8_t e = 0;
+        while (e < n && out[e].ieee != o.ieee) e++;
+        if (e == n) out[n++] = {o.ieee, -1, 0};
+        if (o.profile >= c.n_profiles || p.at(o.profile).state != AlarmState::TRIGGERED) continue;
+        if (out[e].output >= 0) {   // another triggered profile has this device: the higher class, then the lower index, keeps it
+            const uint8_t held = c.outputs[out[e].output].profile;
+            const uint8_t rank_held = kClassRank[static_cast<size_t>(c.profiles[held].cls)];
+            const uint8_t rank_new = kClassRank[static_cast<size_t>(c.profiles[o.profile].cls)];
+            if (rank_new > rank_held || (rank_new == rank_held && o.profile > held)) continue;
+        }
+        const uint32_t end = p.at(o.profile).deadline;
+        out[e].output = static_cast<int8_t>(k);
+        out[e].secs = end > now ? static_cast<uint16_t>(end - now) : 0;   // never more than the profile's siren time
+    }
+    return n;
+}
+
+AlarmOutAct alarm_output_step(const AlarmConfig& c, int8_t was, int8_t next) {
+    const AlarmOutput* w = was >= 0 && was < c.n_outputs ? &c.outputs[was] : nullptr;
+    const AlarmOutput* x = next >= 0 && next < c.n_outputs ? &c.outputs[next] : nullptr;
+    if (x) {
+        if (x == w) return AlarmOutAct::NONE;
+        if (w && w->kind == AlarmOutKind::STATE && x->kind == AlarmOutKind::STATE && w->value == x->value) return AlarmOutAct::NONE;
+        return AlarmOutAct::START;
+    }
+    return w && !w->keep ? AlarmOutAct::STOP : AlarmOutAct::NONE;
+}
