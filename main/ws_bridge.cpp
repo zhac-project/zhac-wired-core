@@ -291,6 +291,7 @@ static void cmd_diagnostics_unhandled(int fd, uint32_t id) {
 static void reply_data(int fd, uint32_t id, JsonVariantConst data) {
     // PSRAM pools: `data` is copied in, and the largest (alarm.get with the largest config) runs to tens of KB.
     JsonDocument env(psram_json()); env["id"] = id; env["ok"] = true; env["data"] = data;
+    if (env.overflowed()) { send_err(fd, id, "oom"); return; }   // a cut copy is not the answer
     const size_t cap = measureJson(env) + 1;
     char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
     if (buf) ws_server_reply(fd, buf, serializeJson(env, buf, cap));
@@ -1763,15 +1764,19 @@ static void cmd_alarm_get(int fd, uint32_t id) {
     JsonObject o = d.to<JsonObject>();
     alarm_status_json(o);
     alarm_config_json(o["config"].to<JsonObject>());
+    if (d.overflowed()) { send_err(fd, id, "oom"); return; }   // a cut config would read as the whole one
     reply_data(fd, id, d);
 }
 
-// A command's profile: args.id. False (answered) when it is there and is not text, so that a
-// malformed id never reads as "no id", which for alarm.disarm means every profile.
+// A command's profile: args.id. Only an absent id is "no id", which for alarm.disarm means every profile; null, ""
+// or anything but text is refused (answered, false) as an unknown id is.
 static bool alarm_profile_arg(int fd, uint32_t id, JsonDocument& doc, const char** out) {
     JsonVariantConst v = doc["args"]["id"];
-    if (!v.isNull() && !v.is<const char*>()) { send_err(fd, id, "no such profile"); return false; }
-    *out = v | "";
+    *out = "";
+    if (v.isUnbound()) return true;
+    const char* s = v.as<const char*>();   // null unless text
+    if (!s || !*s) { send_err(fd, id, "no such profile"); return false; }
+    *out = s;
     return true;
 }
 
