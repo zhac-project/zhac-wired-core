@@ -530,9 +530,10 @@ bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* 
     return false;
 }
 
-bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap) {
+bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
+                         ArduinoJson::Allocator* pool) {
     err[0] = '\0';
-    JsonDocument doc;
+    JsonDocument doc = pool ? JsonDocument(pool) : JsonDocument();
     if (!json || deserializeJson(doc, json, len) || !doc.is<JsonObjectConst>()) return fail(err, cap, "the config must be a JSON object");
     JsonObjectConst root = doc.as<JsonObjectConst>();
     // The defaults, in place: a config is ~4.4 KB, too much for a boot-time stack.
@@ -655,8 +656,8 @@ size_t alarm_cfg_pack(const AlarmConfig& c, char* buf, size_t cap) {
 
 // Memory safety is checked (counts, indexes, the tables a number points into, text that fits its array); the limits of the
 // API (delays, siren time, ids) are not: a record that a later firmware wrote with wider limits must still load.
-bool alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out) {
-    JsonDocument doc;
+bool alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out, ArduinoJson::Allocator* pool) {
+    JsonDocument doc = pool ? JsonDocument(pool) : JsonDocument();
     if (!json || deserializeJson(doc, json, len) || !doc.is<JsonObjectConst>()) return false;
     JsonObjectConst root = doc.as<JsonObjectConst>();
     JsonArrayConst ps, ss, os, ks, cs;
@@ -722,9 +723,11 @@ bool alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out) {
     return true;
 }
 
-size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap) {
+size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap, const uint8_t* st) {
     Appender w{buf, cap};
-    w.f("{\"v\":1,\"p\":[");
+    w.f("{\"v\":1,");
+    if (st) w.f("\"l\":[%u,%u],", static_cast<unsigned>(st[0]), static_cast<unsigned>(st[1]));
+    w.f("\"p\":[");
     for (uint8_t i = 0; i < c.n_profiles; i++) {
         w.f("%s[", i ? "," : "");
         w.str(c.profiles[i].id);
@@ -790,6 +793,31 @@ bool alarm_legacy_restore(const uint8_t rec[2], const AlarmConfig& c, AlarmPanel
         if (rec[0] == 6) *sounding = *in_alarm;
     }
     return true;
+}
+
+AlarmRestored alarm_states_restore(const char* st2, size_t len, const uint8_t* st, const AlarmConfig& c, AlarmPanel* p,
+                                   uint8_t* in_alarm, uint8_t* sounding) {
+    *in_alarm = *sounding = 0;
+    if (st && (st[0] > 6 || st[1] > 6)) st = nullptr;   // a stage 1 record that does not read is no record
+    if (!len || !alarm_states_unpack(st2, len, c, p, in_alarm, sounding))
+        return st && alarm_legacy_restore(st, c, p, in_alarm, sounding) ? AlarmRestored::OLD : AlarmRestored::NOTHING;
+    // Every profile is restored. Is "st" still the one this "st2" was written beside?
+    JsonDocument doc;
+    unsigned was[2];
+    if (!st || deserializeJson(doc, st2, len)) return AlarmRestored::NEW;
+    JsonArrayConst l = doc["l"].as<JsonArrayConst>();
+    if (!row_num(l, 0, 6, &was[0]) || !row_num(l, 1, 6, &was[1]) || (was[0] == st[0] && was[1] == st[1])) return AlarmRestored::NEW;
+    // No: the stage 1 firmware wrote it since. What it says of the intrusion profiles is newer.
+    uint8_t intrusion = 0, alarm = 0, sound = 0;
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        if (c.profiles[i].cls != AlarmClass::INTRUSION) continue;
+        intrusion |= static_cast<uint8_t>(1u << i);
+        p->restore(i, false);
+    }
+    alarm_legacy_restore(st, c, p, &alarm, &sound);
+    *in_alarm = static_cast<uint8_t>((*in_alarm & ~intrusion) | alarm);
+    *sounding = static_cast<uint8_t>((*sounding & ~intrusion) | sound);
+    return AlarmRestored::MIXED;
 }
 
 const char* alarm_output_misfit(AlarmOutKind kind, const char* exposes, size_t len) {

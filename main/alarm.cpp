@@ -29,6 +29,7 @@
 #include "device_shadow.h"
 #include "event_bus.h"
 #include "local_dev.h"
+#include "psram_json.h"
 #include "remote_client.h"
 #include "tg_gw.h"
 #include "ws_bridge.h"
@@ -43,7 +44,7 @@ namespace {
 const char* const TAG = "alarm";
 constexpr char     kNs[] = "alarm";
 constexpr size_t   kExposesMax = 2048;
-constexpr size_t   kStatesMax = 256;        // "st2": eight profiles pack to 190 bytes
+constexpr size_t   kStatesMax = 256;        // "st2": eight profiles pack to 200 bytes
 constexpr size_t   kSummaryMax = 24;        // "armed_" + an id
 constexpr uint8_t  kEventsMax = 20;         // one pass gives 18 names at most
 constexpr uint32_t kBootAlertDelayS = 60;   // the network and the cloud link come up first
@@ -91,7 +92,8 @@ TaskHandle_t  s_task = nullptr;
 bool     s_boot_alert = false;              // restarted during pending or triggered
 char     s_st2_saved[kStatesMax];           // the "st2" record flash holds
 size_t   s_st2_len = 0;
-uint8_t  s_st_saved[2] = {0xFF, 0xFF};      // the stage 1 "st" record flash holds
+uint8_t  s_st_saved[2] = {0, 0};            // the stage 1 "st" record flash holds, when s_st_have
+bool     s_st_have = false;
 char     s_summary[kSummaryMax] = "disarmed";   // the alarm_state acted on last
 uint64_t s_summary_cause = 0;               // ... and the device behind its alarm_sensor
 
@@ -321,7 +323,7 @@ void drive(const AlarmOutput& o, bool on, uint16_t secs) {
 }
 
 void push_changed() {
-    JsonDocument d;
+    JsonDocument d(psram_json());   // kilobytes with eight profiles: not from internal RAM
     alarm_status_json(d.to<JsonObject>());
     ws_push("alarm.changed", d);
 }
@@ -354,12 +356,20 @@ struct Pass {
     char         summary[kSummaryMax];
     uint64_t     summary_cause;              // the device behind the summary's pending or triggered, else 0
     char         events[kEventsMax][kAlarmEventMax];
-    char         st2[kStatesMax];
-    size_t       st2_len;
-    uint8_t      st[2];
+    uint8_t      st[2];                      // the stage 1 state record as of this look
     Orphan       orphans[kAlarmMaxOutputs];
     Act          acts[kAlarmMaxOutputs];
 };
+
+// One more output command of the pass (the caller holds s_mu). They stay in the order of the config's outputs, so
+// that a profile's valve comes before its sirens also when an earlier profile lists that siren too (the plan has
+// each device where it is listed first).
+void add_act(Pass& p, bool on, uint8_t k, uint16_t secs) {
+    if (p.n_act >= kAlarmMaxOutputs) return;   // cannot be: each command is for another output
+    uint8_t at = p.n_act++;
+    for (; at > 0 && p.acts[at - 1].index > k; at--) p.acts[at] = p.acts[at - 1];
+    p.acts[at] = {on, k, secs, s_cfg->outputs[k]};
+}
 
 // `boot_stop`: a minute after a restart during an alarm, what sounded before it and does not sound now is stopped.
 void look(uint32_t now, bool boot_stop, Pass& p) {
@@ -387,8 +397,7 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     const int sp = s_panel->summary_profile();
     const AlarmState ss = sp >= 0 ? s_panel->at(static_cast<uint8_t>(sp)).state : AlarmState::DISARMED;
     p.summary_cause = ss == AlarmState::PENDING || ss == AlarmState::TRIGGERED ? s_panel->at(static_cast<uint8_t>(sp)).cause : 0;
-    p.n_ev    = alarm_events(*s_cfg, p.ch, p.n_ch, s_summary, p.summary, p.events, kEventsMax);
-    p.st2_len = alarm_states_pack(*s_cfg, *s_panel, p.st2, sizeof(p.st2));
+    p.n_ev = alarm_events(*s_cfg, p.ch, p.n_ch, s_summary, p.summary, p.events, kEventsMax);
     alarm_legacy_record(*s_cfg, *s_panel, p.st);
 
     p.n_orphans = s_n_orphans;
@@ -402,31 +411,47 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
             if (s_cfg->outputs[k].ieee == plan[e].ieee && (s_boot_sounding >> s_cfg->outputs[k].profile & 1)) was = static_cast<int8_t>(k);
         const AlarmOutAct a = alarm_output_step(*s_cfg, was, plan[e].output);
         s_follows[e] = plan[e].output;
-        if (a == AlarmOutAct::NONE) continue;
-        // In the order the profiles list their outputs, so that a valve comes before the sirens also when an
-        // earlier profile lists that siren too (the plan has each device where it is listed first).
-        const uint8_t k = static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was);
-        uint8_t at = p.n_act++;
-        for (; at > 0 && p.acts[at - 1].index > k; at--) p.acts[at] = p.acts[at - 1];
-        p.acts[at] = {a == AlarmOutAct::START, k, plan[e].secs, s_cfg->outputs[k]};
+        if (a != AlarmOutAct::NONE) add_act(p, a == AlarmOutAct::START, static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was), plan[e].secs);
     }
     if (boot_stop) s_boot_sounding = 0;
-}
-
-// The states of all profiles ("st2") and the stage 1 record ("st") that follows the intrusion profiles, each when
-// it differs from what flash holds. A write that fails is logged and the change still takes effect.
-void save_states(const Pass& p) {
-    if (p.st2_len != s_st2_len || std::memcmp(p.st2, s_st2_saved, p.st2_len) != 0) {
-        if (p.st2_len && nvs_put("st2", p.st2, p.st2_len)) {
-            std::memcpy(s_st2_saved, p.st2, p.st2_len);
-            s_st2_len = p.st2_len;
-        } else {
-            ESP_LOGW(TAG, "states not saved: a restart comes back to the ones saved last");
+    // An alarm that is over before the task looks (silenced inside one busy pass) still sets the outputs that are
+    // left as set: a valve closes for every leak alarm, however short. The other outputs follow the state of now.
+    for (uint8_t i = 0; i < p.n_ch; i++) {
+        for (uint8_t k = 0; p.ch[i].alarm && k < s_cfg->n_outputs; k++) {
+            const AlarmOutput& o = s_cfg->outputs[k];
+            if (o.profile != p.ch[i].profile || o.kind != AlarmOutKind::STATE || !o.keep) continue;
+            bool set = false;   // by the plan, in this pass
+            for (uint8_t a = 0; a < p.n_act; a++) set = set || (p.acts[a].on && p.acts[a].out.ieee == o.ieee);
+            if (!set) add_act(p, true, k, 0);
         }
     }
-    if (std::memcmp(p.st, s_st_saved, sizeof(p.st)) != 0) {
-        if (nvs_put("st", p.st, sizeof(p.st))) std::memcpy(s_st_saved, p.st, sizeof(p.st));
-        else ESP_LOGW(TAG, "stage 1 state record not saved: a fall back to that firmware finds the one saved last");
+}
+
+// The stage 1 record ("st", which follows the intrusion profiles) and the states of all profiles ("st2"), each when
+// it differs from what flash holds. "st" goes first, and "st2" carries the "st" that flash holds then: a boot that
+// finds another "st" beside it knows the stage 1 firmware wrote that one since (alarm_states_restore). A write that
+// fails is logged and the change still takes effect; a failed "st" leaves the two agreeing.
+void save_states(const Pass& p) {
+    if (!s_st_have || std::memcmp(p.st, s_st_saved, sizeof(p.st)) != 0) {
+        if (nvs_put("st", p.st, sizeof(p.st))) {
+            std::memcpy(s_st_saved, p.st, sizeof(p.st));
+            s_st_have = true;
+        } else {
+            ESP_LOGW(TAG, "stage 1 state record not saved: a fall back to that firmware finds the one saved last");
+        }
+    }
+    static char st2[kStatesMax];
+    size_t len;
+    {
+        Lock l;   // the states of now: never older than the "st" just written
+        len = alarm_states_pack(*s_cfg, *s_panel, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
+    }
+    if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) return;
+    if (len && nvs_put("st2", st2, len)) {
+        std::memcpy(s_st2_saved, st2, len);
+        s_st2_len = len;
+    } else {
+        ESP_LOGW(TAG, "states not saved: a restart comes back to the ones saved last");
     }
 }
 
@@ -743,29 +768,36 @@ void alarm_early_init() {
     char* buf = static_cast<char*>(heap_caps_malloc(kAlarmStoredMax, MALLOC_CAP_SPIRAM));
     bool have = false;
     if (const size_t len = buf ? nvs_get("cfg2", buf, kAlarmStoredMax) : 0) {
-        have = alarm_cfg_unpack(buf, len, s_cfg);
+        have = alarm_cfg_unpack(buf, len, s_cfg, psram_json());
         if (!have) ESP_LOGE(TAG, "stored config unreadable: trying the stage 1 one");
     }
     if (!have) {
         if (const size_t len = buf ? nvs_get("cfg", buf, kAlarmStoredMax) : 0) {
             char err[96] = "";
-            have = alarm_cfg_from_json(buf, len, nullptr, s_cfg, err, sizeof(err));
+            have = alarm_cfg_from_json(buf, len, nullptr, s_cfg, err, sizeof(err), psram_json());
             if (!have) ESP_LOGE(TAG, "stage 1 config unreadable (%s): empty profiles this boot", err);
         }
     }
     if (!have) alarm_cfg_defaults(s_cfg);
     heap_caps_free(buf);
 
-    // The states: "st2", else the stage 1 "st". Both are kept as read: the task writes one only when it differs.
+    // The states: "st2"; the intrusion profiles from the stage 1 "st" when that firmware wrote it since; "st" alone
+    // when there is no "st2" (alarm_states_restore). Both are kept as read: the task writes one only when it differs.
     uint8_t in_alarm = 0;
     s_st2_len = nvs_get("st2", s_st2_saved, sizeof(s_st2_saved));
-    const bool have_st = nvs_get("st", s_st_saved, sizeof(s_st_saved)) == sizeof(s_st_saved);
-    if (!have_st) std::memset(s_st_saved, 0xFF, sizeof(s_st_saved));
-    bool restored = s_st2_len && alarm_states_unpack(s_st2_saved, s_st2_len, *s_cfg, s_panel, &in_alarm, &s_boot_sounding);
-    if (s_st2_len && !restored) ESP_LOGE(TAG, "stored states unreadable: trying the stage 1 record");
-    if (!restored && have_st) {
-        restored = alarm_legacy_restore(s_st_saved, *s_cfg, s_panel, &in_alarm, &s_boot_sounding);
-        if (!restored) ESP_LOGE(TAG, "stage 1 state record unreadable: every profile starts disarmed");
+    s_st_have = nvs_get("st", s_st_saved, sizeof(s_st_saved)) == sizeof(s_st_saved);
+    switch (alarm_states_restore(s_st2_saved, s_st2_len, s_st_have ? s_st_saved : nullptr, *s_cfg, s_panel, &in_alarm, &s_boot_sounding)) {
+    case AlarmRestored::NEW:
+        break;
+    case AlarmRestored::MIXED:
+        ESP_LOGW(TAG, "the stage 1 firmware armed or disarmed since: the intrusion profiles come from its record");
+        break;
+    case AlarmRestored::OLD:
+        if (s_st2_len) ESP_LOGE(TAG, "stored states unreadable: the stage 1 record is used");
+        break;
+    case AlarmRestored::NOTHING:
+        if (s_st2_len || s_st_have) ESP_LOGE(TAG, "stored states unreadable: every profile starts disarmed");
+        break;
     }
     s_boot_alert = in_alarm != 0;
     alarm_seen(*s_panel, s_seen);   // the restored states are where the task starts from, not changes
@@ -876,7 +908,7 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
         // First: no edit meets a running timer or a sounding output.
         ok = !s_panel->running();
         if (!ok) std::snprintf(err, cap, "an alarm is running: disarm or wait, then save");
-        else ok = alarm_cfg_from_json(json, len, s_cfg, next, err, cap);
+        else ok = alarm_cfg_from_json(json, len, s_cfg, next, err, cap, psram_json());
         // A profile that keeps its id keeps its class: the summary, the outputs' order and the user's rules hang on it.
         for (uint8_t i = 0; ok && i < next->n_profiles; i++) {
             const int was = alarm_cfg_profile(*s_cfg, next->profiles[i].id);

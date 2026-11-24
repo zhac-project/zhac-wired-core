@@ -289,7 +289,8 @@ static void cmd_diagnostics_unhandled(int fd, uint32_t id) {
 // Envelope + data, sized to fit (review F10, F30: fixed reply buffers cut a
 // 16-member group and the diagnostics list off mid-JSON).
 static void reply_data(int fd, uint32_t id, JsonVariantConst data) {
-    JsonDocument env; env["id"] = id; env["ok"] = true; env["data"] = data;
+    // PSRAM pools: `data` is copied in, and the largest (alarm.get with the largest config) runs to tens of KB.
+    JsonDocument env(psram_json()); env["id"] = id; env["ok"] = true; env["data"] = data;
     const size_t cap = measureJson(env) + 1;
     char* buf = (char*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
     if (buf) ws_server_reply(fd, buf, serializeJson(env, buf, cap));
@@ -1758,7 +1759,7 @@ static void cmd_alerts_get(int fd, uint32_t id) {
 // ── alarm.* (Safety profiles, spec 2026-11-24) ────────────────────────
 // The hub page's panel. Not on the cloud link: remote_allow lists none of them.
 static void cmd_alarm_get(int fd, uint32_t id) {
-    JsonDocument d;
+    JsonDocument d(psram_json());   // the status and the whole config: tens of KB at the limits
     JsonObject o = d.to<JsonObject>();
     alarm_status_json(o);
     alarm_config_json(o["config"].to<JsonObject>());
@@ -2053,7 +2054,8 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
 }
 
 static void ws_rx(int fd, const char* data, size_t len) {
-    JsonDocument doc;
+    // PSRAM pools for every command: a frame may be 32 KB (alarm.config.set), and its document several times that.
+    JsonDocument doc(psram_json());
     if (deserializeJson(doc, data, len)) { send_err(fd, 0, "bad json"); return; }
     dispatch_envelope(fd, doc);
 }

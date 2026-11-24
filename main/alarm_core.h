@@ -87,7 +87,10 @@ const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
 // The API form (alarm.config.set, alarm.get). An object without "profiles" is the stage 1 form and is converted.
 // "codes" left out keeps `keep`'s codes; "codes":[] clears them. False with the first problem in `err`.
 // `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack) and is partly filled on failure.
-bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap);
+// `pool`: where the parse takes its memory; null is the default allocator. The firmware gives PSRAM: the largest
+// config parses to tens of KB.
+bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
+                         ArduinoJson::Allocator* pool = nullptr);
 void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject o);   // with_codes false: "codes_count"
 void alarm_cfg_defaults(AlarmConfig* out);                                   // a hub with no record: away, home, night
 
@@ -162,9 +165,11 @@ constexpr size_t kAlarmStoredMax = 8192;   // the largest config the limits allo
 // The stored config ("cfg2"): arrays without key names, each sensor once with the set of its profiles. Returns the length,
 // or 0 when it does not fit `cap` (with its NUL): nothing is cut. Unknown keys and extra array items are ignored when read.
 size_t alarm_cfg_pack(const AlarmConfig& c, char* buf, size_t cap);
-bool   alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out);   // built in place, partly filled on failure, like alarm_cfg_from_json
-// The stored states ("st2"): {"v":1,"p":[[id, state, rests_armed], ...]} for every profile.
-size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap);
+// Built in place, partly filled on failure, and with `pool`, like alarm_cfg_from_json.
+bool   alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out, ArduinoJson::Allocator* pool = nullptr);
+// The stored states ("st2"): {"v":1,"l":[state, resting],"p":[[id, state, rests_armed], ...]} for every profile.
+// "l" is the stage 1 record ("st") as flash holds it when this is written; left out when `st` is null.
+size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap, const uint8_t* st = nullptr);
 // Restores each profile named in the record that the config still has; a damaged record restores nothing. `in_alarm` /
 // `sounding`: bit i set when profile i was pending or triggered / triggered when the record was written.
 bool   alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);
@@ -172,6 +177,18 @@ bool   alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, A
 // 3 armed_home, 4 armed_night, 5 pending, 6 triggered), describing summary_profile(); {0, 0} with none.
 void   alarm_legacy_record(const AlarmConfig& c, const AlarmPanel& p, uint8_t rec[2]);
 bool   alarm_legacy_restore(const uint8_t rec[2], const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);
+// What a boot restores from both records (`st2` with len 0: there is none; `st` null: there is none).
+enum class AlarmRestored : uint8_t {
+    NOTHING,   // no record that reads: every profile starts disarmed
+    NEW,       // every profile from "st2"
+    MIXED,     // "st2", but the intrusion profiles from a "st" the stage 1 firmware wrote after it
+    OLD,       // "st" alone: there is no "st2", or it does not read
+};
+// "st2" restores every profile. When the "st" beside it is not the one it was written with ("l"), the hub ran the
+// stage 1 firmware since (a fall back) and was armed or disarmed there: the intrusion profiles, and their bits of
+// `in_alarm` and `sounding`, then come from "st". A "st2" that carries no "l" wins as it is.
+AlarmRestored alarm_states_restore(const char* st2, size_t len, const uint8_t* st, const AlarmConfig& c, AlarmPanel* p,
+                                   uint8_t* in_alarm, uint8_t* sounding);
 
 // ── The work lists of one pass of the alarm task: what changed, which rule events to fire, the texts, what the outputs play ──
 

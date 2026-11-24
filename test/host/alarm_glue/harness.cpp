@@ -1,0 +1,571 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Host check of the alarm panel's glue (Safety profiles, spec 2026-11-24). It includes main/alarm.cpp itself (run.sh
+// copies it beside this file), fakes everything around it and runs the real task loop, in turns with the test, on a fake clock.
+// Every fake of the shadow, the pool, device_cmd, NVS, the event bus, the cloud, Telegram and the page aborts when
+// it is called under the alarm mutex, and the mutex aborts when it is taken twice. Modes (alarm.cpp's statics live
+// as long as the process, so one boot is one run): main, a day of use; boot and legacy, a restart during an alarm
+// from the new records and from the stage 1 records; fallback, a boot after the stage 1 firmware armed the hub.
+#include "alarm.cpp"
+
+#include <condition_variable>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+
+int      g_lock_depth = 0;
+int      g_notified = 0;
+int      g_sleeps_left = 0;
+uint64_t g_now_us = 1000000;
+bool     g_log = false;
+bool     g_nvs_fail = false;
+std::string g_nvs_fail_key;
+std::vector<std::string> g_trace;
+std::map<std::string, std::string> g_nvs;
+std::vector<std::string> g_all_cmds;   // never cleared
+
+namespace h {
+
+struct Dev { const char* name; const char* exposes; };
+std::map<uint64_t, Dev> devs = {
+    {0x1, {"Front door", R"([{"name":"contact","type":"binary","access":1}])"}},
+    {0x2, {"Hall motion", R"([{"name":"occupancy","type":"binary","access":1}])"}},
+    {0x3, {"Kitchen leak", R"([{"name":"water_leak","type":"binary","access":1}])"}},
+    {0x4, {"Smoke", R"([{"name":"smoke","type":"binary","access":1}])"}},
+    {0x10, {"Siren", R"([{"name":"warning","type":"composite","access":2}])"}},
+    {0x11, {"Valve", R"([{"name":"state","type":"binary","access":7}])"}},
+    {0x12, {"Plug", R"([{"name":"state","type":"binary","access":7}])"}},
+    {0x20, {"Keypad", R"([{"name":"action","type":"enum","access":1}])"}},
+};
+std::map<std::pair<uint64_t, std::string>, int> vals;     // the shadow's last sensor values
+std::map<std::string, std::string> alarm_attrs;           // the Alarm device in the shadow
+device_cmd_local_fn   local_cmd_fn = nullptr;
+zhac_local_exposes_fn local_exposes_fn = nullptr;
+EventHandler on_event;
+EventFilter  filter;
+ZapDevice    alarm_dev{};
+bool         have_alarm_dev = false;
+int          fails = 0, checks = 0;
+std::function<void()> on_cmd;   // run once inside the next output command: what happens while it blocks
+
+void trace(const std::string& s) { g_trace.push_back(s); }
+int idx(const char* sub, size_t from = 0) {
+    for (size_t i = from; i < g_trace.size(); i++) if (g_trace[i].find(sub) != std::string::npos) return static_cast<int>(i);
+    return -1;
+}
+int pos(const char* exact) {   // the first entry that is exactly this
+    for (size_t i = 0; i < g_trace.size(); i++) if (g_trace[i] == exact) return static_cast<int>(i);
+    return -1;
+}
+int cnt(const char* sub) {
+    int n = 0;
+    for (const auto& s : g_trace) n += s.find(sub) != std::string::npos;
+    return n;
+}
+void dump() { for (const auto& s : g_trace) std::printf("      %s\n", s.c_str()); }
+#define CHECK(c, what) do { h::checks++; if (!(c)) { std::printf("FAIL: %s (line %d)\n", what, __LINE__); h::fails++; h::dump(); } } while (0)
+
+// The real task loop on its own thread, but never beside the test: one of the two runs, the other waits for its
+// turn. The task keeps its locals between the test's steps, as on the hub.
+std::mutex&              turn_mu = *new std::mutex;   // never destroyed: the task still waits on them at exit
+std::condition_variable& turn_cv = *new std::condition_variable;
+bool task_turn = false, task_started = false;
+void take_turn(bool task) {   // hand over, then wait to be handed back
+    std::unique_lock<std::mutex> l(turn_mu);
+    task_turn = !task;
+    turn_cv.notify_all();
+    turn_cv.wait(l, [task] { return task_turn == task; });
+}
+// Let the task run until it has nothing to do; it may sleep `sleeps` times first (1 s each while an alarm runs).
+void run_task(int sleeps = 0) {
+    g_sleeps_left = sleeps;
+    if (!task_started) {
+        task_started = true;
+        std::thread([] {
+            {
+                std::unique_lock<std::mutex> l(turn_mu);
+                turn_cv.wait(l, [] { return task_turn; });
+            }
+            alarm_task(nullptr);
+        }).detach();
+    }
+    take_turn(false);
+}
+void emit(uint64_t ieee, const char* key, int v, const char* str = nullptr, bool more = false) {
+    if (!str) vals[{ieee, key}] = v;
+    Event e{};
+    e.type = EventType::ZCL_ATTR;
+    auto* z = reinterpret_cast<ZclAttrEvent*>(e.data);
+    z->ieee = ieee;
+    std::snprintf(z->key, sizeof(z->key), "%s", key);
+    z->val_type = str ? VAL_STR : VAL_BOOL;
+    if (str) std::snprintf(z->str_val, sizeof(z->str_val), "%s", str);
+    else z->int_val = v;
+    z->more = more;
+    if (filter(e)) on_event(e);
+}
+std::string status() {
+    JsonDocument d;
+    alarm_status_json(d.to<JsonObject>());
+    std::string s;
+    serializeJson(d, s);
+    return s;
+}
+DevCmdResult cmd(const char* key, const char* value) {
+    const DevCmdValue v = device_cmd_str(value);
+    return local_cmd_fn(kAlarmIeee, key, &v);
+}
+bool save(const char* json, std::string* why = nullptr) {
+    char err[160] = "";
+    const bool ok = alarm_config_set(json, std::strlen(json), err, sizeof(err));
+    if (why) *why = err;
+    return ok;
+}
+void boot() {
+    alarm_early_init();
+    alarm_attach_device();
+    alarm_start();
+}
+
+}  // namespace h
+
+// ── The fakes ──
+void zigbee_pool_lock() { OUTSIDE_LOCK("zigbee_pool_lock"); }
+void zigbee_pool_unlock() {}
+ZapDevice* pool_find_by_ieee(uint64_t ieee) { return ieee == kAlarmIeee && h::have_alarm_dev ? &h::alarm_dev : nullptr; }
+ZapDevice* pool_add() { h::have_alarm_dev = true; return &h::alarm_dev; }
+bool zigbee_pool_snapshot(uint64_t ieee, ZapDevice* out) {
+    OUTSIDE_LOCK("zigbee_pool_snapshot");
+    const auto it = h::devs.find(ieee);
+    if (it == h::devs.end()) return false;
+    *out = ZapDevice{};
+    out->ieee_addr = ieee;
+    std::snprintf(out->friendly_name, sizeof(out->friendly_name), "%s", it->second.name);
+    return true;
+}
+bool zap_store_save_device(const ZapDevice*) { OUTSIDE_LOCK("zap_store_save_device"); return true; }
+bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
+    OUTSIDE_LOCK("device_shadow_get_attr");
+    const auto it = h::vals.find({ieee, key});
+    if (it == h::vals.end()) return false;
+    out->val_type = VAL_BOOL;
+    out->int_val = it->second;
+    return true;
+}
+uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max) {
+    OUTSIDE_LOCK("device_shadow_get_attrs");
+    uint8_t n = 0;
+    if (ieee != kAlarmIeee) return 0;
+    for (const auto& kv : h::alarm_attrs) {
+        if (n == max) break;
+        out[n] = ShadowAttr{};
+        std::snprintf(out[n++].key, ATTR_KEY_MAX, "%s", kv.first.c_str());
+    }
+    return n;
+}
+void device_shadow_process_ieee(uint64_t ieee, const ZclAttribute* a, uint8_t n) {
+    OUTSIDE_LOCK("device_shadow_process_ieee");
+    if (ieee != kAlarmIeee) std::abort();
+    for (uint8_t i = 0; i < n; i++) {
+        h::alarm_attrs[a[i].key] = a[i].str_val;
+        h::trace(std::string("attr:") + a[i].key + "=" + a[i].str_val);
+    }
+    h::alarm_attrs["_last_seen"] = "1";   // the shadow's own
+}
+bool device_shadow_remove_attr(uint64_t, const char* key) {
+    OUTSIDE_LOCK("device_shadow_remove_attr");
+    h::trace(std::string("rm:") + key);
+    return h::alarm_attrs.erase(key) > 0;
+}
+DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t, const char* key, const DevCmdValue* v) {
+    OUTSIDE_LOCK("device_cmd_set_attr");
+    char b[96];
+    if (v->kind == DEVCMD_STR) std::snprintf(b, sizeof(b), "cmd:%" PRIx64 ":%s=%s", ieee, key, v->s);
+    else std::snprintf(b, sizeof(b), "cmd:%" PRIx64 ":%s=%d", ieee, key, v->kind == DEVCMD_BOOL ? v->b : static_cast<int>(v->i));
+    h::trace(b);
+    g_all_cmds.push_back(b);
+    if (h::on_cmd) { auto f = h::on_cmd; h::on_cmd = nullptr; f(); }
+    return DEVCMD_OK;
+}
+const char* device_cmd_result_str(DevCmdResult) { return "x"; }
+extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee, const char*, const char*, char* buf, size_t cap) {
+    OUTSIDE_LOCK("zhac_adapter_build_exposes_json");
+    if (ieee == kAlarmIeee) return h::local_exposes_fn(ieee, buf, cap);
+    const auto it = h::devs.find(ieee);
+    if (it == h::devs.end()) return 0;
+    const int n = std::snprintf(buf, cap, "%s", it->second.exposes);
+    return static_cast<size_t>(n) < cap ? static_cast<size_t>(n) : 0;
+}
+void local_dev_register(uint64_t, device_cmd_local_fn c, zhac_local_exposes_fn e) { h::local_cmd_fn = c; h::local_exposes_fn = e; }
+void event_bus_publish(const Event& e) {
+    OUTSIDE_LOCK("event_bus_publish");
+    if (e.type == EventType::RULE_EVENT) h::trace(std::string("event:") + reinterpret_cast<const RuleEventPayload*>(e.data)->name);
+    else if (e.type == EventType::DEVICE_JOIN) h::trace("join");
+    else std::abort();
+}
+EventSubHandle event_bus_subscribe(EventType, EventHandler cb, EventFilter f, uint8_t) { h::on_event = cb; h::filter = f; return 1; }
+extern "C" void remote_client_publish_event(const char* name, const char* json, size_t len) {
+    OUTSIDE_LOCK("remote_client_publish_event");
+    h::trace(std::string(name) + ":" + std::string(json, len));
+}
+extern "C" bool tg_gw_send(const char* text, const char*, const char*) { OUTSIDE_LOCK("tg_gw_send"); h::trace(std::string("tg:") + text); return true; }
+void ws_push(const char* event, JsonDocument& d) {
+    OUTSIDE_LOCK("ws_push");
+    std::string s;
+    serializeJson(d, s);
+    h::trace(std::string("push:") + event + ":" + s);
+}
+
+void host_yield() { h::take_turn(true); }
+
+using h::cnt; using h::idx; using h::pos; using h::run_task; using h::emit;
+
+const char* kCfg = R"({"profiles":[
+ {"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":0,"trigger_delay":5,"siren_time":10,"notify_arm":true,
+  "sensors":[{"ieee":"0x1","entry":true},{"ieee":"0x2","entry":false}],
+  "outputs":[{"ieee":"0x10","kind":"warning","mode":"burglar","level":"high","strobe":true}]},
+ {"id":"night","name":"Night","class":"intrusion","role":"night","arm_delay":30,"trigger_delay":0,"siren_time":10,"notify_arm":false,
+  "sensors":[{"ieee":"0x1","entry":false}],"outputs":[]},
+ {"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,"notify_arm":true,
+  "sensors":[{"ieee":"0x3","entry":false}],
+  "outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true},{"ieee":"0x10","kind":"warning","mode":"emergency","level":"high","strobe":true}]}],
+ "keypads":[{"ieee":"0x20","trusted":false}],"codes":["1234"]})";
+
+int main_flow() {
+    // ── Boot with no records: the three default profiles, attributes published, nothing else ──
+    h::boot();
+    run_task();
+    CHECK(idx("attr:alarm_sensor=") == 0 && idx("attr:away=disarmed") == 1 && idx("attr:home=disarmed") == 2 &&
+          idx("attr:night=disarmed") == 3 && idx("attr:alarm_state=disarmed") == 4 && g_trace.size() == 5,
+          "boot: alarm_sensor, the profiles, alarm_state, and nothing else (no event, no write, no push)");
+
+    // ── A save: cfg2 only, the new hazard profile armed, the attribute list follows ──
+    g_trace.clear();
+    std::string why;
+    CHECK(h::save(kCfg, &why), "the config saves");
+    CHECK(cnt("nvs:cfg2") == 1 && cnt("nvs:cfg") == 1, "the save writes cfg2 and never cfg");
+    run_task();
+    CHECK(h::alarm_attrs.count("home") == 0 && idx("rm:home") >= 0 && idx("rm:_last_seen") < 0, "home's attribute left the device; the shadow's own stayed");
+    CHECK(h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed" && h::alarm_attrs["night"] == "disarmed", "every profile's attribute published");
+    CHECK(cnt("join") == 1 && idx("rm:home") < idx("attr:flood=armed") && idx("attr:flood=armed") < idx("join"), "removed, published, then announced");
+    CHECK(cnt("alert:") == 1 && idx("\"kind\":\"alarm_armed\"") >= 0 && idx("Armed (Flood) at ") >= 0 && idx("\"name\":\"flood\"") >= 0, "the new flood profile is armed and says so, keyed by its id");
+    CHECK(idx("event:alarm_armed_flood") >= 0 && cnt("event:") == 1, "one event for it; the summary did not move");
+    CHECK(cnt("attr:alarm_state") == 0, "alarm_state is not published again when the summary did not move");
+    CHECK(cnt("nvs:st2") == 1 && cnt("nvs:st") == 2 && g_nvs["st"] == std::string("\0\0", 2), "st2 and st written in the same pass");
+    CHECK(pos("nvs:st") >= 0 && pos("nvs:st") < pos("nvs:st2") && g_nvs["st2"].rfind("{\"v\":1,\"l\":[0,0],\"p\":[", 0) == 0,
+          "st first; st2 carries the st that flash holds (ruling 17)");
+    CHECK(idx("nvs:st2") < idx("alert:") && idx("alert:") < idx("attr:flood") && idx("attr:flood") < idx("event:") && idx("event:") < idx("push:alarm.changed"),
+          "pass order: states, notifications, attributes, events, (outputs), page");
+
+    // ── Arm away from the page ──
+    g_trace.clear();
+    uint64_t open[kAlarmMaxSensors];
+    uint8_t n_open = 9;
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK && n_open == 0, "away arms");
+    CHECK(alarm_arm("nope", false, open, &n_open) == AlarmReply::NO_PROFILE, "an unknown id is no profile");
+    run_task();
+    {
+        const int a = idx("attr:alarm_sensor="), b = idx("attr:away=armed"), c = idx("attr:alarm_state=armed_away");
+        CHECK(a >= 0 && b == a + 1 && c == b + 1, "alarm_sensor first, the profile, alarm_state last");
+    }
+    CHECK(cnt("event:alarm_armed_away") == 1 && cnt("event:") == 1, "alarm_armed_away fires once");
+    CHECK(idx("Armed (Away) at ") >= 0 && idx("tg:Alarm: Armed (Away) at ") >= 0, "armed notice, Telegram with Alarm: in front");
+    CHECK(g_nvs["st"] == std::string("\2\2", 2), "the stage 1 record says armed_away");
+
+    // ── The entry door: pending, then triggered when the delay ends ──
+    g_trace.clear();
+    emit(0x1, "contact", 0);
+    run_task();
+    CHECK(idx("attr:alarm_sensor=Front door") >= 0 && idx("attr:away=pending") >= 0 && idx("attr:alarm_state=pending") >= 0, "pending with its sensor");
+    CHECK(idx("event:alarm_pending_away") >= 0 && idx("event:alarm_pending") >= 0 && cnt("\"kind\":\"alarm\"") == 0 && cnt("cmd:") == 0, "pending: events, no alert, no output");
+    CHECK(h::status().find("\"left\":5") != std::string::npos && h::status().find("\"sensor\":\"Front door\"") != std::string::npos, "the status counts the delay down and names the door");
+    g_trace.clear();
+    run_task(5);
+    CHECK(idx("\"kind\":\"alarm\"") >= 0 && idx("\"message\":\"Front door (Away) at ") >= 0 && idx("\"ieee\":\"0x0000000000000001\"") >= 0 && g_trace[idx("\"kind\":\"alarm\"")].find("\"name\"") == std::string::npos, "the alarm alert, keyed by its sensor");
+    CHECK(idx("tg:Alarm: Front door (Away) at ") >= 0, "the alarm on Telegram");
+    CHECK(cnt("cmd:") == 1 && idx("cmd:10:warning=burglar,high,1,10") >= 0, "the siren starts for the whole alarm time");
+    CHECK(idx("event:alarm_triggered_away") >= 0 && idx("event:alarm_triggered") >= 0, "both trigger events");
+    CHECK(idx("nvs:st2") < idx("alert:") && idx("alert:") < idx("attr:away=triggered") && idx("attr:alarm_state=triggered") < idx("event:alarm_triggered_away") &&
+          idx("event:alarm_triggered") < idx("cmd:10") && idx("cmd:10") < idx("push:alarm.changed"), "pass order with an output");
+
+    // ── A leak while the intrusion alarm sounds: the valve closes, the siren changes to the higher class ──
+    g_trace.clear();
+    emit(0x3, "water_leak", 1);
+    run_task();
+    CHECK(idx("cmd:11:state=0") >= 0 && idx("cmd:10:warning=emergency,high,1,20") > idx("cmd:11:state=0"), "valve first, then the siren takes the flood's tone");
+    CHECK(idx("Kitchen leak (Flood) at ") >= 0 && cnt("attr:alarm_state") == 0 && cnt("attr:alarm_sensor") == 0, "the flood alert; alarm_state and alarm_sensor untouched");
+    g_trace.clear();
+    run_task(11);   // away's 10 s end, the flood's 20 s do not
+    CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["flood"] == "triggered" && cnt("cmd:") == 0, "the intrusion alarm ends and silences nothing");
+    CHECK(idx("attr:alarm_sensor=") >= 0 && idx("attr:alarm_state=armed_away") >= 0 && idx("event:alarm_armed_away") >= 0, "the summary is back to armed_away");
+    g_trace.clear();
+    run_task(12);
+    CHECK(h::alarm_attrs["flood"] == "armed" && cnt("cmd:") == 1 && idx("cmd:10:warning=0") >= 0, "the flood alarm ends: siren off, the kept valve left closed");
+    CHECK(cnt("Disarmed") == 0 && cnt("Armed (") == 0, "an alarm that ends tells nobody armed or disarmed");
+
+    // ── Keypad: a wrong code, then the right one; the flood profile stays armed ──
+    g_trace.clear();
+    emit(0x20, "action", 0, "disarm", true);
+    emit(0x20, "action_code", 0, "0000");
+    run_task();
+    CHECK(h::alarm_attrs["away"] == "armed" && g_trace.empty(), "a wrong code disarms nothing");
+    emit(0x20, "action", 0, "disarm", true);
+    emit(0x20, "action_code", 0, "1234");
+    run_task();
+    CHECK(h::alarm_attrs["away"] == "disarmed" && h::alarm_attrs["flood"] == "armed", "the code disarms intrusion only");
+    CHECK(idx("Disarmed (Away) at ") >= 0 && idx("\"kind\":\"alarm_disarmed\"") >= 0 && idx("\"name\":\"away\"") >= 0, "disarmed notice with the profile id");
+    CHECK(idx("event:alarm_disarmed_away") >= 0 && idx("event:alarm_disarmed") >= 0 && g_nvs["st"] == std::string("\0\0", 2), "disarm events; st follows");
+
+    // ── The Alarm device: a refused arm is told; the page's is not; force bypasses ──
+    g_trace.clear();
+    CHECK(h::cmd("alarm_state", "armed_away") == DEVCMD_BAD_VALUE, "an arm with the door open is refused");
+    run_task();
+    CHECK(idx("\"kind\":\"alarm_arm_failed\"") >= 0 && idx("Not armed (Away): Front door is open at ") >= 0 && idx("\"name\":\"away\"") >= 0 &&
+          idx("\"ieee\":\"0x0000000000000001\"") >= 0, "the refusal is notified");
+    CHECK(g_trace.size() == 4 && g_trace[2] == "event:alarm_arm_failed_away" && g_trace[3] == "event:alarm_arm_failed", "both refusal events");
+    g_trace.clear();
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OPEN && n_open == 1 && open[0] == 0x1, "the page gets the open sensors");
+    run_task();
+    CHECK(g_trace.empty(), "the page's refusal is not notified");
+    CHECK(alarm_arm("away", true, open, &n_open) == AlarmReply::OK, "forced");
+    run_task();
+    CHECK(h::status().find("\"bypassed\":[\"0x0000000000000001\"]") != std::string::npos, "the forced door is bypassed");
+    CHECK(h::cmd("away", "disarmed") == DEVCMD_OK && h::cmd("flood", "armed") == DEVCMD_OK, "a profile's own attribute takes disarmed and armed");
+    CHECK(h::cmd("alarm_state", "armed_flood") == DEVCMD_BAD_VALUE && h::cmd("alarm_state", "pending") == DEVCMD_BAD_VALUE &&
+          h::cmd("away", "triggered") == DEVCMD_BAD_VALUE && h::cmd("alarm_sensor", "x") == DEVCMD_NO_CONVERTER && h::cmd("nokey", "armed") == DEVCMD_NO_CONVERTER,
+          "everything else is a bad value or no converter");
+    CHECK(alarm_silence("nope") == AlarmReply::NO_PROFILE && alarm_disarm("nope") == AlarmReply::NO_PROFILE && alarm_silence("flood") == AlarmReply::OK, "silence and disarm by id");
+    run_task();
+    {
+        char buf[2048];
+        const size_t n = h::local_exposes_fn(kAlarmIeee, buf, sizeof(buf));
+        const std::string e(buf, n);
+        CHECK(e.rfind(R"([{"name":"away","type":"enum","access":7,"values":["disarmed","arming","armed","pending","triggered"]},)", 0) == 0 &&
+              e.find(R"({"name":"alarm_state","type":"enum","access":7,"values":["disarmed","arming","armed_away","armed_night","pending","triggered"]},{"name":"alarm_sensor","type":"text","access":1}])") != std::string::npos,
+              "the exposes follow the profiles");
+        char small[64];
+        CHECK(h::local_exposes_fn(kAlarmIeee, small, sizeof(small)) == 0, "exposes that do not fit give nothing");
+    }
+
+    // ── No save while an alarm runs; panic; keypad arm by role ──
+    emit(0x1, "contact", 1);
+    emit(0x20, "action", 0, "arm_night_zones");
+    run_task();
+    CHECK(h::alarm_attrs["night"] == "arming", "the keypad's night button arms the night profile");
+    CHECK(!h::save(kCfg, &why) && why == "an alarm is running: disarm or wait, then save", "a save during the arm delay is refused");
+    emit(0x20, "action", 0, "arm_day_zones");   // no profile has the role home: ignored
+    g_trace.clear();
+    emit(0x20, "action", 0, "panic");
+    run_task();
+    CHECK(idx("Panic button on Keypad at ") >= 0 && h::alarm_attrs["night"] == "triggered" && idx("attr:alarm_sensor=Keypad") >= 0, "panic triggers the profile that is not disarmed");
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::BUSY, "busy while an intrusion alarm is on");
+    CHECK(alarm_disarm("") == AlarmReply::OK, "disarm all");
+    run_task();
+
+
+    // ── A burst while an output blocks: steps collapse, but every alarm is told and the final state is saved ──
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed for the burst");
+    run_task();
+    g_trace.clear();
+    h::on_cmd = [] {                      // while the siren's start waits on the radio:
+        alarm_silence("away");            // the alarm is silenced (back to armed),
+        emit(0x2, "occupancy", 1);        // motion sets it off again,
+        emit(0x3, "water_leak", 0);
+        emit(0x3, "water_leak", 1);       // a leak triggers flood,
+        alarm_disarm("");                 // and "disarm all" disarms away and silences flood
+    };
+    emit(0x2, "occupancy", 1);
+    run_task();
+    CHECK(cnt("\"message\":\"Hall motion (Away) at ") == 2 && cnt("\"message\":\"Kitchen leak (Flood) at ") == 1 && cnt("\"message\":\"Disarmed (Away) at ") == 1,
+          "both intrusion alarms, the flood alarm and the disarm are notified");
+    CHECK(g_nvs["st2"].find("[\"away\",0,0]") != std::string::npos && g_nvs["st2"].find("[\"flood\",2,1]") != std::string::npos && g_nvs["st"] == std::string("\0\0", 2),
+          "the final states are in flash");
+    CHECK(h::alarm_attrs["away"] == "disarmed" && h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["alarm_state"] == "disarmed" && h::alarm_attrs["alarm_sensor"].empty(),
+          "the final states are shown");
+    CHECK(idx("cmd:10:warning=burglar") >= 0 && idx("cmd:10:warning=0") > idx("cmd:10:warning=burglar"), "the siren that was started is stopped");
+    CHECK(cnt("cmd:11:state=0") == 1 && cnt("cmd:") == 3,
+          "the leak alarm was silenced before the task looked: its kept valve is closed all the same, and nothing else is driven (ruling 19)");
+    CHECK(cnt("event:alarm_triggered_away") == 2 && cnt("event:alarm_triggered_flood") == 1 && cnt("event:alarm_disarmed_away") == 1, "the events of every alarm and of the end");
+    CHECK(h::status().find("\"since\":0") == std::string::npos, "each profile has the time of its last change");
+
+    // ── A state that cannot be written still takes effect; the next pass that differs writes again ──
+    g_nvs_fail = true;
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed while flash refuses");
+    run_task();
+    CHECK(h::alarm_attrs["away"] == "armed" && g_nvs["st2"].find("[\"away\",0,0]") != std::string::npos, "armed and shown, though not written");
+    g_nvs_fail = false;
+    emit(0x2, "occupancy", 1);
+    run_task();
+    CHECK(g_nvs["st2"].find("[\"away\",4,1]") != std::string::npos && g_nvs["st"] == std::string("\6\2", 2), "the next change is written, both records");
+    alarm_disarm("");
+    run_task();
+
+    // ── Only the stage 1 record cannot be written: st2 is, and carries the st that flash still holds (ruling 17) ──
+    g_nvs_fail_key = "st";
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed while st cannot be written");
+    run_task();
+    CHECK(g_nvs["st"] == std::string("\0\0", 2) && g_nvs["st2"].find("\"l\":[0,0]") != std::string::npos && g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos,
+          "a failed st write leaves the two agreeing: st2 holds the new state and the st bytes of before");
+    g_nvs_fail_key.clear();
+    alarm_disarm("");
+    run_task();
+
+    // ── More refusals than the queue holds: the rest is logged, nothing breaks ──
+    emit(0x1, "contact", 0);
+    g_trace.clear();
+    for (int i = 0; i < 17; i++) CHECK(h::cmd("away", "armed") == DEVCMD_BAD_VALUE, "refused");
+    run_task();
+    CHECK(cnt("\"kind\":\"alarm_arm_failed\"") == 16, "sixteen refusals told");
+    emit(0x1, "contact", 1);
+    run_task();
+
+    // ── Checks of a save against the devices ──
+    CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[{"ieee":"0x99","entry":false}],"outputs":[]}]})", &why) &&
+          why == "profiles[0].sensors[0]: 0x0000000000000099 is not a device on this hub", why.c_str());
+    CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[{"ieee":"0x1","entry":false},{"ieee":"0x10","entry":false}],"outputs":[]}]})", &why) &&
+          why == "profiles[0].sensors[1]: Siren has no contact, occupancy, presence, vibration, water_leak, smoke, gas or carbon_monoxide", why.c_str());
+    CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[],"outputs":[]},
+          {"id":"b","name":"B","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[],"outputs":[{"ieee":"0x12","kind":"state","value":"on","keep":false},{"ieee":"0x11","kind":"warning","mode":"fire","level":"high","strobe":false}]}]})", &why) &&
+          why.rfind("profiles[1].outputs[1]: Valve has no warning", 0) == 0, why.c_str());
+    CHECK(!h::save(R"({"profiles":[],"keypads":[{"ieee":"0x77","trusted":true}]})", &why) && why == "keypads[0]: 0x0000000000000077 is not a device on this hub", why.c_str());
+    {   // ruling 15: a profile that keeps its id keeps its class
+        std::string changed = kCfg;
+        const std::string from = "\"class\":\"water\"";
+        changed.replace(changed.find(from), from.size(), "\"class\":\"fire\"");
+        CHECK(!h::save(changed.c_str(), &why) && why == "profiles[2]: the class of a saved profile cannot change", why.c_str());
+        CHECK(h::save(kCfg, &why), "the same config with the class it had still saves");
+        run_task();
+    }
+    g_nvs_fail = true;
+    CHECK(!h::save(kCfg, &why) && why == "could not save the config" && h::alarm_attrs.count("night") == 1, "a failed write changes nothing");
+    g_nvs_fail = false;
+
+    // ── A save that drops night and adds a fire profile whose smoke sensor is already active ──
+    h::vals[{0x4, "smoke"}] = 1;
+    g_trace.clear();
+    CHECK(h::save(R"({"profiles":[
+      {"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
+       "sensors":[{"ieee":"0x4","entry":false}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"fire","level":"very_high","strobe":true},{"ieee":"0x12","kind":"state","value":"on","keep":false}]},
+      {"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":0,"trigger_delay":5,"siren_time":10,"notify_arm":true,
+       "sensors":[{"ieee":"0x1","entry":true}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"burglar","level":"high","strobe":true}]},
+      {"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,"notify_arm":true,
+       "sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true}]}]})", &why), why.c_str());
+    run_task();
+    CHECK(h::alarm_attrs.count("night") == 0 && h::alarm_attrs["fire"] == "triggered" && h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed",
+          "night gone; flood kept its state under its new index; the new fire profile armed and went off for the smoke that was there");
+    CHECK(idx("Smoke (Fire) at ") >= 0 && idx("cmd:10:warning=fire,very_high,1,15") >= 0 && idx("cmd:12:state=1") >= 0 && cnt("Armed (Flood)") == 0, "its alert and outputs; no second notice for flood");
+    CHECK(alarm_silence("fire") == AlarmReply::OK, "silence");
+    g_trace.clear();
+    run_task();
+    CHECK(h::alarm_attrs["fire"] == "armed" && idx("cmd:10:warning=0") >= 0 && idx("cmd:12:state=0") >= 0, "silenced: back to armed, outputs stopped");
+
+    // ── A disarm the task has not acted on, then a save that drops the output: it is stopped by its old entry ──
+    emit(0x4, "smoke", 0);
+    emit(0x4, "smoke", 1);
+    run_task();
+    CHECK(h::alarm_attrs["fire"] == "triggered", "smoke again: the alarm");
+    CHECK(alarm_disarm("fire") == AlarmReply::OK, "disarmed, the task not run yet");
+    g_trace.clear();
+    CHECK(h::save(R"({"profiles":[{"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
+       "sensors":[{"ieee":"0x4","entry":false}],"outputs":[]}]})", &why), why.c_str());
+    run_task();
+    CHECK(idx("cmd:10:warning=0") >= 0 && idx("cmd:12:state=0") >= 0 && cnt("cmd:") == 2, "the outputs the save removed are stopped");
+    CHECK(h::alarm_attrs["fire"] == "disarmed" && h::alarm_attrs.count("away") == 0, "and the state is the one after the disarm");
+    int reopened = 0;
+    for (const auto& c : g_all_cmds) reopened += c.find("cmd:11:state=1") != std::string::npos;
+    CHECK(reopened == 0 && !g_all_cmds.empty(), "the kept valve never got the opposite value, in the whole run");
+    // ── The largest device and status: eight profiles with the longest ids and names ──
+    {
+        std::string big = "{\"profiles\":[";
+        for (int i = 0; i < 8; i++) {
+            char one[256];
+            std::snprintf(one, sizeof(one), "%s{\"id\":\"p%dxxxxxxxxxxx\",\"name\":\"Profile number %d xxxxxxx\",\"class\":\"intrusion\",\"arm_delay\":0,\"trigger_delay\":0,"
+                          "\"siren_time\":10,\"notify_arm\":false,\"sensors\":[],\"outputs\":[]}", i ? "," : "", i, i);
+            big += one;
+        }
+        big += "]}";
+        CHECK(h::save(big.c_str(), &why), why.c_str());
+        run_task();
+        static char buf[4096];
+        const size_t n = h::local_exposes_fn(kAlarmIeee, buf, sizeof(buf));
+        std::printf("note: exposes of 8 profiles: %zu B; status of 8 idle profiles: %zu B\n", n, h::status().size());
+        CHECK(n > 0 && n < 2048, "the exposes of eight profiles fit the callers' 2048-byte buffers");
+        CHECK(h::alarm_attrs.size() == 8 + 3, "eight profile attributes, alarm_state, alarm_sensor (and the shadow's own)");
+    }
+    return 0;
+}
+
+// A restart during an alarm: `legacy` = only the stage 1 records are there.
+int boot_flow(bool legacy) {
+    if (legacy) {
+        g_nvs["cfg"] = R"({"exit_delay":45,"entry_delay":20,"siren_time":120,"notify_arm":true,
+          "sensors":[{"ieee":"0x1","modes":["away","home","night"],"entry":true}],
+          "sirens":[{"ieee":"0x10","kind":"warning","mode":"burglar","level":"very_high","strobe":false},{"ieee":"0x12","kind":"state"}],
+          "keypads":[{"ieee":"0x20","trusted":false}],"codes":["4321"]})";
+        g_nvs["st"] = std::string("\6\2", 2);   // triggered, rests armed_away
+    } else {
+        static AlarmConfig c;
+        char err[96];
+        static char buf[kAlarmStoredMax];
+        if (!alarm_cfg_from_json(kCfg, std::strlen(kCfg), nullptr, &c, err, sizeof(err))) return 1;
+        g_nvs["cfg2"] = std::string(buf, alarm_cfg_pack(c, buf, sizeof(buf)));
+        g_nvs["st2"] = R"({"v":1,"l":[6,2],"p":[["away",4,1],["night",0,0],["flood",4,1]]})";
+        g_nvs["st"] = std::string("\6\2", 2);
+    }
+    const std::string cfg_before = g_nvs["cfg"];
+    h::vals[{0x1, "contact"}] = 0;   // the door that set it off is still open
+    h::boot();
+    run_task(58);
+    CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["alarm_state"] == "armed_away", "back in the state it rested in");
+    CHECK(cnt("nvs:") == 0 && cnt("alert:") == 0 && cnt("cmd:") == 0 && cnt("event:") == 0, "nothing written, told or stopped in the first minute");
+    if (!legacy) CHECK(h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["night"] == "disarmed", "every profile by its id");
+    else CHECK(h::alarm_attrs["home"] == "disarmed" && h::status().find("\"name\":\"Night\"") != std::string::npos, "the stage 1 config as away, home, night");
+    run_task(5);
+    const int told = idx("The hub restarted during an alarm at "), stop = idx("cmd:10:warning=0"), st = pos("nvs:st"), st2 = pos("nvs:st2");
+    CHECK(told >= 0 && cnt("\"kind\":\"alarm\"") == 1 && idx("tg:Alarm: The hub restarted during an alarm at ") >= 0, "the restart notice, once");
+    CHECK(stop > told && st > stop && st2 > st, "told, stopped, and only then the states written, st first");
+    CHECK(cnt("nvs:st2") == 1 && cnt("nvs:") == 2 && g_nvs["st"] == std::string("\2\2", 2), "the records written once: the next restart is not during an alarm");
+    CHECK(cnt("nvs:cfg") == 0 && g_nvs["cfg"] == cfg_before, "the config records are not touched at boot");
+    if (legacy) CHECK(idx("cmd:12:state=0") > told && cnt("cmd:") == 2, "the switch siren goes off too");
+    else CHECK(cnt("cmd:") == 1 && cnt("cmd:11") == 0, "the kept valve is not touched by the boot stop");
+    CHECK(cnt("event:") == 0 && cnt("attr:alarm_state") == 1, "no event and no second alarm_state for a restart");
+    return 0;
+}
+
+// The hub fell back to the stage 1 firmware, was armed there, and is updated again: "st" is newer than "st2" (ruling 17).
+int fallback_flow() {
+    static AlarmConfig c;
+    char err[96];
+    static char buf[kAlarmStoredMax];
+    if (!alarm_cfg_from_json(kCfg, std::strlen(kCfg), nullptr, &c, err, sizeof(err))) return 1;
+    g_nvs["cfg2"] = std::string(buf, alarm_cfg_pack(c, buf, sizeof(buf)));
+    g_nvs["st2"] = R"({"v":1,"l":[0,0],"p":[["away",0,0],["night",0,0],["flood",2,1]]})";   // written beside st = disarmed
+    g_nvs["st"] = std::string("\2\2", 2);                                                   // stage 1 wrote armed_away since
+    h::boot();
+    run_task();
+    CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["alarm_state"] == "armed_away" && h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["night"] == "disarmed",
+          "armed on stage 1 since: the hub comes up armed; flood from st2");
+    CHECK(cnt("nvs:") == 0 && cnt("alert:") == 0 && cnt("event:") == 0 && cnt("cmd:") == 0, "a boot writes, tells and drives nothing");
+    g_trace.clear();
+    uint64_t open[kAlarmMaxSensors];
+    uint8_t n_open = 0;
+    CHECK(alarm_arm("night", false, open, &n_open) == AlarmReply::OK, "night armed on this firmware");
+    run_task();
+    CHECK(pos("nvs:st") >= 0 && pos("nvs:st") < pos("nvs:st2") && g_nvs["st"] == std::string("\1\4", 2) &&
+          g_nvs["st2"] == R"({"v":1,"l":[1,4],"p":[["away",0,0],["night",1,1],["flood",2,1]]})", "the next change writes st, then st2 beside it");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "main";
+    const int rc = mode == "main" ? main_flow() : mode == "fallback" ? fallback_flow() : boot_flow(mode == "legacy");
+    if (rc) { std::printf("FAIL: setup\n"); return 1; }
+    if (g_lock_depth) { std::printf("FAIL: the mutex is still held\n"); return 1; }
+    std::printf("%s: %s (%d checks, %d failed)\n", mode.c_str(), h::fails ? "FAILED" : "ALL PASSED", h::checks, h::fails);
+    return h::fails != 0;
+}

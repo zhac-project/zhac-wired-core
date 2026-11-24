@@ -518,6 +518,81 @@ static void stage1_state() {
     { AlarmConfig d = config(); std::snprintf(d.profiles[kHome].id, sizeof(d.profiles[kHome].id), "guests"); AlarmPanel p(&d);
       CHECK(alarm_legacy_restore(armed_home, d, &p, &ia, &so) && p.at(kHome).state == AlarmState::ARMED, "no profile named home: the one with the role"); }
 }
+// The boot rule over both state records. "st2" carries the "st" bytes it was written beside; a "st" that differs at
+// boot was written since by the stage 1 firmware (a fall back), and it decides the intrusion profiles.
+static void states_of_two_firmwares() {
+    AlarmConfig c = config(); uint64_t open = 0; char st2[256]; uint8_t ia = 9, so = 9;
+    const uint8_t disarmed[2] = {0, 0}, armed_away[2] = {2, 2}, armed_home[2] = {3, 3}, armed_night[2] = {4, 4};
+    const uint8_t alarm_away[2] = {6, 2}, junk[2] = {9, 9};
+    auto restore = [&](size_t n, const uint8_t* st, AlarmPanel* p) { return alarm_states_restore(st2, n, st, c, p, &ia, &so); };
+
+    {   // the format: "l" before the profiles, left out when there is no stage 1 record; the old reader skips it
+        AlarmPanel p(&c); p.arm(kNight, false, 0, &open);
+        const size_t n = alarm_states_pack(c, p, st2, sizeof(st2), armed_night);
+        CHECK(n && std::strcmp(st2, R"({"v":1,"l":[4,4],"p":[["away",0,0],["home",0,0],["night",2,1],["flood",0,0],["fire",0,0]]})") == 0,
+              "st2 carries the st bytes it was written beside");
+        AlarmPanel q(&c);
+        CHECK(alarm_states_unpack(st2, n, c, &q, &ia, &so) && q.at(kNight).state == AlarmState::ARMED, "the plain reader ignores them");
+    }
+    {   // 1. equal bytes: st2 wins, also where st cannot say it (an intrusion profile with no role is "away" there)
+        AlarmConfig d = config(); std::snprintf(d.profiles[kHome].id, sizeof(d.profiles[kHome].id), "guests"); d.profiles[kHome].role = AlarmRole::NONE;
+        AlarmPanel p(&d); p.arm(kHome, false, 0, &open); p.arm(kFlood, false, 0, &open);
+        uint8_t rec[2]; alarm_legacy_record(d, p, rec);
+        const size_t n = alarm_states_pack(d, p, st2, sizeof(st2), rec);
+        AlarmPanel q(&d);
+        CHECK(rec[0] == 2 && alarm_states_restore(st2, n, rec, d, &q, &ia, &so) == AlarmRestored::NEW && q.at(kHome).state == AlarmState::ARMED &&
+              q.at(kAway).state == AlarmState::DISARMED && q.at(kFlood).state == AlarmState::ARMED && !ia && !so,
+              "equal bytes: every profile from st2");
+    }
+    {   // 2. a fall back that armed on stage 1
+        AlarmPanel p(&c); p.arm(kFlood, false, 0, &open);
+        const size_t n = alarm_states_pack(c, p, st2, sizeof(st2), disarmed);
+        AlarmPanel q(&c);
+        CHECK(restore(n, armed_home, &q) == AlarmRestored::MIXED && q.at(kHome).state == AlarmState::ARMED && q.at(kAway).state == AlarmState::DISARMED &&
+              q.at(kFlood).state == AlarmState::ARMED && !ia && !so, "armed on stage 1 since: the hub comes up armed; flood from st2");
+        AlarmPanel r(&c);
+        CHECK(restore(n, alarm_away, &r) == AlarmRestored::MIXED && r.at(kAway).state == AlarmState::ARMED && ia == (1u << kAway) && so == (1u << kAway),
+              "armed and in alarm on stage 1 when it restarted: the restart notice still comes");
+    }
+    {   // 3. a fall back that disarmed on stage 1, while flood was (and stays) in alarm
+        AlarmPanel p(&c); p.arm(kAway, false, 0, &open); p.tick(30); p.sensor(sWindow, AlarmKey::CONTACT, true, 31);
+        p.arm(kFlood, false, 40, &open); p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 41);
+        const size_t n = alarm_states_pack(c, p, st2, sizeof(st2), alarm_away);
+        AlarmPanel q(&c);
+        CHECK(p.at(kAway).state == AlarmState::TRIGGERED && restore(n, disarmed, &q) == AlarmRestored::MIXED && q.at(kAway).state == AlarmState::DISARMED &&
+              q.at(kFlood).state == AlarmState::ARMED && ia == (1u << kFlood) && so == (1u << kFlood),
+              "disarmed on stage 1 since: disarmed, and its alarm is not this boot's; flood from st2 with its alarm");
+    }
+    {   // 4. a power cut between the two writes: st is of after, st2 of before
+        AlarmPanel before(&c); before.arm(kNight, false, 0, &open);
+        const size_t n = alarm_states_pack(c, before, st2, sizeof(st2), armed_night);
+        AlarmPanel q(&c);   // then night was disarmed and flood armed; only st got written
+        CHECK(restore(n, disarmed, &q) == AlarmRestored::MIXED && q.at(kNight).state == AlarmState::DISARMED && q.at(kFlood).state == AlarmState::DISARMED,
+              "a power cut between the writes: the intrusion profiles of after, the others of before");
+    }
+    {   // 5. st2 without the bytes: st2 wins
+        AlarmPanel p(&c); p.arm(kNight, false, 0, &open);
+        const size_t n = alarm_states_pack(c, p, st2, sizeof(st2));
+        AlarmPanel q(&c);
+        CHECK(restore(n, disarmed, &q) == AlarmRestored::NEW && q.at(kNight).state == AlarmState::ARMED, "st2 that carries no st bytes wins");
+        AlarmPanel r(&c);
+        CHECK(restore(n, nullptr, &r) == AlarmRestored::NEW && r.at(kNight).state == AlarmState::ARMED, "no st at all: st2");
+    }
+    {   // the edges: a stage 1 record that does not read changes nothing; a damaged or missing st2 leaves st, as before
+        AlarmPanel p(&c); p.arm(kNight, false, 0, &open);
+        const size_t n = alarm_states_pack(c, p, st2, sizeof(st2), armed_night);
+        AlarmPanel q(&c);
+        CHECK(restore(n, junk, &q) == AlarmRestored::NEW && q.at(kNight).state == AlarmState::ARMED, "a damaged st beside a good st2: st2");
+        std::snprintf(st2, sizeof(st2), "{}");
+        AlarmPanel r(&c);
+        CHECK(restore(2, armed_away, &r) == AlarmRestored::OLD && r.at(kAway).state == AlarmState::ARMED, "a damaged st2: st alone");
+        AlarmPanel s(&c);
+        CHECK(restore(0, armed_home, &s) == AlarmRestored::OLD && s.at(kHome).state == AlarmState::ARMED, "no st2 (a hub updated from stage 1): st alone");
+        AlarmPanel t(&c);
+        CHECK(restore(0, nullptr, &t) == AlarmRestored::NOTHING && restore(2, junk, &t) == AlarmRestored::NOTHING && t.at(kAway).state == AlarmState::DISARMED && !ia && !so,
+              "no record that reads: nothing restored");
+    }
+}
 static void adopt_states() {
     AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0;
     p.sensor(sWindow, AlarmKey::CONTACT, true, 1); p.arm(kNight, true, 2, &open); p.arm(kFlood, false, 3, &open);
@@ -700,6 +775,7 @@ int main() {
     stored_escapes();
     stored_states();
     stage1_state();
+    states_of_two_firmwares();
     adopt_states();
     summary_and_keys();
     changes_under_load();
