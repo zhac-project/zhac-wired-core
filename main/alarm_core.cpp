@@ -95,12 +95,15 @@ bool bool_field(JsonObjectConst o, const char* key, bool* out) {
     return true;
 }
 
-// A string field that fits `cap` (NUL included); absent leaves `out` empty.
+// A string field that fits `cap` (NUL included), without control characters (each takes 6 bytes in the stored form,
+// and the largest config must fit 8 KB there); absent leaves `out` empty.
 bool str_field(JsonObjectConst o, const char* key, char* out, size_t cap) {
     JsonVariantConst v = o[key];
     out[0] = '\0';
     if (v.isNull()) return true;
     if (!v.is<const char*>() || std::strlen(v.as<const char*>()) >= cap) return false;
+    for (const char* p = v.as<const char*>(); *p; p++)
+        if (static_cast<unsigned char>(*p) < 0x20 || *p == 0x7F) return false;
     std::snprintf(out, cap, "%s", v.as<const char*>());
     return true;
 }
@@ -147,9 +150,9 @@ bool parse_output(JsonObjectConst o, const char* where, bool stage1, uint8_t pro
         if (!bool_field(o, "strobe", &s.strobe)) return fail(err, cap, "%s: strobe must be true or false", where);
     } else if (s.kind == AlarmOutKind::ALARM) {
         if (!str_field(o, "melody", s.melody, sizeof(s.melody)))
-            return fail(err, cap, "%s: melody must be text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+            return fail(err, cap, "%s: melody must be plain text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
         if (!str_field(o, "volume", s.volume, sizeof(s.volume)))
-            return fail(err, cap, "%s: volume must be text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
+            return fail(err, cap, "%s: volume must be plain text of up to %u characters", where, static_cast<unsigned>(kAlarmEnumMax - 1));
     } else {
         s.value = true;
     }
@@ -402,7 +405,84 @@ bool parse_codes(JsonObjectConst root, const AlarmConfig* keep, AlarmConfig* c, 
     return true;
 }
 
-bool in_alarm(AlarmState s) { return s == AlarmState::PENDING || s == AlarmState::TRIGGERED; }
+bool alerting(AlarmState s) { return s == AlarmState::PENDING || s == AlarmState::TRIGGERED; }
+
+// ── The stored forms ──
+
+// Appends to `buf`. Once something does not fit `ok` stays false and nothing more is written: a record is whole or not at all.
+struct Appender {
+    char*  buf;
+    size_t cap;
+    size_t n = 0;
+    bool   ok = true;
+
+    __attribute__((format(printf, 2, 3))) void f(const char* fmt, ...) {
+        if (!ok) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = std::vsnprintf(buf + n, cap - n, fmt, ap);
+        va_end(ap);
+        if (w < 0 || static_cast<size_t>(w) >= cap - n) ok = false;
+        else n += static_cast<size_t>(w);
+    }
+    // A JSON string: `"` and `\` escaped, control characters as \u00XX, other bytes (UTF-8) as they are.
+    void str(const char* s) {
+        f("\"");
+        for (; *s; s++) {
+            const unsigned char ch = static_cast<unsigned char>(*s);
+            if (ch == '"' || ch == '\\') f("\\%c", ch);
+            else if (ch < 0x20) f("\\u%04x", static_cast<unsigned>(ch));
+            else f("%c", ch);
+        }
+        f("\"");
+    }
+    void ieee(uint64_t v) { f("\"%016" PRIX64 "\"", v); }
+    size_t length() const { return ok ? n : 0; }
+};
+
+// Row item `i`: a whole number in [0, hi].
+bool row_num(JsonArrayConst row, size_t i, long hi, unsigned* out) {
+    JsonVariantConst v = row[i];
+    if (!v.is<long>() || v.as<long>() < 0 || v.as<long>() > hi) return false;
+    *out = static_cast<unsigned>(v.as<long>());
+    return true;
+}
+
+// Row item `i`: a string that fits `cap` with its NUL.
+bool row_str(JsonArrayConst row, size_t i, char* out, size_t cap) {
+    JsonVariantConst v = row[i];
+    if (!v.is<const char*>() || std::strlen(v.as<const char*>()) >= cap) return false;
+    std::snprintf(out, cap, "%s", v.as<const char*>());
+    return true;
+}
+
+// Row item `i`: an ieee as exactly 16 hex digits.
+bool row_ieee(JsonArrayConst row, size_t i, uint64_t* out) {
+    JsonVariantConst v = row[i];
+    const char* s = v.is<const char*>() ? v.as<const char*>() : nullptr;
+    if (!s || std::strlen(s) != 16) return false;
+    uint64_t x = 0;
+    for (; *s; s++) {
+        const int d = hex_digit(*s);
+        if (d < 0) return false;
+        x = x << 4 | static_cast<uint64_t>(d);
+    }
+    *out = x;
+    return true;
+}
+
+// The rows under `key`: absent is none; not a list, or more than `max`, is damage.
+bool rows(JsonObjectConst root, const char* key, size_t max, JsonArrayConst* out) {
+    char unused[8];
+    return list_field(root, "", key, max, out, unused, sizeof(unused));
+}
+
+// Stage 1's number for an armed profile: 2 away, 3 home, 4 night. By id, else by role, else away.
+uint8_t legacy_mode(const AlarmProfile& p) {
+    const int k = word_index(p.id, kModes);
+    if (k >= 0) return static_cast<uint8_t>(k + 2);
+    return p.role == AlarmRole::NONE ? 2 : static_cast<uint8_t>(static_cast<uint8_t>(p.role) + 1);
+}
 
 }  // namespace
 
@@ -519,6 +599,197 @@ void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject doc) {
 
 void alarm_cfg_defaults(AlarmConfig* out) { three_profiles(new (out) AlarmConfig(), kExitDefault, kEntryDefault, kSirenDefault, false); }
 
+// ── Flash forms ──
+
+size_t alarm_cfg_pack(const AlarmConfig& c, char* buf, size_t cap) {
+    Appender w{buf, cap};
+    w.f("{\"v\":2,\"p\":[");
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        const AlarmProfile& p = c.profiles[i];
+        w.f("%s[", i ? "," : "");
+        w.str(p.id);
+        w.f(",");
+        w.str(p.name);
+        w.f(",%u,%u,%u,%u,%u,%u]", static_cast<unsigned>(p.cls), static_cast<unsigned>(p.role), static_cast<unsigned>(p.arm_delay),
+            static_cast<unsigned>(p.trigger_delay), static_cast<unsigned>(p.siren_time), static_cast<unsigned>(p.notify_arm));
+    }
+    w.f("],\"s\":[");
+    for (uint8_t i = 0; i < c.n_sensors; i++) {
+        w.f("%s[", i ? "," : "");
+        w.ieee(c.sensors[i].ieee);
+        w.f(",%u,%u]", static_cast<unsigned>(c.sensors[i].profiles), static_cast<unsigned>(c.sensors[i].entry));
+    }
+    w.f("],\"o\":[");
+    for (uint8_t i = 0; i < c.n_outputs; i++) {
+        const AlarmOutput& o = c.outputs[i];
+        const char* text1 = "";
+        const char* text2 = "";
+        bool flag1 = false, flag2 = false;
+        if (o.kind == AlarmOutKind::WARNING)    { text1 = o.wd_mode; text2 = o.wd_level; flag1 = o.strobe; }
+        else if (o.kind == AlarmOutKind::ALARM) { text1 = o.melody;  text2 = o.volume; }
+        else                                    { flag1 = o.value;   flag2 = o.keep; }
+        w.f("%s[%u,", i ? "," : "", static_cast<unsigned>(o.profile));
+        w.ieee(o.ieee);
+        w.f(",%u,", static_cast<unsigned>(o.kind));
+        w.str(text1);
+        w.f(",");
+        w.str(text2);
+        w.f(",%u,%u]", static_cast<unsigned>(flag1), static_cast<unsigned>(flag2));
+    }
+    w.f("],\"k\":[");
+    for (uint8_t i = 0; i < c.n_keypads; i++) {
+        w.f("%s[", i ? "," : "");
+        w.ieee(c.keypads[i].ieee);
+        w.f(",%u]", static_cast<unsigned>(c.keypads[i].trusted));
+    }
+    w.f("],\"c\":[");
+    for (uint8_t i = 0; i < c.n_codes; i++) {
+        w.f("%s", i ? "," : "");
+        w.str(c.codes[i]);
+    }
+    w.f("]}");
+    return w.length();
+}
+
+// Memory safety is checked (counts, indexes, the tables a number points into, text that fits its array); the limits of the
+// API (delays, siren time, ids) are not: a record that a later firmware wrote with wider limits must still load.
+bool alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out) {
+    JsonDocument doc;
+    if (!json || deserializeJson(doc, json, len) || !doc.is<JsonObjectConst>()) return false;
+    JsonObjectConst root = doc.as<JsonObjectConst>();
+    JsonArrayConst ps, ss, os, ks, cs;
+    if (!(root["v"] == 2) || !root["p"].is<JsonArrayConst>() || !rows(root, "p", kAlarmMaxProfiles, &ps) ||
+        !rows(root, "s", kAlarmMaxSensors, &ss) || !rows(root, "o", kAlarmMaxOutputs, &os) ||
+        !rows(root, "k", kAlarmMaxKeypads, &ks) || !rows(root, "c", kAlarmMaxCodes, &cs))
+        return false;
+    AlarmConfig& c = *new (out) AlarmConfig();
+    unsigned cls, role, arm, trig, siren, notify, profiles, entry, kind, flag1, flag2, pi;
+    for (JsonVariantConst item : ps) {
+        JsonArrayConst r = item.as<JsonArrayConst>();
+        AlarmProfile& p = c.profiles[c.n_profiles];
+        if (!row_str(r, 0, p.id, sizeof(p.id)) || !row_str(r, 1, p.name, sizeof(p.name)) || !row_num(r, 2, 4, &cls) ||
+            !row_num(r, 3, 3, &role) || !row_num(r, 4, UINT16_MAX, &arm) || !row_num(r, 5, UINT16_MAX, &trig) ||
+            !row_num(r, 6, UINT16_MAX, &siren) || !row_num(r, 7, 1, &notify))
+            return false;
+        p.cls = static_cast<AlarmClass>(cls);
+        p.role = static_cast<AlarmRole>(role);
+        p.arm_delay = static_cast<uint16_t>(arm);
+        p.trigger_delay = static_cast<uint16_t>(trig);
+        p.siren_time = static_cast<uint16_t>(siren);
+        p.notify_arm = notify;
+        c.n_profiles++;
+    }
+    for (JsonVariantConst item : ss) {
+        JsonArrayConst r = item.as<JsonArrayConst>();
+        AlarmSensor& s = c.sensors[c.n_sensors];
+        if (!row_ieee(r, 0, &s.ieee) || !row_num(r, 1, UINT8_MAX, &profiles) || !row_num(r, 2, UINT8_MAX, &entry)) return false;
+        s.profiles = static_cast<uint8_t>(profiles);
+        s.entry = static_cast<uint8_t>(entry);
+        c.n_sensors++;
+    }
+    for (JsonVariantConst item : os) {
+        JsonArrayConst r = item.as<JsonArrayConst>();
+        AlarmOutput& o = c.outputs[c.n_outputs];
+        if (!row_num(r, 0, UINT8_MAX, &pi) || pi >= c.n_profiles || !row_ieee(r, 1, &o.ieee) || !row_num(r, 2, 2, &kind) ||
+            !row_num(r, 5, 1, &flag1) || !row_num(r, 6, 1, &flag2))
+            return false;
+        o.profile = static_cast<uint8_t>(pi);
+        o.kind = static_cast<AlarmOutKind>(kind);
+        if (o.kind == AlarmOutKind::WARNING) {
+            if (!row_str(r, 3, o.wd_mode, sizeof(o.wd_mode)) || !row_str(r, 4, o.wd_level, sizeof(o.wd_level))) return false;
+            o.strobe = flag1;
+        } else if (o.kind == AlarmOutKind::ALARM) {
+            if (!row_str(r, 3, o.melody, sizeof(o.melody)) || !row_str(r, 4, o.volume, sizeof(o.volume))) return false;
+        } else {
+            o.value = flag1;
+            o.keep = flag2;
+        }
+        c.n_outputs++;
+    }
+    for (JsonVariantConst item : ks) {
+        JsonArrayConst r = item.as<JsonArrayConst>();
+        AlarmKeypad& k = c.keypads[c.n_keypads];
+        if (!row_ieee(r, 0, &k.ieee) || !row_num(r, 1, 1, &flag1)) return false;
+        k.trusted = flag1;
+        c.n_keypads++;
+    }
+    for (JsonVariantConst item : cs) {
+        if (!is_code(item)) return false;
+        std::snprintf(c.codes[c.n_codes++], kAlarmCodeMax, "%s", item.as<const char*>());
+    }
+    return true;
+}
+
+size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap) {
+    Appender w{buf, cap};
+    w.f("{\"v\":1,\"p\":[");
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        w.f("%s[", i ? "," : "");
+        w.str(c.profiles[i].id);
+        w.f(",%u,%u]", static_cast<unsigned>(p.at(i).state), static_cast<unsigned>(p.rests_armed(i)));
+    }
+    w.f("]}");
+    return w.length();
+}
+
+bool alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding) {
+    *in_alarm = *sounding = 0;
+    JsonDocument doc;
+    if (!json || deserializeJson(doc, json, len) || !(doc["v"] == 1) || !doc["p"].is<JsonArrayConst>()) return false;
+    // Read it all first: a record damaged half way restores nothing.
+    constexpr uint8_t kNamed = 0x80;   // set in saved[i]: the record names profile i
+    uint8_t saved[kAlarmMaxProfiles] = {};   // kNamed | state, bit 3: rests armed
+    for (JsonVariantConst item : doc["p"].as<JsonArrayConst>()) {
+        JsonArrayConst r = item.as<JsonArrayConst>();
+        unsigned state, rests;
+        if (!r[0].is<const char*>() || !row_num(r, 1, static_cast<long>(AlarmState::TRIGGERED), &state) || !row_num(r, 2, 1, &rests)) return false;
+        const int i = alarm_cfg_profile(c, r[0].as<const char*>());
+        if (i >= 0) saved[i] = static_cast<uint8_t>(kNamed | state | rests << 3);
+    }
+    for (uint8_t i = 0; i < c.n_profiles; i++) {
+        if (!(saved[i] & kNamed)) continue;
+        const AlarmState state = static_cast<AlarmState>(saved[i] & 7);
+        p->restore(i, saved[i] >> 3 & 1);
+        if (alerting(state)) *in_alarm |= static_cast<uint8_t>(1u << i);
+        if (state == AlarmState::TRIGGERED) *sounding |= static_cast<uint8_t>(1u << i);
+    }
+    return true;
+}
+
+void alarm_legacy_record(const AlarmConfig& c, const AlarmPanel& p, uint8_t rec[2]) {
+    rec[0] = rec[1] = 0;
+    const int i = p.summary_profile();
+    if (i < 0) return;
+    const uint8_t mode = legacy_mode(c.profiles[i]);
+    switch (p.at(static_cast<uint8_t>(i)).state) {
+    case AlarmState::DISARMED:  break;   // summary_profile is never one
+    case AlarmState::ARMING:    rec[0] = 1; break;
+    case AlarmState::ARMED:     rec[0] = mode; break;
+    case AlarmState::PENDING:   rec[0] = 5; break;
+    case AlarmState::TRIGGERED: rec[0] = 6; break;
+    }
+    rec[1] = p.rests_armed(static_cast<uint8_t>(i)) ? mode : 0;
+}
+
+bool alarm_legacy_restore(const uint8_t rec[2], const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding) {
+    *in_alarm = *sounding = 0;
+    if (rec[0] > 6 || rec[1] > 6) return false;   // the bound stage 1 itself read with
+    const bool alarmed = rec[0] >= 5;
+    int i = -1;
+    if (rec[1] >= 2 && rec[1] <= 4) {   // rests armed, in that mode: the profile by id, else by role
+        i = alarm_cfg_profile(c, kModes[rec[1] - 2]);
+        if (i < 0 || c.profiles[i].cls != AlarmClass::INTRUSION) i = alarm_cfg_role(c, static_cast<AlarmRole>(rec[1] - 1));
+        if (i >= 0) p->restore(static_cast<uint8_t>(i), true);
+    } else if (alarmed) {   // a panic from disarmed names no profile: the first intrusion profile was in alarm
+        for (uint8_t k = 0; i < 0 && k < c.n_profiles; k++) if (c.profiles[k].cls == AlarmClass::INTRUSION) i = k;
+    }
+    if (i >= 0 && alarmed) {
+        *in_alarm = static_cast<uint8_t>(1u << i);
+        if (rec[0] == 6) *sounding = *in_alarm;
+    }
+    return true;
+}
+
 const char* alarm_output_misfit(AlarmOutKind kind, const char* exposes, size_t len) {
     static constexpr struct { const char* key; const char* why; } kNeed[] = {   // by AlarmOutKind
         {"warning", "has no warning the hub can send (kind warning is for IAS sirens)"},
@@ -618,9 +889,9 @@ AlarmArmResult AlarmPanel::arm(uint8_t p, bool force, uint32_t now, uint64_t* op
     if (open) *open = 0;
     if (p >= cfg_->n_profiles) return AlarmArmResult::BUSY;   // not a profile: the caller checks ids first
     AlarmProfileStatus& s = st_[p];
-    if (in_alarm(s.state)) return AlarmArmResult::BUSY;
+    if (alerting(s.state)) return AlarmArmResult::BUSY;
     for (uint8_t i = 0; intrusion(p) && i < cfg_->n_profiles; i++)
-        if (i != p && intrusion(i) && in_alarm(st_[i].state)) return AlarmArmResult::BUSY;
+        if (i != p && intrusion(i) && alerting(st_[i].state)) return AlarmArmResult::BUSY;
     if (s.state == AlarmState::ARMED || s.state == AlarmState::ARMING) return AlarmArmResult::OK;
     uint64_t o = 0;
     for (uint8_t slot = 0; slot < cfg_->n_sensors; slot++)
@@ -654,7 +925,7 @@ void AlarmPanel::disarm_all() {
 }
 
 void AlarmPanel::silence(uint8_t p) {
-    if (p < cfg_->n_profiles && in_alarm(st_[p].state)) end_alarm(p);
+    if (p < cfg_->n_profiles && alerting(st_[p].state)) end_alarm(p);
 }
 
 bool AlarmPanel::panic(uint64_t source, uint32_t now) {
@@ -684,6 +955,29 @@ void AlarmPanel::restore(uint8_t p, bool armed) {
         st_[p].state = AlarmState::ARMED;
         st_[p].rests_armed = true;
     }
+}
+
+void AlarmPanel::adopt(const AlarmPanel& old, const AlarmConfig& old_cfg) {
+    int8_t was[kAlarmMaxSensors];   // the slot a sensor had in the old config, -1
+    for (uint8_t k = 0; k < cfg_->n_sensors; k++) {
+        was[k] = static_cast<int8_t>(alarm_cfg_sensor(old_cfg, cfg_->sensors[k].ieee));
+        if (was[k] >= 0) last_[k] = old.last_[was[k]];
+    }
+    for (uint8_t i = 0; i < cfg_->n_profiles; i++) {
+        const int j = alarm_cfg_profile(old_cfg, cfg_->profiles[i].id);
+        if (j < 0) continue;
+        st_[i] = old.st_[j];
+        check_due_[i] = old.check_due_[j];   // a hazard check still owed stays owed
+        st_[i].bypass = 0;
+        for (uint8_t k = 0; k < cfg_->n_sensors; k++)
+            if (was[k] >= 0 && (old.st_[j].bypass >> was[k] & 1)) st_[i].bypass |= 1ull << k;
+    }
+}
+
+bool AlarmPanel::rests_armed(uint8_t p) const {
+    if (p >= cfg_->n_profiles) return false;
+    const AlarmProfileStatus& s = st_[p];
+    return s.state == AlarmState::ARMING || s.state == AlarmState::ARMED || (alerting(s.state) && s.rests_armed);
 }
 
 const AlarmProfileStatus& AlarmPanel::at(uint8_t p) const {

@@ -353,6 +353,8 @@ static void config_errors() {
     bad(R"({"profiles":[{"id":"a","name":"A","class":"water","outputs":[{"ieee":"0x1","kind":"state","value":"off","keep":true}]},
                         {"id":"b","name":"B","class":"fire","outputs":[{"ieee":"0x1","kind":"state","value":"off"}]}]})",
         "profiles[1].outputs[0]: the same switch has another value or another keep in a", "a valve another profile would reopen");
+    bad(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x1","kind":"alarm","melody":"a\u0001b"}]}]})", "melody must be plain text",
+        "a melody with a control character (it would not fit the stored form)");
     const std::string p1 = R"({"id":"a","name":"A","class":"fire",)", w = R"(,"kind":"warning")";
     bad((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(]},{"id":"b","name":"B","class":"gas","sensors":[)" + items(49, 1) + "]}]}").c_str(),
         "profiles[1].sensors[0]: more than 48 different sensors", "a 49th different sensor");
@@ -389,6 +391,159 @@ static void stage1_config() {
     CHECK(parse("{}", &c, err, sizeof(err)) && c.n_profiles == 3 && c.profiles[0].arm_delay == 30, "an empty stage 1 config is the defaults");
 }
 
+// ── What goes to flash ──
+
+// The largest config the limits allow, in the widest form of each field: 8 profiles with 13-character ids and 24-byte
+// names, 48 sensors delayed in all 8, 32 outputs of kind alarm (8 per profile in the first four), 8 keypads, 8 codes.
+static void largest_config(AlarmConfig* c) {
+    *c = AlarmConfig();
+    for (unsigned i = 0; i < 8; i++) {
+        AlarmProfile& p = c->profiles[c->n_profiles++];
+        std::snprintf(p.id, sizeof(p.id), "profile_%05u", i);
+        for (int k = 0; k < 12; k++) std::strcat(p.name, "\xD0\x96");   // 12 two-byte letters: 24 bytes
+        p.cls = static_cast<AlarmClass>(i % 5); p.role = i ? AlarmRole::NONE : AlarmRole::AWAY;
+        p.arm_delay = p.trigger_delay = 300; p.siren_time = 1800; p.notify_arm = true;
+    }
+    for (unsigned i = 0; i < 48; i++) c->sensors[c->n_sensors++] = {0x00158D0000000100ULL + i, 0xFF, 0xFF};
+    for (unsigned i = 0; i < 32; i++) {
+        AlarmOutput& o = c->outputs[c->n_outputs++];
+        o.ieee = 0x00158D0000000200ULL + i; o.profile = static_cast<uint8_t>(i / 8); o.kind = AlarmOutKind::ALARM;
+        std::snprintf(o.melody, sizeof(o.melody), "melody_%016u", i); std::snprintf(o.volume, sizeof(o.volume), "volume_%016u", i);
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        c->keypads[c->n_keypads++] = {0x00158D0000000010ULL + i, (i & 1) != 0};
+        std::snprintf(c->codes[c->n_codes++], kAlarmCodeMax, "%08u", 12345670 + i);
+    }
+}
+
+static void stored_config() {
+    static AlarmConfig c, k; char err[160]; static char buf[kAlarmStoredMax];
+    parse(R"({"profiles":[{"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":30,"trigger_delay":30,
+              "sensors":[{"ieee":"0x00158D0001020304","entry":true}],
+              "outputs":[{"ieee":"0x5","kind":"warning"},{"ieee":"0x6","kind":"state","value":"off","keep":true}]}],
+             "keypads":[{"ieee":"0x10","trusted":true}],"codes":["1234"]})", &c, err, sizeof(err));
+    const size_t n = alarm_cfg_pack(c, buf, sizeof(buf));
+    CHECK(n && std::strcmp(buf, R"({"v":2,"p":[["away","Away",0,1,30,30,180,0]],"s":[["00158D0001020304",1,1]],)"
+          R"("o":[[0,"0000000000000005",0,"burglar","high",1,0],[0,"0000000000000006",2,"","",0,1]],)"
+          R"("k":[["0000000000000010",1]],"c":["1234"]})") == 0, "the stored form, byte for byte");
+    CHECK(alarm_cfg_unpack(buf, n, &k) && same(c, k), "stored and read back: the same config");
+    CHECK(!alarm_cfg_unpack("{\"v\":2,\"p\":7}", 13, &k) && !alarm_cfg_unpack("nonsense", 8, &k), "a damaged record is refused");
+    largest_config(&c);
+    const size_t m = alarm_cfg_pack(c, buf, sizeof(buf));
+    CHECK(m && m <= kAlarmStoredMax && alarm_cfg_unpack(buf, m, &k) && same(c, k) && k.n_sensors == 48 && k.n_outputs == 32 &&
+          k.sensors[47].entry == 0xFF, "the largest config fits 8 KB and reads back");
+    char small[64];
+    CHECK(alarm_cfg_pack(c, small, sizeof(small)) == 0, "a buffer too small: 0, nothing cut");
+}
+// What a later firmware may add is read past; what would put a number or a text outside its array is refused.
+static void stored_config_shape() {
+    static AlarmConfig k;
+    auto reads = [&](const char* j) { return alarm_cfg_unpack(j, std::strlen(j), &k); };
+    CHECK(reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0,"later"]],"s":[["0000000000000001",1,0,9]],"zz":[1]})") &&
+          k.n_profiles == 1 && k.n_sensors == 1, "unknown keys and extra items are ignored");
+    CHECK(reads(R"({"v":2,"p":[]})") && k.n_profiles == 0, "a config with no profile reads");
+    CHECK(!reads(R"({"v":3,"p":[]})") && !reads(R"({"p":[]})"), "another version, or none, is refused");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",5,0,0,0,180,0]]})") && !reads(R"({"v":2,"p":[["a","A",0,4,0,0,180,0]]})"), "a class or role outside its table");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"o":[[1,"0000000000000005",0,"burglar","high",1,0]]})"), "an output of a profile that is not there");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"o":[[0,"0000000000000005",3,"","",0,0]]})"), "an output kind outside its table");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"o":[[0,"0000000000000005",1,"0123456789012345678901234","",0,0]]})"), "a melody of 25 characters");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"s":[["5",1,0]]})"), "an ieee that is not 16 digits");
+    CHECK(!reads(R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"c":["12"]})"), "a code of 2 digits");
+    std::string many = R"({"v":2,"p":[["a","A",0,0,0,0,180,0]],"s":[)";
+    for (int i = 0; i < 49; i++) many += std::string(i ? "," : "") + "[\"00000000000000" + char('0' + i / 10) + char('0' + i % 10) + "\",1,0]";
+    CHECK(!reads((many + "]}").c_str()), "49 sensors");
+}
+// A name, a melody with a quote and a backslash, UTF-8: stored and read back as they were.
+static void stored_escapes() {
+    static AlarmConfig c, k; static char buf[kAlarmStoredMax];
+    c = config();
+    std::snprintf(c.profiles[kHome].name, sizeof(c.profiles[kHome].name), "Q\"B\\S \xD0\x9D\xD1\x96\xD1\x87");
+    AlarmOutput o{}; o.ieee = 5; o.profile = kFlood; o.kind = AlarmOutKind::ALARM; std::snprintf(o.melody, sizeof(o.melody), "a\"b\\c\td");
+    c.outputs[c.n_outputs++] = o;
+    const size_t n = alarm_cfg_pack(c, buf, sizeof(buf));
+    CHECK(n && alarm_cfg_unpack(buf, n, &k) && same(c, k) && std::strcmp(k.profiles[kHome].name, c.profiles[kHome].name) == 0 &&
+          std::strcmp(k.outputs[0].melody, o.melody) == 0, "quotes, backslashes, a tab and UTF-8 survive");
+    largest_config(&c);   // and the worst a valid config can cost: every character of every text a two-byte escape
+    for (uint8_t i = 0; i < c.n_profiles; i++) std::memset(c.profiles[i].name, '"', 24);
+    for (uint8_t i = 0; i < c.n_outputs; i++) { std::memset(c.outputs[i].melody, '\\', 23); std::memset(c.outputs[i].volume, '"', 23); }
+    const size_t m = alarm_cfg_pack(c, buf, sizeof(buf));
+    CHECK(m && m <= kAlarmStoredMax && alarm_cfg_unpack(buf, m, &k) && same(c, k), "the largest config with every text character escaped still fits 8 KB");
+}
+static void stored_states() {
+    AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; char buf[256]; uint8_t ia = 0, so = 0;
+    p.arm(kNight, false, 0, &open); p.arm(kFlood, false, 0, &open); p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 5);
+    p.sensor(sDoor, AlarmKey::CONTACT, true, 6);
+    const size_t n = alarm_states_pack(c, p, buf, sizeof(buf));
+    CHECK(n && std::strcmp(buf, R"({"v":1,"p":[["away",0,0],["home",0,0],["night",3,1],["flood",4,1],["fire",0,0]]})") == 0, "the stored states");
+    AlarmPanel q(&c);
+    CHECK(alarm_states_unpack(buf, n, c, &q, &ia, &so) && q.at(kNight).state == AlarmState::ARMED && q.at(kFlood).state == AlarmState::ARMED &&
+          q.at(kFire).state == AlarmState::DISARMED && ia == ((1u << kNight) | (1u << kFlood)) && so == (1u << kFlood),
+          "a restart comes back to the resting states and knows what was in alarm");
+    AlarmConfig d = config(); std::snprintf(d.profiles[kFlood].id, sizeof(d.profiles[kFlood].id), "leak"); AlarmPanel r(&d);
+    CHECK(alarm_states_unpack(buf, n, d, &r, &ia, &so) && r.at(kFlood).state == AlarmState::DISARMED && r.at(kNight).state == AlarmState::ARMED,
+          "a profile the record does not name starts disarmed");
+    CHECK(!alarm_states_unpack("{}", 2, c, &r, &ia, &so), "a damaged record is refused");
+    AlarmPanel t(&c);
+    const char* half = R"({"v":1,"p":[["night",2,1],["flood",9,1]]})";
+    CHECK(!alarm_states_unpack(half, std::strlen(half), c, &t, &ia, &so) && t.at(kNight).state == AlarmState::DISARMED && !ia && !so,
+          "a record damaged half way restores nothing");
+    static AlarmConfig big; static char bigbuf[512];
+    largest_config(&big); AlarmPanel w(&big);
+    const size_t m = alarm_states_pack(big, w, bigbuf, sizeof(bigbuf));
+    CHECK(m && m < 256 && alarm_states_pack(big, w, bigbuf, 20) == 0, "the states of 8 profiles are under 256 bytes; too small: 0");
+}
+static void stage1_state() {
+    AlarmConfig c = config(); uint64_t open = 0; uint8_t rec[2], ia = 0, so = 0;
+    { AlarmPanel p(&c); alarm_legacy_record(c, p, rec); CHECK(rec[0] == 0 && rec[1] == 0, "disarmed"); }
+    { AlarmPanel p(&c); p.arm(kAway, false, 0, &open); alarm_legacy_record(c, p, rec); CHECK(rec[0] == 1 && rec[1] == 2, "arming away rests armed away"); }
+    { AlarmPanel p(&c); p.arm(kNight, false, 0, &open); p.sensor(sWindow, AlarmKey::CONTACT, true, 5); alarm_legacy_record(c, p, rec);
+      CHECK(rec[0] == 6 && rec[1] == 4, "night triggered rests armed night"); }
+    { AlarmPanel p(&c); p.panic(kPad, 0); alarm_legacy_record(c, p, rec); CHECK(rec[0] == 6 && rec[1] == 0, "a panic from disarmed rests disarmed"); }
+    { AlarmPanel p(&c); p.arm(kFlood, false, 0, &open); p.sensor(sLeak, AlarmKey::WATER_LEAK, true, 5); alarm_legacy_record(c, p, rec);
+      CHECK(rec[0] == 0 && rec[1] == 0, "a water alarm is not in the stage 1 record"); }
+    { AlarmConfig d = config(); std::snprintf(d.profiles[kHome].id, sizeof(d.profiles[kHome].id), "guests"); AlarmPanel p(&d);
+      p.arm(kHome, false, 0, &open); alarm_legacy_record(d, p, rec); CHECK(rec[0] == 3 && rec[1] == 3, "another intrusion profile goes by its role");
+      d.profiles[kHome].role = AlarmRole::NONE; alarm_legacy_record(d, p, rec); CHECK(rec[0] == 2 && rec[1] == 2, "with no role, as away"); }
+    const uint8_t armed_home[2] = {3, 3}, pending_night[2] = {5, 4}, triggered_away[2] = {6, 2}, junk[2] = {9, 9};
+    { AlarmPanel p(&c); CHECK(alarm_legacy_restore(armed_home, c, &p, &ia, &so) && p.at(kHome).state == AlarmState::ARMED && !ia && !so, "armed home on stage 1: home armed"); }
+    { AlarmPanel p(&c); CHECK(alarm_legacy_restore(pending_night, c, &p, &ia, &so) && p.at(kNight).state == AlarmState::ARMED && ia == (1u << kNight) && !so,
+                              "pending on stage 1: armed, and it was in alarm"); }
+    { AlarmPanel p(&c); CHECK(alarm_legacy_restore(triggered_away, c, &p, &ia, &so) && p.at(kAway).state == AlarmState::ARMED && so == (1u << kAway), "triggered: it sounded"); }
+    { AlarmPanel p(&c); CHECK(!alarm_legacy_restore(junk, c, &p, &ia, &so) && p.at(kAway).state == AlarmState::DISARMED, "a damaged stage 1 record is refused"); }
+    const uint8_t panic[2] = {6, 0};
+    { AlarmPanel p(&c); CHECK(alarm_legacy_restore(panic, c, &p, &ia, &so) && p.at(kAway).state == AlarmState::DISARMED && ia == (1u << kAway) && so == (1u << kAway),
+                              "a panic from disarmed: nothing armed, the first intrusion profile was in alarm"); }
+    { AlarmConfig d = config(); std::snprintf(d.profiles[kHome].id, sizeof(d.profiles[kHome].id), "guests"); AlarmPanel p(&d);
+      CHECK(alarm_legacy_restore(armed_home, d, &p, &ia, &so) && p.at(kHome).state == AlarmState::ARMED, "no profile named home: the one with the role"); }
+}
+static void adopt_states() {
+    AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0;
+    p.sensor(sWindow, AlarmKey::CONTACT, true, 1); p.arm(kNight, true, 2, &open); p.arm(kFlood, false, 3, &open);
+    AlarmConfig d{};   // night kept (window still in it), flood renamed, a new profile first, the leak sensor kept
+    d.profiles[d.n_profiles++] = prof("garage", AlarmClass::INTRUSION, AlarmRole::NONE, 0, 0);
+    d.profiles[d.n_profiles++] = prof("night",  AlarmClass::INTRUSION, AlarmRole::NIGHT, 0, 30);
+    d.profiles[d.n_profiles++] = prof("leak",   AlarmClass::WATER, AlarmRole::NONE, 0, 0);
+    d.sensors[d.n_sensors++] = {ieee_of(sLeak), 0x04, 0};
+    d.sensors[d.n_sensors++] = {ieee_of(sWindow), 0x02, 0};
+    AlarmPanel q(&d); q.adopt(p, c);
+    CHECK(q.at(1).state == AlarmState::ARMED && q.at(1).bypass == (1ull << 1), "a kept profile keeps its state and, by device, its bypass");
+    CHECK(q.at(0).state == AlarmState::DISARMED && q.at(2).state == AlarmState::DISARMED, "a new id starts disarmed");
+    q.disarm(1);
+    CHECK(q.arm(1, false, 20, &open) == AlarmArmResult::OPEN && open == (1ull << 1), "the window is still known as open");
+    // The hazard check a profile still owes (an arm that has not reached armed yet) survives the change.
+    AlarmConfig e = config(); e.sensors[sSmoke].profiles |= 1u << kAway;
+    AlarmPanel r(&e);
+    r.seed(sSmoke, AlarmKey::SMOKE, true);
+    r.arm(kAway, false, 0, &open); r.panic(kPad, 10); r.silence(kAway);
+    AlarmConfig f{};
+    f.profiles[f.n_profiles++] = prof("away", AlarmClass::INTRUSION, AlarmRole::AWAY, 30, 30);
+    f.sensors[f.n_sensors++] = {ieee_of(sSmoke), 0x01, 0};
+    AlarmPanel s(&f); s.adopt(r, e);
+    CHECK(s.at(0).state == AlarmState::ARMED && s.at(0).alarms == 1, "a silenced panic's profile is adopted armed, with its count");
+    s.tick(11);
+    CHECK(s.at(0).state == AlarmState::TRIGGERED && s.at(0).cause == ieee_of(sSmoke) && s.at(0).alarms == 2,
+          "the hazard check still owed is run at the next tick");
+}
 int main() {
     transitions();
     arming_rules();
@@ -404,6 +559,12 @@ int main() {
     config_json();
     config_errors();
     stage1_config();
+    stored_config();
+    stored_config_shape();
+    stored_escapes();
+    stored_states();
+    stage1_state();
+    adopt_states();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

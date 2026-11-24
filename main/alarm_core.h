@@ -127,6 +127,11 @@ public:
     bool panic(uint64_t source, uint32_t now);       // false: there is no intrusion profile
     void tick(uint32_t now);
     void restore(uint8_t profile, bool armed);       // at boot
+    // After a config change, on a panel made for the new config: each profile whose id the old config had takes its
+    // state (the caller makes sure nothing is running), counters and, by ieee, bypass; each sensor both have keeps
+    // its last values. The rest starts as a new panel does.
+    void adopt(const AlarmPanel& old, const AlarmConfig& old_cfg);
+    bool rests_armed(uint8_t profile) const;         // what a restart comes back to
     const AlarmProfileStatus& at(uint8_t profile) const;
     bool running() const;                            // any profile arming, pending or triggered
     int  summary_profile() const;                    // the intrusion profile that is not disarmed, -1
@@ -150,3 +155,20 @@ private:
     bool               check_due_[kAlarmMaxProfiles] = {};
     Last               last_[kAlarmMaxSensors] = {};
 };
+
+// What goes to flash (NVS namespace "alarm"). The stage 1 records "cfg" and "st" are not these: "cfg" is never rewritten,
+// "st" is kept current by alarm_legacy_record so that a fall back to the stage 1 firmware finds the state of now.
+constexpr size_t kAlarmStoredMax = 8192;   // the largest config the limits allow, in its stored form, fits
+// The stored config ("cfg2"): arrays without key names, each sensor once with the set of its profiles. Returns the length,
+// or 0 when it does not fit `cap` (with its NUL): nothing is cut. Unknown keys and extra array items are ignored when read.
+size_t alarm_cfg_pack(const AlarmConfig& c, char* buf, size_t cap);
+bool   alarm_cfg_unpack(const char* json, size_t len, AlarmConfig* out);   // built in place, partly filled on failure, like alarm_cfg_from_json
+// The stored states ("st2"): {"v":1,"p":[[id, state, rests_armed], ...]} for every profile.
+size_t alarm_states_pack(const AlarmConfig& c, const AlarmPanel& p, char* buf, size_t cap);
+// Restores each profile named in the record that the config still has; a damaged record restores nothing. `in_alarm` /
+// `sounding`: bit i set when profile i was pending or triggered / triggered when the record was written.
+bool   alarm_states_unpack(const char* json, size_t len, const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);
+// The stage 1 state record ("st"): {state, resting} in the stage 1 numbers (0 disarmed, 1 arming, 2 armed_away,
+// 3 armed_home, 4 armed_night, 5 pending, 6 triggered), describing summary_profile(); {0, 0} with none.
+void   alarm_legacy_record(const AlarmConfig& c, const AlarmPanel& p, uint8_t rec[2]);
+bool   alarm_legacy_restore(const uint8_t rec[2], const AlarmConfig& c, AlarmPanel* p, uint8_t* in_alarm, uint8_t* sounding);
