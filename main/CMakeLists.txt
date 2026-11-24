@@ -64,6 +64,9 @@ idf_component_register(
         "user_io.cpp"
         "api_io.cpp"
         "lua_io.cpp"
+        "local_dev.cpp"
+        "alarm_core.cpp"
+        "alarm.cpp"
     INCLUDE_DIRS "."
     # Moves zhc_adapter's ~105 KB of lookup-table .bss to PSRAM. Without it the
     # esp32s31 build has too little internal DRAM left for EMAC DMA descriptors

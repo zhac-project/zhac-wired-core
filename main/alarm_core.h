@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <ArduinoJson.h>
+
 // Home Assistant's alarm_control_panel states (HomeTiles' alarm tile shows the same).
 enum class AlarmState : uint8_t { DISARMED = 0, ARMING, ARMED_AWAY, ARMED_HOME, ARMED_NIGHT, PENDING, TRIGGERED };
 enum class AlarmMode : uint8_t { AWAY = 0, HOME, NIGHT };   // bit (1 << mode) in AlarmSensor::modes
@@ -68,13 +70,15 @@ AlarmState  alarm_armed_state(AlarmMode m);
 
 // Parses and validates a whole config. Fields left out take the defaults, unknown
 // fields are ignored. "codes" left out keeps `keep`'s codes (the stored ones; null =
-// none); "codes":[] clears them. False with the first problem in `err`
-// ("sensors[2]: 0x... is listed twice"); `out` is then unspecified.
+// none; never `out` itself); "codes":[] clears them. False with the first problem
+// in `err` ("sensors[2]: 0x... is listed twice"); `out` is then unspecified.
 bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep,
                          AlarmConfig* out, char* err, size_t cap);
 // The config as JSON. with_codes=false (every API read) writes "codes_count" in
 // place of the codes. Bytes written, 0 if it did not fit.
 size_t alarm_cfg_to_json(const AlarmConfig& c, bool with_codes, char* buf, size_t cap);
+// The same into a document's object (a WS reply).
+void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject o);
 const AlarmSensor* alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee);
 const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
 

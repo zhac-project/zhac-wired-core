@@ -8,8 +8,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
-
-#include <ArduinoJson.h>
+#include <new>
 
 namespace {
 
@@ -278,7 +277,8 @@ bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep,
         return false;
     }
     JsonObjectConst root = doc.as<JsonObjectConst>();
-    AlarmConfig c{};
+    // The defaults, in place: a config is ~2 KB, too much for a boot-time stack.
+    AlarmConfig& c = *new (out) AlarmConfig();
     if (!num_field(root, "exit_delay", 0, kAlarmDelayMax, &c.exit_delay)) {
         std::snprintf(err, cap, "exit_delay must be 0-%u s", kAlarmDelayMax);
         return false;
@@ -295,15 +295,18 @@ bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep,
         std::snprintf(err, cap, "notify_arm must be true or false");
         return false;
     }
-    if (!parse_sensors(root, &c, err, cap) || !parse_sirens(root, &c, err, cap) ||
-        !parse_keypads(root, &c, err, cap) || !parse_codes(root, keep, &c, err, cap))
-        return false;
-    *out = c;
-    return true;
+    return parse_sensors(root, &c, err, cap) && parse_sirens(root, &c, err, cap) &&
+           parse_keypads(root, &c, err, cap) && parse_codes(root, keep, &c, err, cap);
 }
 
 size_t alarm_cfg_to_json(const AlarmConfig& c, bool with_codes, char* buf, size_t cap) {
     JsonDocument doc;
+    alarm_cfg_write(c, with_codes, doc.to<JsonObject>());
+    if (measureJson(doc) + 1 > cap) return 0;
+    return serializeJson(doc, buf, cap);
+}
+
+void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject doc) {
     doc["exit_delay"] = c.exit_delay;
     doc["entry_delay"] = c.entry_delay;
     doc["siren_time"] = c.siren_time;
@@ -347,8 +350,6 @@ size_t alarm_cfg_to_json(const AlarmConfig& c, bool with_codes, char* buf, size_
     } else {
         doc["codes_count"] = c.n_codes;
     }
-    if (measureJson(doc) + 1 > cap) return 0;
-    return serializeJson(doc, buf, cap);
 }
 
 const AlarmSensor* alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee) {
@@ -374,9 +375,9 @@ bool alarm_keypad_may_disarm(const AlarmConfig& c, uint64_t keypad, const char* 
 
 AlarmArmResult AlarmCore::arm(AlarmMode m, bool force, const uint64_t* open, uint8_t n_open, uint32_t now) {
     if (in_alarm()) return AlarmArmResult::BUSY;
-    if (n_open && !force) return AlarmArmResult::OPEN;
     const AlarmState target = alarm_armed_state(m);
     if (state_ == target || (state_ == AlarmState::ARMING && mode_ == m)) return AlarmArmResult::OK;
+    if (n_open && !force) return AlarmArmResult::OPEN;
     n_bypass_ = 0;
     for (uint8_t i = 0; open && i < n_open && n_bypass_ < kAlarmMaxSensors; i++) bypass_[n_bypass_++] = open[i];
     mode_ = m;

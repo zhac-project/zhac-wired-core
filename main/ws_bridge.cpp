@@ -17,7 +17,8 @@
 // dispatch() — the same shape is used by net-core's full WS bridge,
 // so SPA code that targets net-core sees identical wire formats.
 
-#include "user_io.h"
+#include "alarm.h"
+#include "local_dev.h"
 #include "ws_bridge.h"
 #include "edit_lock.h"
 #include "ws_server.h"
@@ -1213,7 +1214,7 @@ static bool push_listeners() {
 // envelope. Handing it the local one nested every event inside another
 // ({"event":..,"data":{"event":..,"data":{..}}}) and the cloud, finding no
 // ieee in `data`, dropped them all.
-static void push_event(const char* event, const char* payload, size_t len) {
+static void push_event(const char* event, const char* payload, size_t len, bool to_cloud = true) {
     if (ws_server_client_count() > 0) {
         const size_t cap = len + std::strlen(event) + 32;   // {"event":"","data":} + NUL
         char* env = static_cast<char*>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -1223,7 +1224,7 @@ static void push_event(const char* event, const char* payload, size_t len) {
             heap_caps_free(env);
         }
     }
-    remote_client_publish_event(event, payload, len);
+    if (to_cloud) remote_client_publish_event(event, payload, len);
 }
 
 void ws_push(const char* event, JsonDocument& data) {
@@ -1746,6 +1747,61 @@ static void cmd_alerts_get(int fd, uint32_t id) {
     ws_server_reply(fd, buf, (size_t)n);
 }
 
+// ── alarm.* (security mode, spec 2026-11-24) ──────────────────────────
+// The hub page's panel. Not on the cloud link: remote_allow lists none of them.
+static void cmd_alarm_get(int fd, uint32_t id) {
+    JsonDocument d;
+    JsonObject o = d.to<JsonObject>();
+    alarm_status_json(o);
+    alarm_config_json(o["config"].to<JsonObject>());
+    reply_data(fd, id, d);
+}
+
+// {mode, force?} -> {armed:true}, or {armed:false, open:[{ieee, name}]} when doors or
+// windows of the mode are open (the page offers to force it).
+static void cmd_alarm_arm(int fd, uint32_t id, JsonDocument& doc) {
+    AlarmMode m;
+    if (!alarm_mode_parse(doc["args"]["mode"] | "", &m)) { send_err(fd, id, "mode must be away, home or night"); return; }
+    uint64_t open[kAlarmMaxSensors];
+    uint8_t n = 0;
+    const AlarmArmResult r = alarm_arm(m, doc["args"]["force"] | false, open, &n);
+    if (r == AlarmArmResult::BUSY) { send_err(fd, id, "the alarm is on: disarm first"); return; }
+    JsonDocument d;
+    d["armed"] = r == AlarmArmResult::OK;
+    if (r == AlarmArmResult::OPEN) {
+        JsonArray a = d["open"].to<JsonArray>();
+        ZapDevice dev{};
+        for (uint8_t i = 0; i < n; i++) {
+            char s[19];
+            snprintf(s, sizeof(s), "0x%016" PRIX64, open[i]);
+            JsonObject o = a.add<JsonObject>();
+            o["ieee"] = static_cast<const char*>(s);   // a pointer is copied (an array would be kept)
+            if (zigbee_pool_snapshot(open[i], &dev) && dev.friendly_name[0])
+                o["name"] = static_cast<const char*>(dev.friendly_name);
+        }
+    }
+    reply_data(fd, id, d);
+}
+
+static void cmd_alarm_disarm(int fd, uint32_t id) {
+    alarm_disarm();
+    reply_ok_or_err(fd, id, true, nullptr);
+}
+
+// {config}: the whole config; "codes" left out keeps the stored ones.
+static void cmd_alarm_config_set(int fd, uint32_t id, JsonDocument& doc) {
+    JsonVariantConst cfg = doc["args"]["config"];
+    if (!cfg.is<JsonObjectConst>()) { send_err(fd, id, "missing config"); return; }
+    const size_t n = measureJson(cfg);
+    char* buf = static_cast<char*>(heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM));
+    if (!buf) { send_err(fd, id, "oom"); return; }
+    serializeJson(cfg, buf, n + 1);
+    char err[160] = "";
+    const bool ok = alarm_config_set(buf, n, err, sizeof(err));
+    heap_caps_free(buf);
+    reply_ok_or_err(fd, id, ok, err);
+}
+
 // ── zigbee.* (network settings + network reset) ───────────────────────
 // This backend keeps its network in the esp-zigbee dataset and a build-time
 // channel mask. Saving channel/key settings nobody reads told the owner
@@ -1875,12 +1931,12 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         return;
     }
     if (std::strcmp(cmd, "auth")               == 0) { reply_ok_or_err(fd, id, true, nullptr); return; }
-    // The Hub I/O device has no radio: Zigbee-only commands refuse it (spec §2).
+    // The hub's own devices (Hub I/O, Alarm) have no radio: Zigbee-only commands refuse them (spec §2).
     static constexpr const char* kZigbeeOnly[] = {"device.bind", "device.reinterview", "device.configure",
                                                   "device.groups.add", "device.groups.remove", "device.groups.refresh"};
     for (const char* z : kZigbeeOnly) {
-        if (std::strcmp(cmd, z) == 0 && parse_ieee(doc["args"]["ieee"] | "") == kHubIoIeee) {
-            send_err(fd, id, "hub I/O device: not a Zigbee device");
+        if (std::strcmp(cmd, z) == 0 && local_dev_is(parse_ieee(doc["args"]["ieee"] | ""))) {
+            send_err(fd, id, "a device on the hub itself: not a Zigbee device");
             return;
         }
     }
@@ -1903,6 +1959,10 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     if (std::strcmp(cmd, "diagnostics.unhandled")     == 0) { cmd_diagnostics_unhandled(fd, id);   return; }
     if (std::strcmp(cmd, "diagnostics.unhandled.get") == 0) { cmd_diagnostics_unhandled(fd, id);   return; }
     if (std::strcmp(cmd, "alerts.get")            == 0) { cmd_alerts_get(fd, id);                 return; }
+    if (std::strcmp(cmd, "alarm.get")             == 0) { cmd_alarm_get(fd, id);                  return; }
+    if (std::strcmp(cmd, "alarm.arm")             == 0) { cmd_alarm_arm(fd, id, doc);             return; }
+    if (std::strcmp(cmd, "alarm.disarm")          == 0) { cmd_alarm_disarm(fd, id);               return; }
+    if (std::strcmp(cmd, "alarm.config.set")      == 0) { cmd_alarm_config_set(fd, id, doc);      return; }
     if (std::strcmp(cmd, "group.list")            == 0) { cmd_group_list(fd, id);                  return; }
     if (std::strcmp(cmd, "group.create")          == 0) { cmd_group_create(fd, id, doc);           return; }
     if (std::strcmp(cmd, "group.get")             == 0) { cmd_group_get(fd, id, doc);              return; }
@@ -2046,7 +2106,8 @@ static void on_zcl_attr(const Event& e) {
     char buf[288];
     const size_t n = serializeJson(d, buf, sizeof(buf));
     if (n == 0 || n >= sizeof(buf)) return;        // truncated JSON helps nobody
-    push_event("attr.changed", buf, n);
+    // A keypad PIN reaches the hub page with its press, never the cloud: it disarms the alarm.
+    push_event("attr.changed", buf, n, !zcl_attr_key_is_secret(z.key));
 }
 
 static void on_device_join(const Event& e) {

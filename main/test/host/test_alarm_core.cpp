@@ -117,6 +117,8 @@ static void arming_rules() {
     a.arm(AlarmMode::HOME, false, nullptr, 0, 20);
     a.arm(AlarmMode::HOME, false, nullptr, 0, 25);
     CHECK(a.state() == AlarmState::ARMED_HOME, "arming the same mode again changes nothing");
+    CHECK(a.arm(AlarmMode::HOME, false, open, 1, 26) == AlarmArmResult::OK && a.state() == AlarmState::ARMED_HOME &&
+          a.bypass_count() == 0, "the same mode again is ok even with a window open now (nothing to arm)");
     a.arm(AlarmMode::AWAY, false, nullptr, 0, 30);
     CHECK(a.state() == AlarmState::ARMING && a.mode() == AlarmMode::AWAY && a.resting() == AlarmState::ARMED_AWAY,
           "home -> away goes through the exit delay");

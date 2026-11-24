@@ -29,6 +29,7 @@
 #include "device_cmd.h"
 #include "device_shadow.h"
 #include "event_bus.h"
+#include "local_dev.h"
 #include "simple_rules.h"
 #include "zap_common.h"
 #include "zap_store.h"
@@ -767,8 +768,7 @@ void user_io_early_init() {
             if (!setup_locked(i, initial)) ESP_LOGW(TAG, "GPIO %u (%s): %s", p.gpio, p.name, s_rt[i].err);
         }
     }
-    device_cmd_set_local_handler(local_cmd);
-    zhac_adapter_set_local_exposes_fn(local_exposes);
+    local_dev_register(kHubIoIeee, local_cmd, local_exposes);
     simple_rules_set_io_hooks(rules_check, rules_run);
     ESP_LOGI(TAG, "%u pin(s) configured, %u allowed (%s)", s_cfg.count, s_caps.n_allowed, CONFIG_ZHAC_IO_PINS);
 }
