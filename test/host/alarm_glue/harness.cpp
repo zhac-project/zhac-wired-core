@@ -10,6 +10,7 @@
 #include "alarm.cpp"
 
 #include <condition_variable>
+#include <cstdarg>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -26,6 +27,17 @@ bool     g_log = false;
 bool     g_nvs_fail = false;
 std::string g_nvs_fail_key;
 void (*g_nvs_hook)(const char*) = nullptr;
+std::map<std::string, int> g_nvs_refused;
+std::vector<std::string> g_logs;   // every log line, without its level and tag
+void host_log(const char* level, const char* tag, const char* fmt, ...) {
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    g_logs.push_back(line);
+    if (g_log) std::fprintf(stderr, "    %s %s: %s\n", level, tag, line);
+}
 std::vector<std::string> g_trace;
 std::map<std::string, std::string> g_nvs;
 std::vector<std::string> g_all_cmds;   // never cleared
@@ -68,6 +80,11 @@ int pos(const char* exact) {   // the first entry that is exactly this
 int cnt(const char* sub) {
     int n = 0;
     for (const auto& s : g_trace) n += s.find(sub) != std::string::npos;
+    return n;
+}
+int logged(const char* sub) {   // the log lines that say this
+    int n = 0;
+    for (const auto& s : g_logs) n += s.find(sub) != std::string::npos;
     return n;
 }
 void dump() { for (const auto& s : g_trace) std::printf("      %s\n", s.c_str()); }
@@ -459,20 +476,40 @@ int main_flow() {
     alarm_disarm("");
     run_task();
 
-    // ── A state that cannot be written still takes effect; the next pass that differs writes again ──
+    // ── A state that cannot be written still takes effect. A record that failed is tried again at the next change of
+    //    state, else no sooner than 5 min after the failure, as the shadow waits: on a nearly full NVS each try can
+    //    cost a page copy and a sector erase (round 2). Each record logs a run of failures once, and once its end ──
+    g_logs.clear();
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed");
+    run_task();
     g_nvs_fail = true;
-    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed while flash refuses");
-    run_task();
-    CHECK(h::alarm_attrs["away"] == "armed" && g_nvs["st2"].find("[\"away\",0,0]") != std::string::npos, "armed and shown, though not written");
-    g_nvs_fail = false;
-    run_task(1);   // a pass with nothing new to act on
-    CHECK(g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos && g_nvs["st"] == std::string("\2\2", 2),
-          "the next pass writes what flash lacks, whether or not the panel moved (F4)");
-    emit(0x2, "occupancy", 1);
-    run_task();
-    CHECK(g_nvs["st2"].find("[\"away\",4,1]") != std::string::npos && g_nvs["st"] == std::string("\6\2", 2), "the next change is written, both records");
     alarm_disarm("");
     run_task();
+    CHECK(h::alarm_attrs["away"] == "disarmed" && g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos, "disarmed and shown, though not written");
+    CHECK(g_nvs_refused["st"] == 1 && g_nvs_refused["st2"] == 1, "each record tried once");
+    CHECK(h::logged("stage 1 state record not saved") == 1 && h::logged("states not saved") == 1, "each failure logged");
+    run_task(9);   // nine passes with nothing new, 30 s apart
+    CHECK(g_nvs_refused["st"] == 1 && g_nvs_refused["st2"] == 1, "no record is tried again within 5 min of its failure");
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed again, as flash still says");
+    run_task();
+    alarm_disarm("");   // the records that failed 4.5 min ago, but a change of state
+    run_task();
+    CHECK(g_nvs_refused["st"] == 2 && g_nvs_refused["st2"] == 2, "a change of state is tried at once");
+    run_task(9);
+    CHECK(g_nvs_refused["st"] == 2 && g_nvs_refused["st2"] == 2, "and then waits 5 min again");
+    run_task(1);
+    CHECK(g_nvs_refused["st"] == 3 && g_nvs_refused["st2"] == 3, "5 min after the failure, one more try of each, though nothing changed");
+    CHECK(h::logged("not saved") == 2, "a run of failures is logged once");
+    g_nvs_fail = false;
+    g_trace.clear();
+    run_task(9);
+    CHECK(cnt("nvs:") == 0, "flash accepts again: still no try within 5 min of the failure");
+    run_task(1);
+    CHECK(g_nvs["st"] == std::string("\0\0", 2) && g_nvs["st2"].find("[\"away\",0,0]") != std::string::npos && cnt("nvs:") == 2,
+          "5 min after the failure, both records are written, whether or not the panel moved (F4)");
+    CHECK(h::logged("stage 1 state record saved again") == 1 && h::logged("states saved again") == 1, "each record says once that it is saved again");
+    run_task(20);
+    CHECK(cnt("nvs:") == 2 && h::logged("saved again") == 2 && h::logged("not saved") == 2, "nothing more to write, nothing more said");
 
     // ── Only the stage 1 record cannot be written: st2 is, and carries the st that flash still holds (ruling 17) ──
     g_nvs_fail_key = "st";

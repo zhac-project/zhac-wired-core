@@ -48,6 +48,7 @@ constexpr size_t   kStatesMax = 256;        // "st2": eight profiles pack to 200
 constexpr size_t   kSummaryMax = 24;        // "armed_" + an id
 constexpr uint8_t  kEventsMax = 20;         // one pass gives 18 names at most
 constexpr uint32_t kBootAlertDelayS = 60;   // the network and the cloud link come up first
+constexpr uint32_t kSaveRetryS = 300;       // a state record that failed to write waits this long, unless it changes
 const char* const  kClassNames[] = {"intrusion", "fire", "water", "gas", "other"};   // by AlarmClass, as the config names them
 
 SemaphoreHandle_t s_mu = nullptr;   // guards everything below up to s_ids_changed
@@ -94,6 +95,17 @@ char     s_st2_saved[kStatesMax];           // the "st2" record flash holds
 size_t   s_st2_len = 0;
 uint8_t  s_st_saved[2] = {0, 0};            // the stage 1 "st" record flash holds, when s_st_have
 bool     s_st_have = false;
+// A state record's write that failed: the same bytes are not tried again for kSaveRetryS. On a nearly full NVS each
+// try can cost a page copy and a sector erase; the shadow waits as long after one.
+template <size_t N>
+struct SaveRetry {
+    bool     failing;   // no write of the record landed since one failed: the failure is logged once
+    uint32_t at;        // the last failed try
+    size_t   len;       // ... and what it tried; 0 once flash held what the hub had (what comes next is a change)
+    uint8_t  tried[N];
+};
+SaveRetry<2>          s_st_retry{};
+SaveRetry<kStatesMax> s_st2_retry{};
 char     s_summary[kSummaryMax] = "disarmed";   // the alarm_state acted on last
 uint64_t s_summary_cause = 0;               // ... and the device behind its alarm_sensor
 
@@ -439,28 +451,49 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     if (boot_stop) s_boot_sounding = 0;
 }
 
+// One state record that differs from flash, unless the same bytes failed less than kSaveRetryS ago. The first failure
+// of a run is logged, and the write that lands after it.
+template <size_t N>
+bool put_state(const char* key, const void* d, size_t n, SaveRetry<N>& r, const char* what, const char* lost) {
+    const uint32_t now = mono_s();
+    if (r.len == n && std::memcmp(r.tried, d, n) == 0 && now - r.at < kSaveRetryS) return false;
+    if (nvs_put(key, d, n)) {
+        if (r.failing) ESP_LOGI(TAG, "%s saved again", what);
+        r.failing = false;
+        r.len = 0;
+        return true;
+    }
+    if (!r.failing)
+        ESP_LOGW(TAG, "%s not saved: %s; tried again at the next change, or in %u min", what, lost, static_cast<unsigned>(kSaveRetryS / 60));
+    r.failing = true;
+    r.at = now;
+    r.len = n;
+    std::memcpy(r.tried, d, n);
+    return false;
+}
+
 // The stage 1 record ("st", which follows the intrusion profiles) and the states of all profiles ("st2") as of the look,
 // each when it differs from what flash holds. "st" goes first, and "st2" carries the "st" that flash holds then: a boot
 // that finds another "st" beside it knows the stage 1 firmware wrote that one since (alarm_states_restore). Both
 // describe the one instant of the look: what happens while they are written is the next look's. A write that fails is
-// logged and the change still takes effect; a failed "st" leaves the two agreeing.
+// logged and the change still takes effect; a failed "st" leaves the two agreeing. A record that failed is tried again
+// at its next change, or kSaveRetryS later (put_state).
 void save_states(const Pass& p) {
-    if (!s_st_have || std::memcmp(p.st, s_st_saved, sizeof(p.st)) != 0) {
-        if (nvs_put("st", p.st, sizeof(p.st))) {
-            std::memcpy(s_st_saved, p.st, sizeof(p.st));
-            s_st_have = true;
-        } else {
-            ESP_LOGW(TAG, "stage 1 state record not saved: a fall back to that firmware finds the one saved last");
-        }
+    if (s_st_have && std::memcmp(p.st, s_st_saved, sizeof(p.st)) == 0) {
+        s_st_retry.len = 0;
+    } else if (put_state("st", p.st, sizeof(p.st), s_st_retry, "stage 1 state record", "a fall back to that firmware finds the one saved last")) {
+        std::memcpy(s_st_saved, p.st, sizeof(p.st));
+        s_st_have = true;
     }
     static char st2[kStatesMax];
     const size_t len = alarm_states_pack(p.prof, p.state, p.rests, p.n_prof, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
-    if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) return;
-    if (len && nvs_put("st2", st2, len)) {
+    if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) {
+        s_st2_retry.len = 0;
+        return;
+    }
+    if (len && put_state("st2", st2, len, s_st2_retry, "states", "a restart comes back to the ones saved last")) {
         std::memcpy(s_st2_saved, st2, len);
         s_st2_len = len;
-    } else {
-        ESP_LOGW(TAG, "states not saved: a restart comes back to the ones saved last");
     }
 }
 
@@ -589,9 +622,9 @@ void alarm_task(void*) {
                 ESP_LOGI(TAG, "task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
         } else if (!boot_alert_at) {
-            // Nothing new, and flash may still hold other states: a write that failed, steps the look did not see as a
-            // change (a disarm and an arm), a boot that read other records. Not in the minute after a restart during
-            // an alarm: its record waits for the boot stop.
+            // Nothing new, and flash may still hold other states: a write that failed (tried again kSaveRetryS after
+            // it), steps the look did not see as a change (a disarm and an arm), a boot that read other records. Not in
+            // the minute after a restart during an alarm: its record waits for the boot stop.
             save_states(p);
         }
         Refusal r;
