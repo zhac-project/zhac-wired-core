@@ -684,7 +684,8 @@ void alarm_task(void*) {
             // Nothing new, and flash may still hold other states: a write that failed (tried again kSaveRetryS after
             // it), steps the look did not see as a change (a disarm and an arm), a boot that read other records, a save's
             // own write. Not in the minute after a restart during an alarm, where the record waits for the boot stop,
-            // unless a save wrote it since: that one holds no alarm (a save is refused while one runs).
+            // unless a save wrote it since: the save's own pass (s_resync) writes the states in run() anyway, and "bt"
+            // keeps the boot stop's job.
             save_states(p);
         }
         Refusal r;
