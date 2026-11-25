@@ -4,8 +4,8 @@
 // The hub speaker (spec extra/docs/superpowers/specs/2026-11-25-hub-sounds-design.md): the ES8311 codec
 // found at boot, its I2S stream, the amplifier pin, and the task that plays the one-voice player of
 // sound_synth.h. Rules, Lua, REST and the Hub Sound device all come through here; every call is safe from
-// any task (one mutex around the player). Built without CONFIG_ZHAC_AUDIO, each call is a stub: not
-// present, plays ABSENT, volume and maximum 0.
+// any task, one on a PSRAM stack included (one mutex around the player; no call writes flash). Built
+// without CONFIG_ZHAC_AUDIO, each call is a stub: not present, plays ABSENT, volume and maximum 0.
 #pragma once
 
 #include <cstddef>
@@ -30,8 +30,10 @@ SoundResult sound_melody(const SoundNote* notes, size_t n, int volume);
 bool        sound_stop(const char* name);   // nullptr or "" = whatever plays; else only that sound
 const char* sound_playing();                // the name, "tone", "melody" or nullptr
 
+// The setters change the live value at once and never write flash; the sound task saves volume and mute to
+// NVS once no sound plays. Without that task (no codec, or its start failed) only the live value changes.
 int  sound_volume();             // the default volume, 0..sound_max_volume()
-int  sound_set_volume(int v);    // held to 0..max and saved; returns the stored value
+int  sound_set_volume(int v);    // held to 0..max; returns the value now in use
 bool sound_muted();
-void sound_set_muted(bool m);    // saved
+void sound_set_muted(bool m);
 int  sound_max_volume();         // CONFIG_ZHAC_AUDIO_MAX_VOLUME

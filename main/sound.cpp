@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // The hub speaker: the codec probe, the I2S stream, the amplifier pin, NVS, the rule hooks and the render
-// task around the pure player of sound_synth.h. Locking: s_mu guards s_player around every player call,
-// render included; callers get the player's answer at once and the task only renders. NVS is written
-// outside the lock, so a save never stalls the stream.
+// task around the pure player of sound_synth.h. Locking: s_mu guards s_player and s_save around every
+// player call, render included; callers get the player's answer at once. Only the task writes NVS (volume
+// and mute, between sounds, outside the lock): callers may run on a PSRAM stack, and one writer keeps the
+// saved values equal to the live ones.
 #include "sound.h"
 
 #include "sdkconfig.h"
@@ -53,6 +54,7 @@ i2c_master_bus_handle_t  s_bus  = nullptr;
 i2c_master_dev_handle_t  s_dev  = nullptr;
 i2s_chan_handle_t        s_tx   = nullptr;
 TaskHandle_t             s_task = nullptr;
+bool                     s_save = false;      // under s_mu: volume or mute changed since the task saved them
 int16_t                  s_buf[kBlock];       // the task's block: static, off its stack
 
 struct Lock {
@@ -71,15 +73,26 @@ uint8_t load_u8(const char* key, uint8_t def) {
     return v;
 }
 
-void save_u8(const char* key, uint8_t v) {
+// The sound task's only: `vol` and `muted` as they are now, when a setter changed either since the last
+// save. NVS skips a value it already holds.
+void save_settings() {
+    uint8_t vol, muted;
+    {
+        Lock l;
+        if (!s_save) return;
+        s_save = false;
+        vol    = static_cast<uint8_t>(s_player.volume);
+        muted  = s_player.muted ? 1 : 0;
+    }
     nvs_handle_t h;
     esp_err_t e = nvs_open(kNs, NVS_READWRITE, &h);
     if (e == ESP_OK) {
-        e = nvs_set_u8(h, key, v);
+        e = nvs_set_u8(h, "vol", vol);
+        if (e == ESP_OK) e = nvs_set_u8(h, "muted", muted);
         if (e == ESP_OK) e = nvs_commit(h);
         nvs_close(h);
     }
-    if (e != ESP_OK) ESP_LOGW(TAG, "%s not saved: %s", key, esp_err_to_name(e));
+    if (e != ESP_OK) ESP_LOGW(TAG, "volume and mute not saved: %s", esp_err_to_name(e));
 }
 
 // ── Boot ──
@@ -108,12 +121,14 @@ bool probe() {
 // ── The render task ──
 
 // Plays the player block by block. The amplifier goes on once a sound's first block is queued, and off after
-// ~1 s of silence; a sound in that second keeps it on. Idle with it off, the task sleeps until a caller's
-// notify, a minute at most. The I2S channel runs throughout and sends zeros whenever no block is queued.
+// ~1 s of silence; a sound in that second keeps it on. Idle with it off, the task saves a changed volume or
+// mute, then sleeps until a caller's notify, a minute at most. The I2S channel runs throughout and sends
+// zeros whenever no block is queued.
 void sound_task(void*) {
     bool     amp = false;
-    uint32_t quiet = 0;   // silent blocks written since the last sound
-    bool     warned = false, stack_logged = false;
+    uint32_t quiet = 0;          // silent blocks written since the last sound
+    unsigned stack_free = ~0u;   // the least free stack logged so far
+    bool     warned = false;
     for (;;) {
         size_t n;
         {
@@ -123,15 +138,16 @@ void sound_task(void*) {
         if (n) {
             quiet = 0;
         } else if (!amp) {
+            save_settings();   // a setter's wake ends here: the amplifier stays off, no linger
+            if (const unsigned f = uxTaskGetStackHighWaterMark(nullptr); f < stack_free) {   // for the hardware check
+                stack_free = f;
+                ESP_LOGI(TAG, "task: %u B of stack never used", f);
+            }
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kIdleWakeMs));
             continue;
         } else if (++quiet > kLingerBlocks) {
             gpio_set_level(kPa, 0);
             amp = false;
-            if (!stack_logged) {   // for the hardware check: a whole sound has run through the task
-                stack_logged = true;
-                ESP_LOGI(TAG, "task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-            }
             continue;
         }
         std::memset(s_buf + n, 0, (kBlock - n) * sizeof(s_buf[0]));
@@ -177,10 +193,12 @@ const char* start(esp_err_t* e) {
     if ((*e = i2s_channel_init_std_mode(s_tx, &sc)) != ESP_OK) return "I2S setup";
     if ((*e = i2s_channel_enable(s_tx)) != ESP_OK) return "I2S start";
 
+    // The task's stack: 6 KB like the other tasks that commit NVS (the commit path uses ~3 KB). Internal RAM
+    // (xTaskCreate): it writes flash, so its stack cannot sit in PSRAM.
     const char* step = nullptr;
     if (!es8311_dac_start(s_dev, e)) {
         step = "codec setup";
-    } else if (xTaskCreate(sound_task, "sound", 4096, nullptr, 5, &s_task) != pdPASS) {   // internal stack
+    } else if (xTaskCreate(sound_task, "sound", 6144, nullptr, 5, &s_task) != pdPASS) {
         *e   = ESP_ERR_NO_MEM;
         step = "render task";
     }
@@ -312,13 +330,16 @@ int sound_volume() {
 }
 
 int sound_set_volume(int v) {
-    int stored;
+    int          now;
+    TaskHandle_t t;
     {
         Lock l;
-        stored = sound_player_set_volume(&s_player, v);
+        now    = sound_player_set_volume(&s_player, v);
+        s_save = true;
+        t      = s_task;
     }
-    save_u8("vol", static_cast<uint8_t>(stored));
-    return stored;
+    if (t) xTaskNotifyGive(t);   // the task saves it
+    return now;
 }
 
 bool sound_muted() {
@@ -327,11 +348,14 @@ bool sound_muted() {
 }
 
 void sound_set_muted(bool m) {
+    TaskHandle_t t;
     {
         Lock l;
         sound_player_set_muted(&s_player, m);
+        s_save = true;
+        t      = s_task;
     }
-    save_u8("muted", m ? 1 : 0);
+    if (t) xTaskNotifyGive(t);   // the task saves it
 }
 
 int sound_max_volume() { return s_player.max_volume; }   // fixed in sound_early_init
