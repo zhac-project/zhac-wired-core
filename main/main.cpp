@@ -49,6 +49,7 @@
 #include "api_remote.h"
 #include "api_rules.h"
 #include "api_io.h"
+#include "api_sound.h"
 #include "alarm.h"
 #include "sound.h"
 #include "user_io.h"
@@ -395,6 +396,7 @@ extern "C" void app_main() {
         api_net_register(hd);      // replaces mono's api_wifi_register
         api_rules_register(hd);
         api_io_register(hd);
+        api_sound_register(hd);   // 4 more URI handlers (WS_SERVER_MAX_URI_HANDLERS in ws_server.h)
         api_scripts_register(hd);
         api_system_register(hd);
         api_groups_register(hd);

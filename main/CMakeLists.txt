@@ -63,6 +63,7 @@ idf_component_register(
         "user_io_config.cpp"
         "user_io.cpp"
         "api_io.cpp"
+        "api_sound.cpp"
         "lua_io.cpp"
         "local_dev.cpp"
         "alarm_core.cpp"

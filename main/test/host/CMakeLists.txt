@@ -68,3 +68,10 @@ target_include_directories(sound_synth_tests PRIVATE
     "${ZHAC_COMPONENTS}/components/arduinojson/src"
     "${ZHAC_COMPONENTS}/components/ws_server/include")
 add_test(NAME sound_synth COMMAND sound_synth_tests)
+
+# /api/sound's request-body checks and GET body (spec 2026-11-25 hub sounds).
+add_executable(api_sound_json_tests test_api_sound_json.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../sound_synth.cpp)
+target_include_directories(api_sound_json_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    "${ZHAC_COMPONENTS}/components/arduinojson/src")
+add_test(NAME api_sound_json COMMAND api_sound_json_tests)
