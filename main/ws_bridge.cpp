@@ -1421,9 +1421,9 @@ static void cmd_rule_update(int fd, uint32_t id, JsonDocument& doc) {
 static void cmd_rule_check(int fd, uint32_t id, JsonDocument& doc) {
     const char* dsl = doc["args"]["dsl"] | (const char*)nullptr;
     if (!dsl) { send_err(fd, id, "missing dsl"); return; }
-    char err[96];
+    char err[192];
     const bool ok = simple_rules_check(dsl, err, sizeof(err));
-    char buf[700];   // a 96-byte message escaped as \u00XX at worst
+    char buf[1300];   // a 192-byte message escaped as \u00XX at worst
     JsonWriter w(buf, sizeof(buf));
     w.fmt("{\"id\":%" PRIu32 ",\"ok\":true,\"data\":{\"ok\":%s,\"err\":\"", id, ok ? "true" : "false")
      .str(err, sizeof(err)).raw("\"}}");

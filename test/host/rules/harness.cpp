@@ -643,19 +643,19 @@ static void test_rule_check() {
     g_check_msg = "back\\slash and \"both\" \xD0\xBF\xD1\x80\xD0\xB8";
     h_rule_check(1, 7, q);
     if (parse(one(), d)) CHECK(d["data"]["err"].as<std::string>() == g_check_msg, "backslash, quotes, Cyrillic");
-    g_check_msg = std::string(94, 'a') + "\xD0\xB6";   // 96 bytes: snprintf into err[96] cuts the letter
+    g_check_msg = std::string(190, 'a') + "\xD0\xB6";   // 192 bytes: snprintf into err[192] cuts the letter
     h_rule_check(1, 8, q);
     if (parse(one(), d)) {
         const std::string e = d["data"]["err"].as<std::string>();
-        CHECK(e == std::string(94, 'a') + "\xEF\xBF\xBD", "a message cut by the 96-byte buffer is healed (%zu bytes)", e.size());
+        CHECK(e == std::string(190, 'a') + "\xEF\xBF\xBD", "a message cut by the 192-byte buffer is healed (%zu bytes)", e.size());
     }
-    g_check_msg = std::string(200, '\x01');   // all control bytes: 95 kept, each \u0001
+    g_check_msg = std::string(200, '\x01');   // all control bytes: 191 kept, each \u0001
     h_rule_check(1, 4294967295u, q);
     {
         const std::string r = g_replies.empty() ? "" : g_replies.back();
         if (parse(one(), d)) {
-            CHECK(d["data"]["err"].as<std::string>() == std::string(95, '\x01'), "worst case message");
-            CHECK(r.size() < 700, "worst reply %zu bytes fits the 700-byte buffer", r.size());
+            CHECK(d["data"]["err"].as<std::string>() == std::string(191, '\x01'), "worst case message");
+            CHECK(r.size() < 1300, "worst reply %zu bytes fits the 1300-byte buffer", r.size());
         }
     }
     JsonDocument none;

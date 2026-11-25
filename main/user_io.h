@@ -42,6 +42,7 @@ bool user_io_write(const char* ref, UserIoMode want, double v, char* err, size_t
 int  user_io_toggle(const char* ref, char* err, size_t cap);                             // new level, -1 on error
 bool user_io_read(const char* ref, int32_t* value, int32_t* raw, char* err, size_t cap); // out/in: level; adc: mV|raw, raw
 bool user_io_strip(const char* ref, const uint32_t* rgb, size_t n, char* err, size_t cap); // 0xRRGGBB per LED
+bool user_io_strip_fill(const char* ref, uint32_t rgb, char* err, size_t cap);              // every configured LED one 0xRRGGBB, then refresh
 
 // lua_io.cpp: adds zhac.gpio_* & co. to the Lua `zhac` table. Before lua_engine_init.
 void lua_io_register();

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "user_io_config.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -188,6 +189,30 @@ bool user_io_parse_level(const char* s, bool* on) {
     const double d = std::strtod(s, &end);
     if (end == s || *end != '\0' || d != d) return false;
     *on = d != 0.0;
+    return true;
+}
+
+bool user_io_parse_strip_value(const char* s, uint32_t* rgb) {
+    if (!s || s[0] != '#') return false;
+    uint32_t c = 0;
+    for (int i = 1; i <= 6; i++) {
+        const char ch = s[i];
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+        c = c << 4 | static_cast<uint32_t>(ch <= '9' ? ch - '0' : (ch | 0x20) - 'a' + 10);
+    }
+    uint32_t b = 100;
+    if (s[7] == ' ') {
+        const char* d = s + 8;
+        b = 0;
+        size_t n = 0;
+        for (; std::isdigit(static_cast<unsigned char>(d[n])); n++) b = b * 10 + static_cast<uint32_t>(d[n] - '0');
+        if (n == 0 || n > 3 || d[n] != '\0' || b > 100) return false;
+    } else if (s[7] != '\0') {
+        return false;
+    }
+    uint32_t out = 0;
+    for (int sh = 16; sh >= 0; sh -= 8) out |= (((c >> sh & 0xFF) * b + 50) / 100) << sh;
+    *rgb = out;
     return true;
 }
 

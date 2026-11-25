@@ -150,6 +150,26 @@ int main() {
     CHECK(user_io_parse_pins("2, 3,4,,20 ,x,99,53", list, 64) == 5 && list[0] == 2 && list[1] == 3 && list[2] == 4 &&
           list[3] == 20 && list[4] == 53, "Kconfig pin list: numbers 0-63, junk skipped");
 
+    // ── strip.set value: "#RRGGBB" or "#RRGGBB <0-100>", scaled per channel (c * b + 50) / 100 ──
+    {
+        uint32_t rgb = 0xDEADBEEF;
+        CHECK(user_io_parse_strip_value("#FF8800", &rgb) && rgb == 0xFF8800, "a colour alone is full brightness");
+        CHECK(user_io_parse_strip_value("#ff8800 50", &rgb) && rgb == 0x804400, "lower-case hex, brightness 50 rounds half up per channel");
+        CHECK(user_io_parse_strip_value("#FF8800 0", &rgb) && rgb == 0, "brightness 0 is dark");
+        CHECK(user_io_parse_strip_value("#FF8800 100", &rgb) && rgb == 0xFF8800, "brightness 100 leaves the colour");
+        CHECK(user_io_parse_strip_value("#000000", &rgb) && rgb == 0, "strip.off sends black");
+        CHECK(user_io_parse_strip_value("#FF8800 050", &rgb) && rgb == 0x804400, "up to three digits, as the rule parser takes them");
+        const char* bad[] = {"#FF880", "FF8800", "#GG0000", "#FF8800 101", "#FF8800 -1", "#FF8800 5x", "#FF8800  50",
+                             "", "#FF88000", "#FF8800 ", "#FF8800 1000", "#FF8800 50 ", "#FF8800 50 1"};
+        for (const char* b : bad) {
+            rgb = 0xDEADBEEF;
+            char what[64];
+            std::snprintf(what, sizeof(what), "'%s' is refused", b);
+            CHECK(!user_io_parse_strip_value(b, &rgb), what);
+        }
+        CHECK(!user_io_parse_strip_value(nullptr, &rgb), "null is refused");
+    }
+
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("user_io config: all checks passed\n");
     return 0;

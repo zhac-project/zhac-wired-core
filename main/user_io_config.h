@@ -59,6 +59,10 @@ int user_io_cfg_find(const UserIoConfig& c, const char* ref);
 // or a number (non-zero = on). False for anything else.
 bool user_io_parse_level(const char* s, bool* on);
 
+// A strip.set rule value: "#RRGGBB" or "#RRGGBB <0-100>" (one space, up to three digits; hex in either case).
+// `rgb` is 0xRRGGBB with each channel scaled by the brightness, (c * b + 50) / 100. False for anything else.
+bool user_io_parse_strip_value(const char* s, uint32_t* rgb);
+
 // "2, 3,4" -> {2,3,4}: the Kconfig pin list. Entries that are not 0-63 are skipped. Returns the count.
 uint8_t user_io_parse_pins(const char* csv, uint8_t* out, uint8_t cap);
 

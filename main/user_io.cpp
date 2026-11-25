@@ -468,7 +468,7 @@ int find_locked(const char* ref, UserIoMode want, char* err, size_t cap) {
 // ── Hooks: rules, device_cmd, exposes ──
 
 bool rules_check(SimpleRulesIoOp op, const char* pin, char* err, size_t cap) {
-    const UserIoMode want = op == SimpleRulesIoOp::PWM ? UserIoMode::PWM : UserIoMode::OUT;
+    const UserIoMode want = op == SimpleRulesIoOp::PWM ? UserIoMode::PWM : op == SimpleRulesIoOp::STRIP ? UserIoMode::STRIP : UserIoMode::OUT;
     Lock l;
     const int i = user_io_cfg_find(s_cfg, pin);
     if (i >= 0 && s_cfg.pins[i].mode == want) return true;
@@ -478,7 +478,7 @@ bool rules_check(SimpleRulesIoOp op, const char* pin, char* err, size_t cap) {
         if (s_cfg.pins[k].mode != want) continue;
         n += static_cast<size_t>(std::snprintf(names + n, sizeof(names) - n, "%s%s", n ? ", " : "", s_cfg.pins[k].name));
     }
-    const char* kind = want == UserIoMode::PWM ? "pwm pins" : "outputs";
+    const char* kind = want == UserIoMode::PWM ? "pwm pins" : want == UserIoMode::STRIP ? "strips" : "outputs";
     if (i < 0) std::snprintf(err, cap, "unknown pin '%s' (%s: %s)", pin, kind, n ? names : "none configured");
     else       std::snprintf(err, cap, "pin '%s' is %s (%s: %s)", pin, user_io_mode_name(s_cfg.pins[i].mode), kind, n ? names : "none configured");
     return false;
@@ -494,6 +494,10 @@ bool rules_run(SimpleRulesIoOp op, const char* pin, const char* value) {
         bool on = false;
         if (!user_io_parse_level(value, &on)) std::snprintf(err, sizeof(err), "'%s' is not on or off", value);
         else ok = user_io_write(pin, UserIoMode::OUT, on ? 1.0 : 0.0, err, sizeof(err));
+    } else if (op == SimpleRulesIoOp::STRIP) {
+        uint32_t rgb = 0;
+        if (!user_io_parse_strip_value(value, &rgb)) std::snprintf(err, sizeof(err), "'%s' is not a colour", value);
+        else ok = user_io_strip_fill(pin, rgb, err, sizeof(err));
     } else {
         char* end = nullptr;
         const double d = std::strtod(value, &end);
@@ -937,6 +941,24 @@ bool user_io_strip(const char* ref, const uint32_t* rgb, size_t n, char* err, si
     const size_t leds = s_cfg.pins[i].leds;
     for (size_t k = 0; k < n && k < leds; k++) {
         if (led_strip_set_pixel(strip, k, (rgb[k] >> 16) & 0xFF, (rgb[k] >> 8) & 0xFF, rgb[k] & 0xFF) != ESP_OK) {
+            std::snprintf(err, cap, "pin '%s': LED %u not set", ref, static_cast<unsigned>(k));
+            return false;
+        }
+    }
+    if (led_strip_refresh(strip) != ESP_OK) { std::snprintf(err, cap, "pin '%s': strip refresh failed", ref); return false; }
+    return true;
+}
+
+// Every configured LED one colour, then refresh (strip.set / strip.off). No per-LED array: user_io_strip's
+// would be up to 4 KB on the caller's stack.
+bool user_io_strip_fill(const char* ref, uint32_t rgb, char* err, size_t cap) {
+    Lock l;
+    const int i = find_locked(ref, UserIoMode::STRIP, err, cap);
+    if (i < 0) return false;
+    led_strip_handle_t strip = s_rt[i].strip;
+    const size_t leds = s_cfg.pins[i].leds;
+    for (size_t k = 0; k < leds; k++) {
+        if (led_strip_set_pixel(strip, k, (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF) != ESP_OK) {
             std::snprintf(err, cap, "pin '%s': LED %u not set", ref, static_cast<unsigned>(k));
             return false;
         }
