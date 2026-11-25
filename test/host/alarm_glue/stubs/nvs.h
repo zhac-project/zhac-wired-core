@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Host stub: the "alarm" namespace as a map; every write goes into the trace; writes can be made to fail.
+// Host stub: the "alarm" namespace as a map; every write ("nvs:<key>") and erase ("nvs-erase:<key>") goes into the
+// trace; both can be made to fail.
 #pragma once
 #include <cstring>
 #include <map>
@@ -25,6 +26,16 @@ inline esp_err_t nvs_set_blob(nvs_handle_t, const char* k, const void* d, size_t
     g_nvs[k] = std::string(static_cast<const char*>(d), n);
     g_trace.push_back(std::string("nvs:") + k);
     if (g_nvs_hook) g_nvs_hook(k);
+    return ESP_OK;
+}
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+inline esp_err_t nvs_erase_key(nvs_handle_t, const char* k) {
+    if (g_nvs_fail || g_nvs_fail_key == k) {
+        g_nvs_refused[k]++;
+        return ESP_FAIL;
+    }
+    if (!g_nvs.erase(k)) return ESP_ERR_NVS_NOT_FOUND;
+    g_trace.push_back(std::string("nvs-erase:") + k);
     return ESP_OK;
 }
 inline esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }

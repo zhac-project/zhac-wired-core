@@ -511,6 +511,22 @@ int main_flow() {
     run_task(20);
     CHECK(cnt("nvs:") == 2 && h::logged("saved again") == 2 && h::logged("not saved") == 2, "nothing more to write, nothing more said");
 
+    // ── The wait after a failure is for the same bytes only: a change to others, which flash does not hold either, is
+    //    tried at once (M46) ──
+    g_logs.clear();
+    g_nvs_fail = true;
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed while flash refuses");
+    run_task();
+    {
+        const int st_tries = g_nvs_refused["st"], st2_tries = g_nvs_refused["st2"];
+        CHECK(alarm_arm("night", false, open, &n_open) == AlarmReply::OK, "night arming: other bytes than the failed ones and than flash's");
+        run_task();
+        CHECK(g_nvs_refused["st"] == st_tries + 1 && g_nvs_refused["st2"] == st2_tries + 1, "each record is tried at once, within 5 min of its failure");
+    }
+    CHECK(alarm_disarm("") == AlarmReply::OK, "disarmed: flash agrees again, nothing to write");
+    run_task();
+    g_nvs_fail = false;
+
     // ── Only the stage 1 record cannot be written: st2 is, and carries the st that flash still holds (ruling 17) ──
     g_nvs_fail_key = "st";
     CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed while st cannot be written");
