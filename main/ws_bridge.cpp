@@ -1791,7 +1791,7 @@ static void cmd_alarm_arm(int fd, uint32_t id, JsonDocument& doc) {
     const AlarmReply r = alarm_arm(profile, doc["args"]["force"] | false, open, &n);
     if (r == AlarmReply::BUSY) { send_err(fd, id, "an alarm is on: disarm first"); return; }
     if (r == AlarmReply::NO_PROFILE) { send_err(fd, id, "no such profile"); return; }
-    JsonDocument d;
+    JsonDocument d(psram_json());   // the open list runs to about 3 KB at 48 contacts: not from internal RAM
     d["armed"] = r == AlarmReply::OK;
     if (r == AlarmReply::OPEN) {
         JsonArray a = d["open"].to<JsonArray>();

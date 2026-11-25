@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Host check of the hub page's alarm.* commands (main/ws_bridge.cpp): only an absent id means "no id", so a null or
-// empty one never disarms every profile (review W18), and alarm.get never answers a cut document as the whole
-// config (W20). The real commands are in slice_tu.cpp; here are their neighbours: the counted allocator, the reply
-// sink and the panel's calls, recorded.
+// empty one never disarms every profile (review W18), alarm.get never answers a cut document as the whole config (W20),
+// and an arm refused for open doors builds their list in PSRAM (W21). The real commands are in slice_tu.cpp; here are
+// their neighbours: the counted allocator, the reply sink and the panel's calls, recorded.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,26 +22,32 @@ void h_alarm_silence(int fd, uint32_t id, JsonDocument& doc);
 static int g_fail = 0, g_checks = 0;
 #define CHECK(c, m) do { g_checks++; if (!(c)) { std::printf("FAIL: %s (line %d)\n", (m), __LINE__); g_fail++; } } while (0)
 
-// heap_caps: every call counted; call number g_fail_at (1-based) fails, 0 = none
-static int g_allocs = 0, g_fail_at = 0;
-static bool fails() { return ++g_allocs == g_fail_at; }
-void* heap_caps_malloc(size_t n, uint32_t) { return fails() ? nullptr : std::malloc(n); }
-void* heap_caps_realloc(void* p, size_t n, uint32_t) { return fails() ? nullptr : std::realloc(p, n); }
+// heap_caps: every call counted; call number g_fail_at (1-based) fails, 0 = none; g_spiram: the calls that ask for PSRAM
+static int g_allocs = 0, g_fail_at = 0, g_spiram = 0;
+static bool fails(uint32_t caps) { g_spiram += (caps & MALLOC_CAP_SPIRAM) != 0; return ++g_allocs == g_fail_at; }
+void* heap_caps_malloc(size_t n, uint32_t caps) { return fails(caps) ? nullptr : std::malloc(n); }
+void* heap_caps_realloc(void* p, size_t n, uint32_t caps) { return fails(caps) ? nullptr : std::realloc(p, n); }
 void heap_caps_free(void* p) { std::free(p); }
 
 static std::vector<std::string> g_replies;
 void ws_server_reply(int, const char* buf, size_t len) { g_replies.emplace_back(buf, len); }
 struct ZapDevice;
-bool zigbee_pool_snapshot(uint64_t, ZapDevice*) { return false; }
+static int g_spiram_named = -1;   // g_spiram when a device name was last looked up: while alarm.arm fills its open list
+bool zigbee_pool_snapshot(uint64_t, ZapDevice*) { g_spiram_named = g_spiram; return false; }
 
-// The panel: four profiles, and what each call was given
+// The panel: four profiles, and what each call was given; "door" is refused for 48 open contacts
 static std::vector<std::string> g_calls;
 static bool known(const char* id) {
     for (const char* p : {"away", "home", "night", "flood"}) if (std::strcmp(id, p) == 0) return true;
     return false;
 }
-AlarmReply alarm_arm(const char* id, bool, uint64_t*, uint8_t*) {
+AlarmReply alarm_arm(const char* id, bool, uint64_t* open, uint8_t* n) {
     g_calls.push_back(std::string("arm:") + id);
+    if (std::strcmp(id, "door") == 0) {
+        for (uint8_t i = 0; i < kAlarmMaxSensors; i++) open[i] = i + 1u;
+        *n = kAlarmMaxSensors;
+        return AlarmReply::OPEN;
+    }
     return known(id) ? AlarmReply::OK : AlarmReply::NO_PROFILE;
 }
 AlarmReply alarm_disarm(const char* id) {   // "" is every profile
@@ -103,6 +109,15 @@ int main() {
     CHECK(run(h_alarm_arm, R"({"args":{"mode":"home"}})") == R"({"id":5,"ok":true,"data":{"armed":true}})" &&
           g_calls == Calls({"arm:home"}), "arm without an id: stage 1's mode");
     CHECK(run(h_alarm_silence, R"({"args":{}})") == no && g_calls == Calls({"silence:"}), "silence without an id: the panel's answer");
+
+    // ── W21: an arm refused for open doors lists them (about 3 KB at 48 contacts) in a document in PSRAM ──
+    {
+        g_spiram = 0;
+        const std::string r = run(h_alarm_arm, R"({"args":{"id":"door"}})");
+        CHECK(r.rfind(R"({"id":5,"ok":true,"data":{"armed":false,"open":[{"ieee":"0x0000000000000001"},)", 0) == 0 &&
+              r.find(R"({"ieee":"0x0000000000000030"}]}})") != std::string::npos, "the refusal lists the 48 open contacts");
+        CHECK(g_spiram_named > 0, "its document takes PSRAM while the list is filled, not the default heap (M33)");
+    }
 
     // ── W20: whichever allocation fails, in the document or in the reply, alarm.get answers an error ──
     g_allocs = 0;

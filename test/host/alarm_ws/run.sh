@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # Host check of the hub page's alarm.* commands (spec 2026-11-24 Safety profiles): only an absent id means "no id"
-# (a null or empty one disarmed every profile, review W18), and alarm.get answers an error instead of a cut config
-# when its document or its reply runs out of memory (W20).
+# (a null or empty one disarmed every profile, review W18), alarm.get answers an error instead of a cut config
+# when its document or its reply runs out of memory (W20), and an arm refused for open doors lists them in PSRAM (W21).
 #   sh run.sh                  build and run; exit code = number of mismatches (ASan/UBSan abort = non-zero too)
 #   MUTANT=<name> sh run.sh    same, after breaking ONE line in the work copy (never in the repo), to show the
 #                              harness can fail: null_id empty_id no_doc_check no_env_check
