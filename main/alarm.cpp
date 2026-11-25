@@ -903,7 +903,7 @@ void alarm_early_init() {
     // rewrites the state records, and a save in it the outputs. Internal RAM for it: an NVS read target.
     auto* bt = static_cast<uint8_t*>(heap_caps_malloc(kBootStopMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     size_t bt_len = bt ? nvs_get("bt", bt, kBootStopMax) : 0;
-    if (bt_len && (bt[0] != 1 || bt_len != 2 + bt[1] * kBootItem)) {
+    if (bt_len && (bt_len < 2 || bt[0] != 1 || bt_len != 2 + bt[1] * kBootItem)) {
         ESP_LOGE(TAG, "boot stop record unreadable: ignored");
         bt_len = 0;
     }
@@ -919,7 +919,7 @@ void alarm_early_init() {
         std::memcpy(&o.ieee, bt + at, sizeof(o.ieee));
         o.kind  = static_cast<AlarmOutKind>(bt[at + 8]);
         o.value = bt[at + 9];
-        o.keep  = bt[at + 10];
+        o.keep  = bt[at + 10] && o.kind == AlarmOutKind::STATE;   // as a config allows it: a foreign siren is stopped
         if (!listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = o;
     }
     for (uint8_t k = 0; s_boot_stop && k < s_cfg->n_outputs; k++) {

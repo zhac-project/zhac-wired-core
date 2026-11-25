@@ -988,6 +988,16 @@ int restart_flow() {
               "a minute after the second restart, the relay is switched off as it sounded at the first, not set as the save keeps it");
     });
 
+    // ── A foreign "bt" that keeps a siren: only a switch is left as set, so the siren is stopped, not started ──
+    g_nvs = {{"cfg2", packed(relay)}, {"st2", R"({"v":1,"l":[0,0],"p":[["flood",2,1]]})"}, {"st", std::string("\0\0", 2)},
+             {"bt", std::string("\1\1" "\x10\0\0\0\0\0\0\0" "\0\0\1", 13)}};   // the siren 0x10, warning, keep
+    boot_run([] {
+        h::boot();
+        run_task(63);
+        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:10:warning=0") == 1 && cnt("cmd:10:") == 1,
+              "a siren that a foreign record keeps is stopped a minute after the restart, not started");
+    });
+
     // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
     std::string with_fire = kCfg;
     with_fire.insert(with_fire.find("],\n \"keypads\""), R"(,
