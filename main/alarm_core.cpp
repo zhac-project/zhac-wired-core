@@ -18,7 +18,9 @@ namespace {
 const char* const kStates[] = {"disarmed", "arming", "armed", "pending", "triggered"};
 const char* const kClasses[] = {"intrusion", "fire", "water", "gas", "other"};   // by AlarmClass
 const char* const kModes[] = {"away", "home", "night"};                         // a role is index + 1; stage 1's modes
-const char* const kReserved[] = {"alarm_state", "alarm_sensor", "armed", "disarmed", "arming", "pending", "triggered"};
+// Ids a profile may not have: the stage 1 attributes and states, and attribute names the device layer treats as its own.
+const char* const kReserved[] = {"alarm_state", "alarm_sensor", "armed", "disarmed", "arming", "pending", "triggered",
+                                 "pin_code", "action_code", "color_hex"};
 const char* const kKinds[] = {"warning", "alarm", "state"};
 const char* const kOnOff[] = {"on", "off"};
 // z2m's warning object (toZigbee.ts warning / modernExtend iasWarning).
@@ -209,7 +211,9 @@ bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char*
     char prefix[16];
     std::snprintf(prefix, sizeof(prefix), "profiles[%u].", static_cast<unsigned>(pi));
     JsonArrayConst arr;
-    if (!list_field(po, prefix, "sensors", kAlarmMaxSensors, &arr, err, cap)) return false;
+    // No cap on the list itself: a profile's 49th item is a sensor listed twice or a 49th different one, and the loop
+    // says so, as it does for 49 sensors over several profiles.
+    if (!list_field(po, prefix, "sensors", SIZE_MAX, &arr, err, cap)) return false;
     unsigned j = 0;
     for (JsonVariantConst item : arr) {
         char where[40];

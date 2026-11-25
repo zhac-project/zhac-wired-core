@@ -386,6 +386,20 @@ static void config_errors() {
     const std::string p1 = R"({"id":"a","name":"A","class":"fire",)", w = R"(,"kind":"warning")";
     bad((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(]},{"id":"b","name":"B","class":"gas","sensors":[)" + items(49, 1) + "]}]}").c_str(),
         "profiles[1].sensors[0]: more than 48 different sensors", "a 49th different sensor");
+    // M5: the 49th sensor of one profile reads as the 49th different one: one message for both
+    CHECK(!parse((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 49) + R"(]}]})").c_str(), &c, err, sizeof(err)) &&
+          std::strcmp(err, "profiles[0].sensors[48]: more than 48 different sensors") == 0, "a 49th sensor in one profile: the same message");
+    CHECK(!parse((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(]},{"id":"b","name":"B","class":"gas","sensors":[)" + items(49, 1) + "]}]}").c_str(),
+                 &c, err, sizeof(err)) && std::strcmp(err, "profiles[1].sensors[0]: more than 48 different sensors") == 0,
+          "49 different sensors over two profiles: its message, as it was");
+    CHECK(!parse((R"({"profiles":[)" + p1 + R"("sensors":[)" + items(1, 48) + R"(,{"ieee":"0x1"}]}]})").c_str(), &c, err, sizeof(err)) &&
+          std::strcmp(err, "profiles[0].sensors[48]: listed twice") == 0, "a 49th item that is a sensor already listed: listed twice");
+    // M34: the attribute names the device layer already uses (pin_code, action_code and color_hex are generic attributes)
+    for (const char* id : {"pin_code", "action_code", "color_hex"}) {
+        const std::string j = std::string(R"({"profiles":[{"id":")") + id + R"(","name":"A","class":"fire"}]})";
+        const std::string msg = std::string("profiles[0]: id ") + id + " is reserved";
+        CHECK(!parse(j.c_str(), &c, err, sizeof(err)) && msg == err, ("a reserved id: " + std::string(id)).c_str());
+    }
     bad((R"({"profiles":[)" + p1 + R"("outputs":[)" + items(1, 9, w.c_str()) + "]}]}").c_str(), "profiles[0].outputs: at most 8", "nine outputs in a profile");
     std::string five = R"({"profiles":[)";
     for (int i = 0; i < 5; i++)
