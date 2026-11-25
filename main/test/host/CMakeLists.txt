@@ -61,7 +61,8 @@ target_include_directories(alarm_core_tests PRIVATE
 add_test(NAME alarm_core COMMAND alarm_core_tests)
 
 # Hub sounds: the built-in sound table and the synthesizer (spec 2026-11-25 hub sounds).
-add_executable(sound_synth_tests test_sound_synth.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../sound_synth.cpp)
+add_executable(sound_synth_tests test_sound_synth.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../sound_synth.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../alarm_core.cpp)   # alarm_output_misfit: the Hub Sound must fit a warning output
 target_include_directories(sound_synth_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
     "${ZHAC_COMPONENTS}/components/arduinojson/src"

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Hub sounds: the built-in table and the synthesizer. See sound_synth.h.
+// Hub sounds: the built-in table, the synthesizer, the one-voice player and the `warning` text. See sound_synth.h.
 #include "sound_synth.h"
 
 #include <cmath>
@@ -184,4 +184,189 @@ size_t sound_voice_render(SoundVoice* v, int16_t* out, size_t n) {
         out[i++] = (int16_t)std::lround(s * v->gain);
     }
     return i;
+}
+
+// ---- the player ------------------------------------------------------------------------------
+namespace {
+
+constexpr int      kDefaultVolume = 40;
+constexpr uint32_t kWarnMaxSecs   = kSoundLoopCapMs / 1000;
+constexpr int      kMedium        = 40;   // the `warning` level a text without one means
+constexpr uint32_t kWarnSecs      = 10;   // ... and its duration
+
+bool bad_volume(int v) { return v < -1 || v > 100; }
+
+int effective_volume(const SoundPlayer* p, int v) {   // -1 = the default, either way no louder than the max
+    const int e = v < 0 ? p->volume : v;
+    return e > p->max_volume ? p->max_volume : e;
+}
+
+void go_idle(SoundPlayer* p) { p->active = p->urgent = false; p->name = nullptr; }
+
+// Whether a sound with this urgency may start now. Urgent sounds always may.
+SoundResult admit(const SoundPlayer* p, bool urgent) {
+    if (urgent) return SoundResult::OK;
+    if (p->muted) return SoundResult::MUTED;
+    return p->active && p->urgent ? SoundResult::BUSY : SoundResult::OK;
+}
+
+// The admitted voice replaces the current one.
+SoundResult start(SoundPlayer* p, const SoundVoice& v, const char* name, bool urgent, SoundOwner o) {
+    p->voice = v;
+    p->active = true;
+    p->urgent = urgent;
+    p->owner = o;
+    p->name = name;
+    return SoundResult::OK;
+}
+
+}  // namespace
+
+const char* sound_result_text(SoundResult r) {
+    switch (r) {
+    case SoundResult::OK:      return "ok";
+    case SoundResult::MUTED:   return "muted";
+    case SoundResult::BUSY:    return "an urgent sound is playing";
+    case SoundResult::UNKNOWN: return "unknown sound";
+    case SoundResult::NO_LOOP: return "this sound cannot loop";
+    case SoundResult::BAD_ARG: return "bad value (volume 0-100, hz 100-8000, ms 1-10000, 1-32 notes)";
+    case SoundResult::ABSENT:  return "no speaker on this hub";
+    }
+    return "";
+}
+
+void sound_player_init(SoundPlayer* p, int max_volume) {
+    *p = SoundPlayer{};
+    p->max_volume = max_volume < 0 ? 0 : max_volume > 100 ? 100 : max_volume;
+    p->volume = kDefaultVolume > p->max_volume ? p->max_volume : kDefaultVolume;
+}
+
+int sound_player_set_volume(SoundPlayer* p, int v) {
+    return p->volume = v < 0 ? 0 : v > p->max_volume ? p->max_volume : v;
+}
+
+void sound_player_set_muted(SoundPlayer* p, bool m) {
+    p->muted = m;
+    if (m && p->active && !p->urgent) go_idle(p);
+}
+
+SoundResult sound_player_play(SoundPlayer* p, int idx, int volume, bool loop, uint32_t max_ms, SoundOwner o) {
+    if (bad_volume(volume)) return SoundResult::BAD_ARG;
+    if (idx < 0 || (size_t)idx >= sound_count()) return SoundResult::UNKNOWN;
+    if (loop && !sound_loopable((size_t)idx)) return SoundResult::NO_LOOP;
+    const bool urgent = sound_urgent((size_t)idx);
+    if (const SoundResult r = admit(p, urgent); r != SoundResult::OK) return r;
+    SoundVoice v;
+    if (!sound_voice_builtin(&v, idx, effective_volume(p, volume), loop, max_ms)) return SoundResult::BAD_ARG;   // not reachable: checked above
+    return start(p, v, sound_name((size_t)idx), urgent, o);
+}
+
+SoundResult sound_player_tone(SoundPlayer* p, int hz, int ms, int volume) {
+    SoundVoice v;
+    if (bad_volume(volume) || !sound_voice_tone(&v, hz, ms, effective_volume(p, volume))) return SoundResult::BAD_ARG;
+    if (const SoundResult r = admit(p, false); r != SoundResult::OK) return r;
+    return start(p, v, "tone", false, SoundOwner::USER);
+}
+
+SoundResult sound_player_melody(SoundPlayer* p, const SoundNote* n, size_t count, int volume) {
+    SoundVoice v;
+    if (bad_volume(volume) || !sound_voice_melody(&v, n, count, effective_volume(p, volume))) return SoundResult::BAD_ARG;
+    if (const SoundResult r = admit(p, false); r != SoundResult::OK) return r;
+    return start(p, v, "melody", false, SoundOwner::USER);
+}
+
+bool sound_player_stop(SoundPlayer* p, const char* name) {
+    if (!p->active || (name && *name && std::strcmp(name, p->name))) return false;
+    go_idle(p);
+    return true;
+}
+
+bool sound_player_stop_owner(SoundPlayer* p, SoundOwner o) {
+    if (!p->active || p->owner != o) return false;
+    go_idle(p);
+    return true;
+}
+
+const char* sound_player_playing(const SoundPlayer* p) { return p->active ? p->name : nullptr; }
+
+size_t sound_player_render(SoundPlayer* p, int16_t* out, size_t n) {
+    if (!p->active || !out || !n) return 0;
+    const size_t r = sound_voice_render(&p->voice, out, n);
+    if (r < n) go_idle(p);   // a voice that ends on a block boundary says so with a 0 on the next call
+    return r;
+}
+
+// ---- the Hub Sound `warning` -------------------------------------------------------------------
+namespace {
+
+struct Field { const char* p; size_t n; };
+bool is(const Field& f, const char* word) { return f.n == std::strlen(word) && !std::strncmp(f.p, word, f.n); }
+
+struct Mode  { const char* word; const char* sound; };   // sound nullptr = stop
+struct Level { const char* word; int volume; };
+constexpr Mode kModes[] = {
+    {"stop", nullptr}, {"OFF", nullptr},
+    {"burglar", "alarm"},
+    {"fire", "fire"}, {"fire_panic", "fire"},
+    {"emergency", "siren"}, {"alarm", "siren"}, {"ON", "siren"}, {"police_panic", "siren"}, {"emergency_panic", "siren"},
+};
+constexpr Level kLevels[] = {{"low", 25}, {"medium", kMedium}, {"high", 55}, {"very_high", 70}};
+
+constexpr SoundWarning kStop = {true, -1, 0, 0};
+
+uint32_t held(uint32_t secs) { return secs > kWarnMaxSecs ? kWarnMaxSecs : secs; }
+
+// Decimal digits only, held to 600 as they come (a long run of digits cannot overflow).
+bool seconds(const Field& f, uint32_t* out) {
+    uint32_t v = 0;
+    for (size_t i = 0; i < f.n; i++) {
+        if (f.p[i] < '0' || f.p[i] > '9') return false;
+        if (v <= kWarnMaxSecs) v = v * 10 + (uint32_t)(f.p[i] - '0');
+    }
+    *out = held(v);
+    return true;
+}
+
+}  // namespace
+
+bool sound_warning_text(const char* s, SoundWarning* w) {
+    if (!s || !w) return false;
+    Field f[4];
+    size_t k = 0;
+    for (;;) {
+        if (k == 4) return false;
+        const char* comma = std::strchr(s, ',');
+        const size_t n = comma ? (size_t)(comma - s) : std::strlen(s);
+        if (!n) return false;
+        f[k++] = {s, n};
+        if (!comma) break;
+        s = comma + 1;
+    }
+    const Mode* mode = nullptr;
+    for (const Mode& m : kModes) if (is(f[0], m.word)) mode = &m;
+    if (!mode) return false;
+    int volume = kMedium;
+    if (k > 1) {
+        const Level* lv = nullptr;
+        for (const Level& l : kLevels) if (is(f[1], l.word)) lv = &l;
+        if (!lv) return false;
+        volume = lv->volume;
+    }
+    if (k > 2 && !is(f[2], "1") && !is(f[2], "true") && !is(f[2], "0") && !is(f[2], "false")) return false;
+    uint32_t secs = kWarnSecs;
+    if (k > 3 && !seconds(f[3], &secs)) return false;
+    *w = !mode->sound || secs == 0 ? kStop : SoundWarning{false, sound_find(mode->sound), volume, secs};
+    return true;
+}
+
+SoundWarning sound_warning_secs(uint32_t secs) {
+    return secs ? SoundWarning{false, sound_find("siren"), kMedium, held(secs)} : kStop;
+}
+
+SoundResult sound_player_warn(SoundPlayer* p, const SoundWarning& w) {
+    if (w.stop || w.secs == 0) {   // a struct built by hand with 0 s must not become the 10 min cap
+        sound_player_stop_owner(p, SoundOwner::DEVICE);
+        return SoundResult::OK;
+    }
+    return sound_player_play(p, w.idx, w.volume, true, held(w.secs) * 1000, SoundOwner::DEVICE);
 }
