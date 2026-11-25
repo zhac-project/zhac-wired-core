@@ -8,6 +8,7 @@
 // network: the state records, notifications, the Alarm device, rule events, outputs, the page.
 #include "alarm.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -98,8 +99,9 @@ bool     s_boot_alert = false;              // restarted during pending or trigg
 // each device once. PSRAM, and only while one is due.
 Orphan*  s_boot_stop = nullptr;
 uint8_t  s_n_boot_stop = 0;
-char     s_st2_saved[kStatesMax];           // the "st2" record flash holds
+char     s_st2_saved[kStatesMax];           // the "st2" record flash holds, unless s_st2_unknown
 size_t   s_st2_len = 0;
+std::atomic<bool> s_st2_unknown{false};     // set by a save after its own write of "st2": the copy above may be wrong
 uint8_t  s_st_saved[2] = {0, 0};            // the stage 1 "st" record flash holds, when s_st_have
 bool     s_st_have = false;
 // A state record's write that failed: the same bytes are not tried again for kSaveRetryS. On a nearly full NVS each
@@ -515,6 +517,8 @@ bool put_state(const char* key, const void* d, size_t n, SaveRetry<N>& r, const 
 // describe the one instant of the look: what happens while they are written is the next look's. A write that fails is
 // logged and the change still takes effect; a failed "st" leaves the two agreeing. A record that failed is tried again
 // at its next change, or kSaveRetryS later (put_state). Flash that comes to agree without a write ends a run of failures.
+// After a save's own write of "st2" the copy of it is dropped: the look's states are written whatever it said (NVS
+// skips a blob it holds already).
 void save_states(const Pass& p) {
     if (s_st_have && std::memcmp(p.st, s_st_saved, sizeof(p.st)) == 0) {
         s_st_retry.len = 0;
@@ -525,6 +529,7 @@ void save_states(const Pass& p) {
     }
     static char st2[kStatesMax];
     const size_t len = alarm_states_pack(p.prof, p.state, p.rests, p.n_prof, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
+    if (s_st2_unknown.exchange(false)) s_st2_len = 0;
     if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) {
         s_st2_retry.len = 0;
         s_st2_retry.failing = false;
@@ -665,10 +670,11 @@ void alarm_task(void*) {
                 stack_logged = true;
                 ESP_LOGI(TAG, "task: %u B of stack never used", static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
-        } else if (!boot_alert_at) {
+        } else if (!boot_alert_at || s_st2_unknown) {
             // Nothing new, and flash may still hold other states: a write that failed (tried again kSaveRetryS after
-            // it), steps the look did not see as a change (a disarm and an arm), a boot that read other records. Not in
-            // the minute after a restart during an alarm: its record waits for the boot stop.
+            // it), steps the look did not see as a change (a disarm and an arm), a boot that read other records, a save's
+            // own write. Not in the minute after a restart during an alarm, where the record waits for the boot stop,
+            // unless a save wrote it since: that one holds no alarm (a save is refused while one runs).
             save_states(p);
         }
         Refusal r;
@@ -1179,8 +1185,14 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             std::swap(s_panel, panel);
             states = alarm_states_pack(*s_cfg, *s_panel, buf, kStatesMax, have_st ? st : nullptr);
         }
-        // ponytail: a pass that looked before the save may write its older st2 after this, till its next pass (W6)
-        if (states) nvs_put("st2", buf, states);   // if it fails, the task's next pass writes them
+        // ponytail: till the task's next pass, flash may hold this record over a change the task wrote since the pack, or
+        // an older pass's record over this one (W6). The mark makes that pass write the hub's states whatever its copy of
+        // flash says, and the wake below brings it (after the pass under way, which may wait on an output). One writer of
+        // "st2" if that gap must close.
+        if (states) {
+            nvs_put("st2", buf, states);   // if it fails, the task's next pass writes them
+            s_st2_unknown = true;
+        }
         // A sensor the save adds starts from its last values in the shadow: they go to flash at the shadow's next
         // sweep, as a sensor's change does (on_attr), or a power cut brings back older ones.
         for (uint8_t i = 0; i < n_seeds; i++)

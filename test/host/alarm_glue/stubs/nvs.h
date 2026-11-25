@@ -16,9 +16,11 @@ extern std::map<std::string, std::string> g_nvs;      // key -> blob (namespace 
 extern bool                               g_nvs_fail;       // every write fails
 extern std::string                        g_nvs_fail_key;   // writes of this key fail
 extern void (*g_nvs_hook)(const char* key);                 // run inside each write that lands: what happens while it waits
+extern void (*g_nvs_before)(const char* key);               // run inside each write, before it lands: what comes first
 extern std::map<std::string, int>         g_nvs_refused;    // writes that failed, by key
 inline esp_err_t nvs_open(const char* ns, int, nvs_handle_t* h) { OUTSIDE_LOCK("nvs_open"); *h = 1; return std::strcmp(ns, "alarm") == 0 ? ESP_OK : ESP_FAIL; }
 inline esp_err_t nvs_set_blob(nvs_handle_t, const char* k, const void* d, size_t n) {
+    if (g_nvs_before) g_nvs_before(k);
     if (g_nvs_fail || g_nvs_fail_key == k) {
         g_nvs_refused[k]++;
         return ESP_FAIL;

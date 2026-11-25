@@ -31,6 +31,7 @@ bool     g_log = false;
 bool     g_nvs_fail = false;
 std::string g_nvs_fail_key;
 void (*g_nvs_hook)(const char*) = nullptr;
+void (*g_nvs_before)(const char*) = nullptr;
 std::map<std::string, int> g_nvs_refused;
 std::vector<std::string> g_logs;   // every log line, without its level and tag
 void host_log(const char* level, const char* tag, const char* fmt, ...) {
@@ -350,7 +351,7 @@ int main_flow() {
     CHECK(idx("event:alarm_armed_flood") >= 0 && cnt("event:") == 1, "one event for it; the summary did not move");
     CHECK(cnt("attr:alarm_state") == 0, "alarm_state is not published again when the summary did not move");
     CHECK(cnt("nvs:st2") == 2 && pos("nvs:st") < 0 && g_nvs["st"] == std::string("\0\0", 2),
-          "the task writes st2 once more (its copy is of before the save); st is still the one the boot wrote");
+          "the task writes st2 once more after the save's own write; st is still the one the boot wrote");
     CHECK(g_nvs["st2"].rfind("{\"v\":1,\"l\":[0,0],\"p\":[", 0) == 0, "st2 carries the st that flash holds (ruling 17)");
     CHECK(idx("nvs:st2") < idx("alert:") && idx("alert:") < idx("attr:flood") && idx("attr:flood") < idx("event:") && idx("event:") < idx("push:alarm.changed"),
           "pass order: states, notifications, attributes, events, (outputs), page");
@@ -1012,6 +1013,81 @@ int restart_flow() {
         CHECK(h::alarm_attrs["fire"] == "armed" && h::alarm_attrs["away"] == "armed" && h::alarm_attrs["flood"] == "armed" &&
               h::alarm_attrs["night"] == "disarmed", "after the cut, every profile is in its state at the save, the new one too");
     });
+
+    // ── While the siren's stop waits on the radio: a disarm, a save of the same config and an arm again (or the mirror:
+    //    arm, save, disarm). The save writes the states itself, behind the task's copy of flash: the task's next pass
+    //    still writes the hub's states, though they are the ones it wrote last (final review, Important 1) ──
+    static const char* const fire_away = R"({"profiles":[
+      {"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
+       "sensors":[{"ieee":"0x4","entry":false}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"fire","level":"high","strobe":true}]},
+      {"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":0,"trigger_delay":5,"siren_time":10,"notify_arm":false,
+       "sensors":[{"ieee":"0x1","entry":true}],"outputs":[]}]})";
+    for (const bool armed : {true, false}) {
+        g_nvs.clear();
+        boot_run([armed] {
+            h::boot();
+            run_task();
+            std::string why;
+            CHECK(h::save(fire_away, &why), why.c_str());
+            run_task();
+            if (armed) CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "away armed");
+            run_task();
+            emit(0x4, "smoke", 1);
+            run_task();
+            CHECK(h::alarm_attrs["fire"] == "triggered", "fire sounds");
+            h::on_cmd = [armed] {   // while the siren's stop waits on the radio:
+                std::string w;
+                if (armed) alarm_disarm("away"); else alarm_arm("away", false, open, &n_open);
+                CHECK(h::save(fire_away, &w), w.c_str());   // the save writes away's state of the moment,
+                if (armed) alarm_arm("away", false, open, &n_open); else alarm_disarm("away");   // and away goes back
+            };
+            alarm_silence("fire");
+            run_task();
+            run_task(4);   // four passes with nothing new, 30 s apart
+            CHECK(h::alarm_attrs["away"] == (armed ? "armed" : "disarmed"), "the hub is back in away's state of before");
+            CHECK((g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos) == armed,
+                  armed ? "disarm, save, arm: flash says armed, as the hub does" : "arm, save, disarm: flash says disarmed, as the hub does");
+        });   // the power goes
+        boot_run([armed] {
+            h::boot();
+            run_task();
+            CHECK(h::alarm_attrs["away"] == (armed ? "armed" : "disarmed"),
+                  armed ? "after a power cut, away is armed, as it was" : "after a power cut, away is disarmed, as it was");
+        });
+    }
+
+    // ── The second form: an arm that the task writes between the save's pack of the states and its write of them. The
+    //    save's older bytes land over it, and the task's next pass writes the hub's states again: also inside the minute
+    //    after a restart during an alarm, where a pass with nothing new writes no state record. Flood, as "st" (which
+    //    follows the intrusion profiles) cannot bring it back ──
+    for (const bool minute : {false, true}) {
+        g_nvs = minute ? sounding : std::map<std::string, std::string>{};
+        boot_run([minute] {
+            h::boot();
+            run_task(minute ? 20 : 0);
+            std::string why;
+            CHECK(h::save(kCfg, &why), why.c_str());
+            CHECK(alarm_disarm("flood") == AlarmReply::OK, "flood disarmed");
+            run_task();
+            g_nvs_before = [](const char* key) {   // the save has packed the states and is about to write them:
+                if (std::strcmp(key, "st2") != 0) return;
+                g_nvs_before = nullptr;
+                alarm_arm("flood", false, open, &n_open);   // flood is armed,
+                run_task();                                 // and the task writes that first
+            };
+            CHECK(h::save(kCfg, &why), why.c_str());
+            CHECK(h::alarm_attrs["flood"] == "armed" && g_nvs["st2"].find("[\"flood\",0,0]") != std::string::npos,
+                  "the save's states, packed before the arm, land over the task's");
+            run_task();   // one pass, with nothing new
+            CHECK(g_nvs["st2"].find("[\"flood\",2,1]") != std::string::npos,
+                  minute ? "inside the minute, the next pass writes the hub's states: flood armed" : "the next pass writes the hub's states: flood armed");
+        });   // the power goes
+        boot_run([] {
+            h::boot();
+            run_task();
+            CHECK(h::alarm_attrs["flood"] == "armed", "after a power cut, flood comes back armed");
+        });
+    }
     return 0;
 }
 
