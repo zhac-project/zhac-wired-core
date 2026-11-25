@@ -794,6 +794,7 @@ int boot_flow(bool legacy) {
         CHECK(asked(sizeof(Pass), MALLOC_CAP_SPIRAM) && asked(2 * sizeof(ZapDevice), MALLOC_CAP_SPIRAM) &&
               asked(kAlarmMaxSensors * sizeof(Seed), MALLOC_CAP_SPIRAM) && asked(kBootStopMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
               "the task's pass, the Alarm device's copies and the seeds are in PSRAM; the boot stop record is read into internal RAM (M49)");
+        CHECK(asked(kAlarmStoredMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), "the config is read into internal RAM too: an NVS read target");
     }
     CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["alarm_state"] == "armed_away", "back in the state it rested in");
     CHECK(cnt("nvs:") == 1 && pos("nvs:bt") == 0 && cnt("alert:") == 0 && cnt("cmd:") == 0 && cnt("event:") == 0,

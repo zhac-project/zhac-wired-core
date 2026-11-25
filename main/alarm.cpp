@@ -860,8 +860,10 @@ void alarm_early_init() {
     std::memset(s_follows, -1, sizeof(s_follows));
 
     // The config: "cfg2", else the stage 1 "cfg" (read only, for good), else the defaults. Nothing else reads
-    // s_cfg yet, so each loader builds it in place (too big for app_main's stack) and from scratch.
-    char* buf = static_cast<char*>(heap_caps_malloc(kAlarmStoredMax, MALLOC_CAP_SPIRAM));
+    // s_cfg yet, so each loader builds it in place (too big for app_main's stack) and from scratch. The record is read
+    // into internal RAM, an NVS read target, until it is parsed (into PSRAM).
+    char* buf = static_cast<char*>(heap_caps_malloc(kAlarmStoredMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!buf) ESP_LOGE(TAG, "out of memory: the config is not read, empty profiles this boot");
     bool have = false;
     if (const size_t len = buf ? nvs_get("cfg2", buf, kAlarmStoredMax) : 0) {
         have = alarm_cfg_unpack(buf, len, s_cfg, psram_json());
