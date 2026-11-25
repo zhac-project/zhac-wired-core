@@ -407,12 +407,19 @@ void add_act(Pass& p, bool on, uint8_t k, uint16_t secs) {
 }
 
 // The boot stop into the pass: each output of it that the plan of now does not sound (the plan drives the others),
-// once. The caller holds s_mu.
+// once. Not a switch that the config of now leaves as set at the other value than its command sends: the hub never sends
+// such a device the opposite value (a save in the minute may have made it one). The caller holds s_mu.
 void boot_stop_to(Pass& p, const AlarmDrive* plan, uint8_t n) {
     for (uint8_t b = 0; b < s_n_boot_stop; b++) {
-        bool sounds = false;
-        for (uint8_t e = 0; e < n; e++) sounds = sounds || (plan[e].ieee == s_boot_stop[b].ieee && plan[e].output >= 0);
-        if (!sounds) p.orphans[p.n_orphans++] = s_boot_stop[b];
+        const Orphan& o = s_boot_stop[b];
+        bool skip = false;
+        for (uint8_t e = 0; e < n; e++) skip = skip || (plan[e].ieee == o.ieee && plan[e].output >= 0);
+        const bool sends = o.keep ? o.value : !o.value;   // a switch: set again when left as set, else stopped
+        for (uint8_t k = 0; o.kind == AlarmOutKind::STATE && k < s_cfg->n_outputs; k++) {
+            const AlarmOutput& c = s_cfg->outputs[k];
+            skip = skip || (c.ieee == o.ieee && c.kind == AlarmOutKind::STATE && c.keep && c.value != sends);
+        }
+        if (!skip) p.orphans[p.n_orphans++] = o;
     }
     heap_caps_free(s_boot_stop);
     s_boot_stop = nullptr;

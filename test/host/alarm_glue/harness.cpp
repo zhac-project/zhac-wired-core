@@ -961,25 +961,31 @@ int restart_flow() {
     });
 
     // ── The same, but both writes of the states fail, and the save makes the relay a kept output: the next boot still finds
-    //    flood sounding, so its config lists the relay as well, and "bt", what was on at the first restart, wins ──
-    std::string kept_relay = relay;
-    kept_relay.replace(kept_relay.find(out12), out12.size(), R"({"ieee":"0x12","kind":"state","value":"on","keep":true})");
-    g_nvs = sounding;
-    boot_run([&] {
-        h::boot();
-        run_task(20);
-        g_nvs_fail_key = "st2";
-        std::string why;
-        CHECK(h::save(kept_relay.c_str(), &why), why.c_str());
-        run_task(10);
-        CHECK(g_nvs["st2"] == sounding.at("st2") && cnt("cmd:") == 0, "the states still say flood sounds; nothing stopped yet");
-    });   // the power goes 30 s after the restart
-    boot_run([] {
-        h::boot();
-        run_task(63);
-        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=0") == 1 && cnt("cmd:12:state=1") == 0,
-              "a minute after the second restart, the relay is switched off as it sounded at the first, not set as the save keeps it");
-    });
+    //    flood sounding, so its config lists the relay as well, and "bt", what was on at the first restart, wins. Yet the
+    //    stop never sends a device the opposite of the value the config in force keeps it at (spec, outputs: "not after a
+    //    restart"): kept on, the relay gets no "off"; kept off, the stop's "off" is that value and goes out ──
+    for (const bool on : {true, false}) {
+        std::string kept_relay = relay;
+        kept_relay.replace(kept_relay.find(out12), out12.size(), on ? R"({"ieee":"0x12","kind":"state","value":"on","keep":true})"
+                                                                    : R"({"ieee":"0x12","kind":"state","value":"off","keep":true})");
+        g_nvs = sounding;
+        boot_run([&] {
+            h::boot();
+            run_task(20);
+            g_nvs_fail_key = "st2";
+            std::string why;
+            CHECK(h::save(kept_relay.c_str(), &why), why.c_str());
+            run_task(10);
+            CHECK(g_nvs["st2"] == sounding.at("st2") && cnt("cmd:") == 0, "the states still say flood sounds; nothing stopped yet");
+        });   // the power goes 30 s after the restart
+        boot_run([on] {
+            h::boot();
+            run_task(63);
+            CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=1") == 0 && cnt("cmd:12:state=0") == (on ? 0 : 1),
+                  on ? "a minute after the second restart, the relay that the config in force keeps on gets no \"off\""
+                     : "a minute after the second restart, the relay that the config in force keeps off is switched off");
+        });
+    }
 
     // ── A foreign "bt" that keeps a siren: only a switch is left as set, so the siren is stopped, not started ──
     g_nvs = {{"cfg2", packed(relay)}, {"st2", R"({"v":1,"l":[0,0],"p":[["flood",2,1]]})"}, {"st", std::string("\0\0", 2)},
