@@ -282,6 +282,8 @@ int main_flow() {
     std::string why;
     CHECK(h::save(kCfg, &why), "the config saves");
     CHECK(cnt("nvs:cfg2") == 1 && cnt("nvs:cfg") == 1, "the save writes cfg2 and never cfg");
+    CHECK(h::persisted == std::vector<uint64_t>({0x1, 0x2, 0x3}),
+          "each sensor the save adds is seeded, and its last values go to flash at the shadow's next sweep (M44)");
     run_task();
     CHECK(h::alarm_attrs.count("home") == 0 && idx("rm:home") >= 0 && idx("rm:_last_seen") < 0, "home's attribute left the device; the shadow's own stayed");
     CHECK(h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed" && h::alarm_attrs["night"] == "disarmed", "every profile's attribute published");
@@ -592,6 +594,7 @@ int main_flow() {
     // ── A save that drops night and adds a fire profile whose smoke sensor is already active ──
     h::vals[{0x4, "smoke"}] = 1;
     g_trace.clear();
+    h::persisted.clear();
     CHECK(h::save(R"({"profiles":[
       {"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
        "sensors":[{"ieee":"0x4","entry":false}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"fire","level":"very_high","strobe":true},{"ieee":"0x12","kind":"state","value":"on","keep":false}]},
@@ -599,6 +602,7 @@ int main_flow() {
        "sensors":[{"ieee":"0x1","entry":true}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"burglar","level":"high","strobe":true}]},
       {"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,"notify_arm":true,
        "sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true}]}]})", &why), why.c_str());
+    CHECK(h::persisted == std::vector<uint64_t>({0x4}), "only the sensor the save adds is persisted soon: the kept ones were already");
     run_task();
     CHECK(h::alarm_attrs.count("night") == 0 && h::alarm_attrs["fire"] == "triggered" && h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed",
           "night gone; flood kept its state under its new index; the new fire profile armed and went off for the smoke that was there");

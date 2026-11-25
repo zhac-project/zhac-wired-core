@@ -1022,8 +1022,9 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
                       next->n_sensors, next->n_outputs, next->n_keypads, next->n_codes);
     }
     if (ok) {
-        for (uint8_t i = 0; i < next->n_sensors; i++) seeds[i].ieee = next->sensors[i].ieee;
-        read_seeds(seeds, next->n_sensors);
+        const uint8_t n_seeds = next->n_sensors;
+        for (uint8_t i = 0; i < n_seeds; i++) seeds[i].ieee = next->sensors[i].ieee;
+        read_seeds(seeds, n_seeds);
         const uint32_t now = mono_s();
         {
             Lock l;
@@ -1066,6 +1067,10 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             std::swap(s_cfg, next);   // `next` and `panel` now hold the old ones, freed below
             std::swap(s_panel, panel);
         }
+        // A sensor the save adds starts from its last values in the shadow: they go to flash at the shadow's next
+        // sweep, as a sensor's change does (on_attr), or a power cut brings back older ones.
+        for (uint8_t i = 0; i < n_seeds; i++)
+            if (alarm_cfg_sensor(*next, seeds[i].ieee) < 0) device_shadow_persist_soon(seeds[i].ieee);
         wake();   // the task saves the states, publishes the attributes and announces the device
     }
     heap_caps_free(buf);
