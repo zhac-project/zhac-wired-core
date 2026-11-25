@@ -724,6 +724,36 @@ int main_flow() {
     for (const auto& c : g_all_cmds) reopened += c.find("cmd:11:state=1") != std::string::npos;
     CHECK(reopened == 0 && !g_all_cmds.empty(), "the kept valve never got the opposite value, in the whole run");
 
+    // ── Two leaks the task has not looked at, and between them a save that gives the kept valve the other value: the
+    //    valve ends as the newer alarm's config sets it ──
+    {
+        const std::string closes = R"({"profiles":[{"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,
+          "notify_arm":false,"sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true}]}]})";
+        std::string opens = closes;
+        opens.replace(opens.find("\"off\""), 5, "\"on\"");
+        emit(0x3, "water_leak", 0);          // dry: the new profile does not go off at the save
+        CHECK(h::save(closes.c_str(), &why), why.c_str());
+        run_task();
+        g_trace.clear();
+        h::on_cmd = [opens] {                // while the valve closes for a first leak:
+            alarm_silence("flood");
+            emit(0x3, "water_leak", 0);
+            emit(0x3, "water_leak", 1);      // a second leak, under the config that closes the valve,
+            alarm_silence("flood");
+            std::string w;
+            CHECK(h::save(opens.c_str(), &w), w.c_str());   // a save that opens it instead,
+            emit(0x3, "water_leak", 0);
+            emit(0x3, "water_leak", 1);      // and a third leak, under the new config
+            alarm_silence("flood");
+        };
+        emit(0x3, "water_leak", 1);
+        run_task();
+        std::string last;
+        for (const auto& s : g_trace) if (s.rfind("cmd:11:", 0) == 0) last = s;
+        CHECK(cnt("cmd:11:state=0") == 2 && last == "cmd:11:state=1",
+              "the valve is closed for the second leak, then opened for the third: it ends as the newer alarm's config sets it");
+    }
+
     // ── A panic in the arm delay, a smoke sensor of the profile still on: the panic's end in armed sets the smoke off in
     //    the same tick (ruling 7), and the siren starts again (W4) ──
     CHECK(h::save(R"({"profiles":[{"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":5,"trigger_delay":0,"siren_time":10,

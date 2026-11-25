@@ -480,9 +480,10 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     for (uint8_t k = 0; kept && k < s_cfg->n_outputs; k++) {
         const AlarmOutput& o = s_cfg->outputs[k];
         if (!(kept >> o.profile & 1) || o.kind != AlarmOutKind::STATE || !o.keep) continue;
-        bool set = false;   // in this pass, by the plan or by a save
+        bool set = false;   // in this pass, by the plan or by a save (to this value: an older config's other one goes first)
         for (uint8_t a = 0; a < p.n_act; a++) set = set || (p.acts[a].on && p.acts[a].out.ieee == o.ieee);
-        for (uint8_t a = 0; a < p.n_orphans; a++) set = set || (p.orphans[a].keep && p.orphans[a].ieee == o.ieee);
+        for (uint8_t a = 0; a < p.n_orphans; a++)
+            set = set || (p.orphans[a].keep && p.orphans[a].ieee == o.ieee && p.orphans[a].value == o.value);
         if (!set) add_act(p, true, k, 0);
     }
 }
