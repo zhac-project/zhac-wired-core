@@ -595,13 +595,14 @@ int main_flow() {
     h::vals[{0x4, "smoke"}] = 1;
     g_trace.clear();
     h::persisted.clear();
-    CHECK(h::save(R"({"profiles":[
+    const std::string fire_cfg = R"({"profiles":[
       {"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
        "sensors":[{"ieee":"0x4","entry":false}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"fire","level":"very_high","strobe":true},{"ieee":"0x12","kind":"state","value":"on","keep":false}]},
       {"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":0,"trigger_delay":5,"siren_time":10,"notify_arm":true,
        "sensors":[{"ieee":"0x1","entry":true}],"outputs":[{"ieee":"0x10","kind":"warning","mode":"burglar","level":"high","strobe":true}]},
       {"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,"notify_arm":true,
-       "sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true}]}]})", &why), why.c_str());
+       "sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x11","kind":"state","value":"off","keep":true}]}]})";
+    CHECK(h::save(fire_cfg.c_str(), &why), why.c_str());
     CHECK(h::persisted == std::vector<uint64_t>({0x4}), "only the sensor the save adds is persisted soon: the kept ones were already");
     run_task();
     CHECK(h::alarm_attrs.count("night") == 0 && h::alarm_attrs["fire"] == "triggered" && h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed",
@@ -611,6 +612,42 @@ int main_flow() {
     g_trace.clear();
     run_task();
     CHECK(h::alarm_attrs["fire"] == "armed" && idx("cmd:10:warning=0") >= 0 && idx("cmd:12:state=0") >= 0, "silenced: back to armed, outputs stopped");
+
+    // ── A leak, its silence and a save that removes its valve, all while an output command blocks: the alarm's outputs
+    //    are those of the config it went off under, so the valve closes (M31) ──
+    {
+        std::string no_valve = fire_cfg;
+        const std::string valve = R"({"ieee":"0x11","kind":"state","value":"off","keep":true})";
+        no_valve.erase(no_valve.find(valve), valve.size());
+        g_trace.clear();
+        h::on_cmd = [no_valve] {             // while fire's siren start waits on the radio:
+            alarm_silence("fire");           // fire is silenced,
+            emit(0x3, "water_leak", 0);
+            emit(0x3, "water_leak", 1);      // a leak sets off flood,
+            alarm_silence("flood");          // which is silenced too,
+            std::string w;
+            CHECK(h::save(no_valve.c_str(), &w), w.c_str());   // and a save takes flood's valve away
+        };
+        emit(0x4, "smoke", 0);
+        emit(0x4, "smoke", 1);               // smoke again: fire's alarm
+        run_task();
+        CHECK(idx("Kitchen leak (Flood) at ") >= 0 && cnt("cmd:11:state=0") == 1,
+              "the leak is told, and the valve it went off with is closed, though the save removed it");
+        CHECK(idx("cmd:10:warning=0") >= 0 && idx("cmd:12:state=0") >= 0, "fire's outputs stop after its silence");
+        g_trace.clear();
+        h::on_cmd = [&fire_cfg] {            // the same, and the save brings the valve back
+            alarm_silence("fire");
+            emit(0x3, "water_leak", 0);
+            emit(0x3, "water_leak", 1);
+            alarm_silence("flood");
+            std::string w;
+            CHECK(h::save(fire_cfg.c_str(), &w), w.c_str());
+        };
+        emit(0x4, "smoke", 0);
+        emit(0x4, "smoke", 1);
+        run_task();
+        CHECK(idx("Kitchen leak (Flood) at ") >= 0 && cnt("cmd:11:") == 0, "that leak went off without a valve: the one the save adds is left alone");
+    }
 
     // ── A disarm the task has not acted on, then a save that drops the output: it is stopped by its old entry ──
     emit(0x4, "smoke", 0);
