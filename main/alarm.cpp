@@ -1179,6 +1179,7 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             std::swap(s_panel, panel);
             states = alarm_states_pack(*s_cfg, *s_panel, buf, kStatesMax, have_st ? st : nullptr);
         }
+        // ponytail: a pass that looked before the save may write its older st2 after this, till its next pass (W6)
         if (states) nvs_put("st2", buf, states);   // if it fails, the task's next pass writes them
         // A sensor the save adds starts from its last values in the shadow: they go to flash at the shadow's next
         // sweep, as a sensor's change does (on_attr), or a power cut brings back older ones.
