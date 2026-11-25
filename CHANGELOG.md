@@ -70,6 +70,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **Safety profiles, small fixes in the alarm core** (`main/alarm_core.*`): a save that takes a sensor out of an armed profile no longer leaves its bypass there for a later save to bring back; `pin_code`, `action_code` and `color_hex` are reserved as profile ids; a 49th sensor in one profile is refused with `profiles[0].sensors[48]: more than 48 different sensors`, as 49 over several profiles are; an error naming a sensor gives the row the page listed it at; `alarm_events` takes a null summary; more host tests (config limits and text, the hazard check, skipped steps, the class order of an output device).
 - **A change of the alarm can no longer be dropped when many come at once.** The alarm queued every change for its task and dropped one when eight were waiting: that state was then not saved, the sirens not driven and the alert not sent. The task now asks the panel what differs from what it acted on last. Under load it may skip the steps in between, but each profile's final state is saved, shown and acted on, and every alarm is notified.
 - **A push to the hub page larger than 1 KB is sent, not dropped** (`ws_push` sizes its buffer to fit): `alarm.changed` with eight profiles runs to kilobytes.
 - **A light setting the light never reports keeps the value set** (zhac-components 08eaa7f, embedded-zhc
