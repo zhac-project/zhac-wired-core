@@ -82,6 +82,7 @@ struct AlarmConfig {
 
 const char* alarm_state_name(AlarmState s);                      // disarmed arming armed pending triggered
 bool        alarm_state_parse(const char* s, AlarmState* out);
+const char* alarm_class_name(AlarmClass c);                      // intrusion fire water gas other, as the config names them
 int  alarm_cfg_profile(const AlarmConfig& c, const char* id);   // index, -1
 int  alarm_cfg_role(const AlarmConfig& c, AlarmRole r);         // the intrusion profile with that role, -1
 int  alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee);     // slot, -1

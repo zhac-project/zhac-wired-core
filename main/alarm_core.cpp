@@ -510,6 +510,11 @@ bool alarm_state_parse(const char* s, AlarmState* out) {
     return true;
 }
 
+const char* alarm_class_name(AlarmClass c) {
+    const auto i = static_cast<size_t>(c);
+    return i < sizeof(kClasses) / sizeof(kClasses[0]) ? kClasses[i] : "other";
+}
+
 int alarm_cfg_profile(const AlarmConfig& c, const char* id) {
     for (uint8_t i = 0; id && i < c.n_profiles; i++) if (std::strcmp(c.profiles[i].id, id) == 0) return i;
     return -1;
@@ -571,7 +576,7 @@ void alarm_cfg_write(const AlarmConfig& c, bool with_codes, JsonObject doc) {
         JsonObject o = profiles.add<JsonObject>();
         o["id"] = static_cast<const char*>(p.id);   // a copy: the array would be kept by pointer
         o["name"] = static_cast<const char*>(p.name);
-        o["class"] = kClasses[static_cast<size_t>(p.cls)];
+        o["class"] = alarm_class_name(p.cls);
         if (p.cls == AlarmClass::INTRUSION) o["role"] = p.role == AlarmRole::NONE ? "" : kModes[static_cast<size_t>(p.role) - 1];
         o["arm_delay"] = p.arm_delay;
         o["trigger_delay"] = p.trigger_delay;
@@ -1072,6 +1077,9 @@ namespace {
 
 // Which class wins an output device that several triggered profiles list: fire, gas, water, other, intrusion.
 constexpr uint8_t kClassRank[] = {4, 0, 2, 1, 3};   // by AlarmClass: intrusion fire water gas other
+// A new class needs its word and its rank: the tables are indexed by the enum, and the enum is not bounds-checked there.
+static_assert(sizeof(kClassRank) == static_cast<size_t>(AlarmClass::OTHER) + 1, "kClassRank: one rank per AlarmClass");
+static_assert(sizeof(kClasses) / sizeof(kClasses[0]) == static_cast<size_t>(AlarmClass::OTHER) + 1, "kClasses: one word per AlarmClass");
 
 // The event names of one pass: a name already in the list is not added again; nothing is added past `cap`.
 struct EventList {

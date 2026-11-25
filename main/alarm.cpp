@@ -49,7 +49,6 @@ constexpr size_t   kSummaryMax = 24;        // "armed_" + an id
 constexpr uint8_t  kEventsMax = 20;         // one pass gives 18 names at most
 constexpr uint32_t kBootAlertDelayS = 60;   // the network and the cloud link come up first
 constexpr uint32_t kSaveRetryS = 300;       // a state record that failed to write waits this long, unless it changes
-const char* const  kClassNames[] = {"intrusion", "fire", "water", "gas", "other"};   // by AlarmClass, as the config names them
 
 SemaphoreHandle_t s_mu = nullptr;   // guards everything below up to s_ids_changed
 struct Lock {
@@ -1092,7 +1091,7 @@ void alarm_status_json(JsonObject o) {
             JsonObject j = list.add<JsonObject>();
             j["id"]    = static_cast<const char*>(p.id);   // a copy: the array would be kept by pointer
             j["name"]  = static_cast<const char*>(p.name);
-            j["class"] = kClassNames[static_cast<size_t>(p.cls)];
+            j["class"] = alarm_class_name(p.cls);
             j["state"] = alarm_state_name(st.state);
             j["since"] = s_since[i];
             if (st.state != AlarmState::DISARMED && st.state != AlarmState::ARMED) j["left"] = st.deadline > now ? st.deadline - now : 0;

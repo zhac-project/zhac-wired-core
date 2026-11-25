@@ -315,6 +315,17 @@ static std::string largest_stage1() {
     }
     return s + R"(],"sirens":[)" + items(0x100, 8, R"(,"kind":"warning")") + "]}";
 }
+// M17: the one table of class words; the config reads what it names, and the glue writes it.
+static void class_words() {
+    static AlarmConfig c; char err[160]; bool ok = true;
+    for (uint8_t i = 0; i <= static_cast<uint8_t>(AlarmClass::OTHER); i++) {
+        const std::string j = std::string(R"({"profiles":[{"id":"a","name":"A","class":")") + alarm_class_name(static_cast<AlarmClass>(i)) + R"("}]})";
+        ok = ok && parse(j.c_str(), &c, err, sizeof(err)) && c.profiles[0].cls == static_cast<AlarmClass>(i);
+    }
+    CHECK(ok && std::strcmp(alarm_class_name(AlarmClass::INTRUSION), "intrusion") == 0 && std::strcmp(alarm_class_name(AlarmClass::OTHER), "other") == 0,
+          "the five class words, as the config reads them");
+    CHECK(std::strcmp(alarm_class_name(static_cast<AlarmClass>(9)), "other") == 0, "a value that is not a class reads as other");
+}
 static void config_json() {
     static AlarmConfig c, k; char err[160];
     const char* j = R"({"profiles":[
@@ -820,6 +831,32 @@ static void outputs_plan() {
     alarm_drive_plan(c, p, 300, d);
     CHECK(d[0].output == -1 && d[1].output == -1, "all alarms over: nothing sounds");
 }
+// M14: one siren that all five classes list: the class decides, whatever the order of the profiles.
+static void outputs_plan_classes() {
+    // fire > gas > water > other > intrusion; the profiles are listed from the lowest rank, so a mix-up of the index and the rank shows
+    static const AlarmClass kOrder[] = {AlarmClass::INTRUSION, AlarmClass::OTHER, AlarmClass::WATER, AlarmClass::GAS, AlarmClass::FIRE};
+    static const char* const kWin[] = {"intrusion", "other", "water", "gas", "fire"};
+    AlarmConfig c{}; uint64_t open = 0; AlarmDrive d[kAlarmMaxOutputs];
+    for (uint8_t i = 0; i < 5; i++) {
+        char id[8]; std::snprintf(id, sizeof(id), "p%u", i);
+        c.profiles[c.n_profiles++] = prof(id, kOrder[i], AlarmRole::NONE, 0, 0);
+        AlarmOutput o{}; o.profile = i; o.ieee = 0xA1; o.kind = AlarmOutKind::WARNING; c.outputs[c.n_outputs++] = o;
+    }
+    c.sensors[c.n_sensors++] = {0x5E, 0x1F, 0};        // one contact in every profile, not delayed
+    AlarmPanel p(&c);
+    for (uint8_t i = 0; i < 5; i++) p.arm(i, false, 0, &open);
+    p.sensor(0, AlarmKey::CONTACT, true, 10);
+    bool ok = true;
+    for (int top = 4; top >= 0; top--) {   // fire wins; silence it and gas does; and so down to intrusion
+        const uint8_t n = alarm_drive_plan(c, p, 20, d);
+        ok = ok && n == 1 && d[0].output == top && c.profiles[d[0].output].cls == kOrder[top];
+        if (!ok) std::printf("  step %s: n=%u output=%d\n", kWin[top], n, n ? d[0].output : -9);
+        p.silence(static_cast<uint8_t>(top));
+    }
+    CHECK(ok, "five profiles on one siren: fire, gas, water, other, intrusion take it over in that order");
+    alarm_drive_plan(c, p, 20, d);
+    CHECK(d[0].output == -1, "and when all five are silenced nothing sounds");
+}
 static void outputs_keep() {
     static AlarmConfig c = config();
     auto out = [&](uint8_t profile, uint64_t ieee, AlarmOutKind kind, bool value, bool keep) {
@@ -851,6 +888,7 @@ int main() {
     names();
     siren_fit();
     config_json();
+    class_words();
     config_errors();
     config_needs_profiles();
     sensor_rows();
@@ -868,6 +906,7 @@ int main() {
     event_names();
     texts();
     outputs_plan();
+    outputs_plan_classes();
     outputs_keep();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
