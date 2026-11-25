@@ -48,6 +48,8 @@ constexpr size_t   kStatesMax = 256;        // "st2": eight profiles pack to 200
 constexpr size_t   kSummaryMax = 24;        // "armed_" + an id
 constexpr uint8_t  kEventsMax = 20;         // one pass gives 18 names at most
 constexpr uint32_t kBootAlertDelayS = 60;   // the network and the cloud link come up first
+constexpr size_t   kBootItem = 11;          // "bt", per output: ieee (8 bytes, as the chip holds it), kind, value, keep
+constexpr size_t   kBootStopMax = 2 + kAlarmMaxOutputs * kBootItem;   // ... after the version (1) and the count
 constexpr uint32_t kSaveRetryS = 300;       // a state record that failed to write waits this long, unless it changes
 
 SemaphoreHandle_t s_mu = nullptr;   // guards everything below up to s_ids_changed
@@ -137,6 +139,15 @@ bool nvs_put(const char* key, const void* data, size_t len) {
     if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e == ESP_OK;
+}
+
+bool nvs_drop(const char* key) {   // gone, also when it was never there
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e = nvs_erase_key(h, key);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;
 }
 
 size_t nvs_get(const char* key, void* data, size_t cap) {
@@ -620,7 +631,10 @@ void run(const Pass& p, bool boot_due) {
     }
     for (uint8_t i = 0; i < p.n_act; i++) drive(p.acts[i].out, p.acts[i].on, p.acts[i].secs);
     // Told and stopped: only now is the next restart not "during an alarm" again.
-    if (boot_due) save_states(p);
+    if (boot_due) {
+        save_states(p);
+        if (!nvs_drop("bt")) ESP_LOGW(TAG, "boot stop record not erased: the next boot tells and stops it again");
+    }
     push_changed();   // 6
     std::memcpy(s_summary, p.summary, sizeof(s_summary));
     s_summary_cause = p.summary_cause;
@@ -878,15 +892,48 @@ void alarm_early_init() {
         if (s_st2_len || s_st_have) ESP_LOGE(TAG, "stored states unreadable: every profile starts disarmed");
         break;
     }
-    s_boot_alert = in_alarm != 0;
-    if (sounding) s_boot_stop = static_cast<Orphan*>(heap_caps_malloc(kAlarmMaxOutputs * sizeof(Orphan), MALLOC_CAP_SPIRAM));
-    if (sounding && !s_boot_stop) ESP_LOGE(TAG, "out of memory: what sounded is not stopped a minute after the restart");
+    // The boot stop: the outputs of the profiles that sounded, by this config, and those a boot less than a minute before
+    // left to stop in "bt". That record holds the job until it is done: a change in the minute rewrites the state records,
+    // and a save in it the outputs. Internal RAM for it: an NVS read target.
+    auto* bt = static_cast<uint8_t*>(heap_caps_malloc(kBootStopMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    size_t bt_len = bt ? nvs_get("bt", bt, kBootStopMax) : 0;
+    if (bt_len && (bt[0] != 1 || bt_len != 2 + bt[1] * kBootItem)) {
+        ESP_LOGE(TAG, "boot stop record unreadable: ignored");
+        bt_len = 0;
+    }
+    s_boot_alert = in_alarm != 0 || bt_len != 0;
+    if (s_boot_alert) s_boot_stop = static_cast<Orphan*>(heap_caps_malloc(kAlarmMaxOutputs * sizeof(Orphan), MALLOC_CAP_SPIRAM));
+    if (s_boot_alert && !s_boot_stop) ESP_LOGE(TAG, "out of memory: what sounded is not stopped a minute after the restart");
+    auto listed = [](uint64_t ieee) {   // each device once (and none when the list is full)
+        for (uint8_t i = 0; i < s_n_boot_stop; i++) if (s_boot_stop[i].ieee == ieee) return true;
+        return s_n_boot_stop == kAlarmMaxOutputs;
+    };
     for (uint8_t k = 0; s_boot_stop && k < s_cfg->n_outputs; k++) {
         const AlarmOutput& o = s_cfg->outputs[k];
-        bool listed = !(sounding >> o.profile & 1);
-        for (uint8_t i = 0; !listed && i < s_n_boot_stop; i++) listed = s_boot_stop[i].ieee == o.ieee;
-        if (!listed) s_boot_stop[s_n_boot_stop++] = {o.ieee, o.kind, o.value, o.keep};
+        if ((sounding >> o.profile & 1) && !listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = {o.ieee, o.kind, o.value, o.keep};
     }
+    for (size_t at = 2; s_boot_stop && at < bt_len; at += kBootItem) {
+        Orphan o{};
+        std::memcpy(&o.ieee, bt + at, sizeof(o.ieee));
+        o.kind  = static_cast<AlarmOutKind>(bt[at + 8]);
+        o.value = bt[at + 9];
+        o.keep  = bt[at + 10];
+        if (!listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = o;
+    }
+    if (bt && s_boot_stop && (!bt_len || s_n_boot_stop != bt[1])) {   // to flash now, unless it holds this already
+        bt[0] = 1;
+        bt[1] = s_n_boot_stop;
+        for (uint8_t i = 0; i < s_n_boot_stop; i++) {
+            uint8_t* b = bt + 2 + i * kBootItem;
+            std::memcpy(b, &s_boot_stop[i].ieee, sizeof(s_boot_stop[i].ieee));
+            b[8]  = static_cast<uint8_t>(s_boot_stop[i].kind);
+            b[9]  = s_boot_stop[i].value;
+            b[10] = s_boot_stop[i].keep;
+        }
+        if (!nvs_put("bt", bt, 2 + s_n_boot_stop * kBootItem))
+            ESP_LOGW(TAG, "boot stop record not saved: a restart in the next minute stops nothing");
+    }
+    heap_caps_free(bt);
     alarm_seen(*s_panel, s_seen);   // the restored states are where the task starts from, not changes
     alarm_summary_name(*s_cfg, *s_panel, s_summary, sizeof(s_summary));
 

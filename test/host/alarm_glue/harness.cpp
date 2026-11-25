@@ -787,14 +787,19 @@ int boot_flow(bool legacy) {
           "subscribed before the seeds are read: a report in between waits for the event pump, after them, and is not lost (W16)");
     run_task(58);
     CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["alarm_state"] == "armed_away", "back in the state it rested in");
-    CHECK(cnt("nvs:") == 0 && cnt("alert:") == 0 && cnt("cmd:") == 0 && cnt("event:") == 0, "nothing written, told or stopped in the first minute");
+    CHECK(cnt("nvs:") == 1 && pos("nvs:bt") == 0 && cnt("alert:") == 0 && cnt("cmd:") == 0 && cnt("event:") == 0,
+          "in the first minute only the boot stop's own record is written, at boot (M30); nothing told or stopped");
+    CHECK(g_nvs["bt"] == (legacy ? std::string("\1\2\x10\0\0\0\0\0\0\0\0\0\0\x12\0\0\0\0\0\0\0\2\1\0", 24)
+                                 : std::string("\1\2\x10\0\0\0\0\0\0\0\0\0\0\x11\0\0\0\0\0\0\0\2\0\1", 24)),
+          "it lists what sounded, each device once: the siren, and the switch siren or the kept valve");
     if (!legacy) CHECK(h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["night"] == "disarmed", "every profile by its id");
     else CHECK(h::alarm_attrs["home"] == "disarmed" && h::status().find("\"name\":\"Night\"") != std::string::npos, "the stage 1 config as away, home, night");
     run_task(5);
     const int told = idx("The hub restarted during an alarm at "), stop = idx("cmd:10:warning=0"), st = pos("nvs:st"), st2 = pos("nvs:st2");
     CHECK(told >= 0 && cnt("\"kind\":\"alarm\"") == 1 && idx("tg:Alarm: The hub restarted during an alarm at ") >= 0, "the restart notice, once");
     CHECK(stop > told && st > stop && st2 > st, "told, stopped, and only then the states written, st first");
-    CHECK(cnt("nvs:st2") == 1 && cnt("nvs:") == 2 && g_nvs["st"] == std::string("\2\2", 2), "the records written once: the next restart is not during an alarm");
+    CHECK(cnt("nvs:st2") == 1 && cnt("nvs:") == 3 && g_nvs["st"] == std::string("\2\2", 2), "the records written once: the next restart is not during an alarm");
+    CHECK(idx("nvs-erase:bt") > st2 && g_nvs.count("bt") == 0, "and then the boot stop's record is erased: its job is done");
     CHECK(cnt("nvs:cfg") == 0 && g_nvs["cfg"] == cfg_before, "the config records are not touched at boot");
     if (legacy) CHECK(idx("cmd:12:state=0") > told && cnt("cmd:") == 2, "the switch siren goes off too");
     else CHECK(cnt("cmd:") == 2 && cnt("cmd:11:state=0") == 1 && idx("cmd:11:state=0") > told && st > idx("cmd:11:state=0") && cnt("cmd:11:state=1") == 0,
@@ -894,6 +899,32 @@ int restart_flow() {
         emit(0x20, "action", 0, "disarm");   // a trusted keypad: no code
         run_task();
         CHECK(cnt("cmd:12:state=0") == 1, "a keypad's disarm stops it at once too");
+    });
+
+    // ── A second restart inside that minute, after a save that rewrote the states and swapped the output: the next boot
+    //    still tells and stops what sounded at the first restart (F5/W10, M30) ──
+    g_nvs = sounding;
+    boot_run([&] {
+        h::boot();
+        run_task(20);
+        std::string why;
+        CHECK(h::save(siren.c_str(), &why), why.c_str());
+        run_task(10);
+        CHECK(g_nvs["st2"] == R"({"v":1,"l":[0,0],"p":[["flood",2,1]]})" && cnt("cmd:") == 0, "the states say armed now; nothing stopped yet");
+    });   // the power goes 30 s after the restart
+    boot_run([] {
+        h::boot();
+        run_task(58);
+        CHECK(cnt("alert:") == 0 && cnt("cmd:") == 0, "nothing in the first minute");
+        run_task(5);
+        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=0") == 1 && cnt("cmd:10:") == 0,
+              "a minute after the second restart: the notice, and the relay of the first one switched off");
+        CHECK(g_nvs.count("bt") == 0, "and the job is done");
+    });
+    boot_run([] {
+        h::boot();
+        run_task(70);
+        CHECK(cnt("alert:") == 0 && cnt("cmd:") == 0, "the next boot has nothing left to tell or stop");
     });
 
     // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
