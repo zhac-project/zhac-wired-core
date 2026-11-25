@@ -967,6 +967,27 @@ int restart_flow() {
         CHECK(cnt("alert:") == 0 && cnt("cmd:") == 0, "the next boot has nothing left to tell or stop");
     });
 
+    // ── The same, but both writes of the states fail, and the save makes the relay a kept output: the next boot still finds
+    //    flood sounding, so its config lists the relay as well, and "bt", what was on at the first restart, wins ──
+    std::string kept_relay = relay;
+    kept_relay.replace(kept_relay.find(out12), out12.size(), R"({"ieee":"0x12","kind":"state","value":"on","keep":true})");
+    g_nvs = sounding;
+    boot_run([&] {
+        h::boot();
+        run_task(20);
+        g_nvs_fail_key = "st2";
+        std::string why;
+        CHECK(h::save(kept_relay.c_str(), &why), why.c_str());
+        run_task(10);
+        CHECK(g_nvs["st2"] == sounding.at("st2") && cnt("cmd:") == 0, "the states still say flood sounds; nothing stopped yet");
+    });   // the power goes 30 s after the restart
+    boot_run([] {
+        h::boot();
+        run_task(63);
+        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=0") == 1 && cnt("cmd:12:state=1") == 0,
+              "a minute after the second restart, the relay is switched off as it sounded at the first, not set as the save keeps it");
+    });
+
     // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
     std::string with_fire = kCfg;
     with_fire.insert(with_fire.find("],\n \"keypads\""), R"(,

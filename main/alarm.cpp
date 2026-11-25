@@ -898,9 +898,9 @@ void alarm_early_init() {
         if (s_st2_len || s_st_have) ESP_LOGE(TAG, "stored states unreadable: every profile starts disarmed");
         break;
     }
-    // The boot stop: the outputs of the profiles that sounded, by this config, and those a boot less than a minute before
-    // left to stop in "bt". That record holds the job until it is done: a change in the minute rewrites the state records,
-    // and a save in it the outputs. Internal RAM for it: an NVS read target.
+    // The boot stop: what a boot less than a minute before left to stop in "bt", as it was on then, then the outputs of
+    // the profiles that sounded, by this config. That record holds the job until it is done: a change in the minute
+    // rewrites the state records, and a save in it the outputs. Internal RAM for it: an NVS read target.
     auto* bt = static_cast<uint8_t*>(heap_caps_malloc(kBootStopMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     size_t bt_len = bt ? nvs_get("bt", bt, kBootStopMax) : 0;
     if (bt_len && (bt[0] != 1 || bt_len != 2 + bt[1] * kBootItem)) {
@@ -914,10 +914,6 @@ void alarm_early_init() {
         for (uint8_t i = 0; i < s_n_boot_stop; i++) if (s_boot_stop[i].ieee == ieee) return true;
         return s_n_boot_stop == kAlarmMaxOutputs;
     };
-    for (uint8_t k = 0; s_boot_stop && k < s_cfg->n_outputs; k++) {
-        const AlarmOutput& o = s_cfg->outputs[k];
-        if ((sounding >> o.profile & 1) && !listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = {o.ieee, o.kind, o.value, o.keep};
-    }
     for (size_t at = 2; s_boot_stop && at < bt_len; at += kBootItem) {
         Orphan o{};
         std::memcpy(&o.ieee, bt + at, sizeof(o.ieee));
@@ -925,6 +921,10 @@ void alarm_early_init() {
         o.value = bt[at + 9];
         o.keep  = bt[at + 10];
         if (!listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = o;
+    }
+    for (uint8_t k = 0; s_boot_stop && k < s_cfg->n_outputs; k++) {
+        const AlarmOutput& o = s_cfg->outputs[k];
+        if ((sounding >> o.profile & 1) && !listed(o.ieee)) s_boot_stop[s_n_boot_stop++] = {o.ieee, o.kind, o.value, o.keep};
     }
     if (bt && s_boot_stop && (!bt_len || s_n_boot_stop != bt[1])) {   // to flash now, unless it holds this already
         bt[0] = 1;
