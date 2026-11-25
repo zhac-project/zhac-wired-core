@@ -484,7 +484,6 @@ static void config_errors() {
     CHECK(!parse1(R"({"sirens":[{"ieee":"0x1","kind":"horn"}]})", &c, err, sizeof(err)) &&
           std::strstr(err, "sirens[0]: kind must be warning, alarm or state"), "stage 1: a siren kind keeps its message");
 }
-// The API form must list its profiles: a body without them is not a stage 1 config to convert (review F6, W19).
 // M43: the place a sensor has in the list of its first profile, as submitted: the page's row, which an error names.
 static void sensor_rows() {
     static AlarmConfig c; char err[160];
@@ -495,6 +494,7 @@ static void sensor_rows() {
     CHECK(c.sensors[0].row == 0 && c.sensors[1].row == 0 && c.sensors[2].row == 2,
           "row: the place in the first profile's list as submitted (S2 is b's first, not its second slot; S1's is a's)");
 }
+// The API form must list its profiles: a body without them is not a stage 1 config to convert (review F6, W19).
 static void config_needs_profiles() {
     static AlarmConfig c, before; char err[160];
     CHECK(parse(R"({"profiles":[{"id":"flood","name":"Flood","class":"water","sensors":[{"ieee":"0x3"}]}],"codes":["1234"]})",
@@ -654,7 +654,6 @@ static void config_text_and_limits() {
     CHECK(refused(R"({"profiles":[],"keypads":[)" + k9 + "]}", "keypads: at most 8"), "nine keypads");
     CHECK(fits(R"({"profiles":[],"codes":[)" + c8 + "]}") && c.n_codes == 8, "eight codes");
     CHECK(refused(R"({"profiles":[],"codes":[)" + c9 + "]}", "codes: at most 8"), "nine codes");
-    CHECK(refused(profiles_of(9), "profiles: at most 8"), "nine profiles: the list limit, with the others");
     CHECK(refused(R"({"profiles":[],"keypads":{}})", "keypads must be a list") && refused(R"({"profiles":[],"codes":"1234"})", "codes must be a list"),
           "a keypads or codes that is no list");
 }

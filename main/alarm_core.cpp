@@ -1044,7 +1044,7 @@ void AlarmPanel::adopt(const AlarmPanel& old, const AlarmConfig& old_cfg) {
         check_due_[i] = old.check_due_[j];   // a hazard check still owed stays owed
         st_[i].bypass = 0;
         for (uint8_t k = 0; k < cfg_->n_sensors; k++)   // only where the sensor is still in profile i
-            if (was[k] >= 0 && (old.st_[j].bypass >> was[k] & 1) && (cfg_->sensors[k].profiles >> i & 1)) st_[i].bypass |= 1ull << k;
+            if (was[k] >= 0 && (old.st_[j].bypass >> was[k] & 1) && ((cfg_->sensors[k].profiles >> i) & 1)) st_[i].bypass |= 1ull << k;
     }
 }
 
