@@ -76,6 +76,7 @@ struct Orphan { uint64_t ieee; AlarmOutKind kind; bool value, keep; };
 Orphan       s_orphans[kAlarmMaxOutputs];
 uint8_t      s_n_orphans = 0;
 uint32_t     s_kept_alarms[kAlarmMaxProfiles];   // by profile: the alarms whose outputs left as set are set or queued
+bool         s_boot_stop_now = false;   // a disarm: the boot stop's outputs are not left on until its minute is over
 bool         s_resync = false;        // a save swapped the config: the task takes a pass over it
 bool         s_ids_changed = false;   // ... and the Alarm device has another list of attributes
 
@@ -451,9 +452,10 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
         s_follows[e] = plan[e].output;
         if (a != AlarmOutAct::NONE) add_act(p, a == AlarmOutAct::START, static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was), plan[e].secs);
     }
-    // The boot stop also sets again what the restart's alarm left as set: the states are saved before the outputs are
-    // set, so the restart may have come in between.
-    if (boot_stop) boot_stop_to(p, plan, n);
+    // The boot stop, at its minute or at a disarm before it, also sets again what the restart's alarm left as set: the
+    // states are saved before the outputs are set, so the restart may have come in between.
+    if (boot_stop || s_boot_stop_now) boot_stop_to(p, plan, n);
+    s_boot_stop_now = false;
     // The outputs left as set are set for every alarm, also one that is over before the task looks (silenced inside one
     // busy pass: a valve closes for every leak alarm, however short), as the config it went off under has them: a save
     // queues them for an alarm before it (alarm_config_set). It is the same command each time. The other outputs follow
@@ -708,6 +710,7 @@ void on_keypad(const ZclAttrEvent& z) {
         act([&] {
             ok = alarm_keypad_may_disarm(*s_cfg, z.ieee, in.code);
             if (ok) s_panel->disarm_all();
+            s_boot_stop_now = s_boot_stop_now || ok;
         });
         if (!ok) ESP_LOGW(TAG, "keypad 0x%016" PRIX64 ": disarm refused, wrong or no code", z.ieee);
     } else if (std::strcmp(in.action, "emergency") == 0 || std::strcmp(in.action, "panic") == 0 ||
@@ -959,13 +962,11 @@ AlarmReply alarm_arm(const char* id, bool force, uint64_t* open, uint8_t* n_open
 AlarmReply alarm_disarm(const char* id) {
     AlarmReply r = AlarmReply::OK;
     act([&] {
-        if (!id || !id[0]) {
-            s_panel->disarm_all();
-            return;
-        }
-        const int p = alarm_cfg_profile(*s_cfg, id);
-        if (p < 0) r = AlarmReply::NO_PROFILE;
+        const int p = id && id[0] ? alarm_cfg_profile(*s_cfg, id) : -1;
+        if (!id || !id[0]) s_panel->disarm_all();
+        else if (p < 0) r = AlarmReply::NO_PROFILE;
         else s_panel->disarm(static_cast<uint8_t>(p));
+        s_boot_stop_now = s_boot_stop_now || r == AlarmReply::OK;
     });
     return r;
 }

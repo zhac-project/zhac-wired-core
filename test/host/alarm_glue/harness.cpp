@@ -849,7 +849,8 @@ int restart_flow() {
     static uint8_t n_open = 0;
     // A flood profile whose alarm switches a relay on; restarted while it sounds.
     const char* relay = R"({"profiles":[{"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,
-      "notify_arm":false,"sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x12","kind":"state","value":"on","keep":false}]}]})";
+      "notify_arm":false,"sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x12","kind":"state","value":"on","keep":false}]}],
+      "keypads":[{"ieee":"0x20","trusted":true}]})";
     const std::map<std::string, std::string> sounding = {
         {"cfg2", packed(relay)}, {"st2", R"({"v":1,"l":[0,0],"p":[["flood",4,1]]})"}, {"st", std::string("\0\0", 2)}};
 
@@ -869,6 +870,30 @@ int restart_flow() {
         run_task(5);
         CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=0") == 1 && cnt("cmd:10:") == 0,
               "a minute after the restart, the relay that was on is switched off, and the siren the save lists is left alone");
+    });
+
+    // ── A disarm inside that minute stops what sounded at the restart at once; the notice still waits for the minute
+    //    (F5/W10, M30) ──
+    g_nvs = sounding;
+    boot_run([] {
+        h::boot();
+        run_task(10);
+        g_trace.clear();
+        CHECK(alarm_disarm("") == AlarmReply::OK, "disarm, 10 s after the restart");
+        run_task();
+        CHECK(cnt("cmd:12:state=0") == 1 && cnt("alert:") == 0, "the relay is switched off at once; the notice waits");
+        g_trace.clear();
+        run_task(55);
+        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:") == 0, "the notice a minute after the restart; nothing is stopped twice");
+    });
+    g_nvs = sounding;
+    boot_run([] {
+        h::boot();
+        run_task(10);
+        g_trace.clear();
+        emit(0x20, "action", 0, "disarm");   // a trusted keypad: no code
+        run_task();
+        CHECK(cnt("cmd:12:state=0") == 1, "a keypad's disarm stops it at once too");
     });
 
     // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
