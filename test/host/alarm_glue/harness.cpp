@@ -786,6 +786,15 @@ int boot_flow(bool legacy) {
     CHECK(h::reads_before_sub == 0 && h::seed_reads > 0,
           "subscribed before the seeds are read: a report in between waits for the event pump, after them, and is not lost (W16)");
     run_task(58);
+    {
+        auto asked = [](size_t n, unsigned caps) {
+            for (const auto& a : heap_asked()) if (a.first == n && a.second == caps) return true;
+            return false;
+        };
+        CHECK(asked(sizeof(Pass), MALLOC_CAP_SPIRAM) && asked(2 * sizeof(ZapDevice), MALLOC_CAP_SPIRAM) &&
+              asked(kAlarmMaxSensors * sizeof(Seed), MALLOC_CAP_SPIRAM) && asked(kBootStopMax, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+              "the task's pass, the Alarm device's copies and the seeds are in PSRAM; the boot stop record is read into internal RAM (M49)");
+    }
     CHECK(h::alarm_attrs["away"] == "armed" && h::alarm_attrs["alarm_state"] == "armed_away", "back in the state it rested in");
     CHECK(cnt("nvs:") == 1 && pos("nvs:bt") == 0 && cnt("alert:") == 0 && cnt("cmd:") == 0 && cnt("event:") == 0,
           "in the first minute only the boot stop's own record is written, at boot (M30); nothing told or stopped");

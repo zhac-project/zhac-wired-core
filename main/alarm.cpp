@@ -376,7 +376,8 @@ struct Act {
     AlarmOutput out;
 };
 
-// What one look found, copied under the lock. The task's only, and static: too big for its stack.
+// What one look found, copied under the lock. The task's only, in PSRAM (too big for its stack): no NVS or flash read
+// writes into it, the records are only written from it.
 struct Pass {
     uint8_t      n_ch, n_prof, n_ev, n_orphans, n_act;
     bool         running, resync, ids_changed;
@@ -641,7 +642,9 @@ void run(const Pass& p, bool boot_due) {
 }
 
 void alarm_task(void*) {
-    static Pass p;
+    void* mem = heap_caps_malloc(sizeof(Pass), MALLOC_CAP_SPIRAM);
+    configASSERT(mem);
+    Pass& p = *new (mem) Pass();   // for good: the task never ends
     uint32_t boot_alert_at = s_boot_alert ? mono_s() + kBootAlertDelayS : 0;
     uint32_t next_seen = 0;
     bool first = true, stack_logged = false;
@@ -944,7 +947,14 @@ void alarm_early_init() {
 }
 
 void alarm_attach_device() {
-    static ZapDevice snap, before;   // app_main's stack is tight
+    // PSRAM, not app_main's tight stack: copies of the pool's entry, and zap_store writes from its own copy.
+    auto* m = static_cast<ZapDevice*>(heap_caps_malloc(2 * sizeof(ZapDevice), MALLOC_CAP_SPIRAM));
+    if (!m) {
+        ESP_LOGE(TAG, "out of memory: the Alarm device is not shown");
+        return;
+    }
+    ZapDevice& snap = m[0];
+    ZapDevice& before = m[1];
     std::memset(&snap, 0, sizeof(snap));
     bool save = false;
     zigbee_pool_lock();
@@ -977,24 +987,31 @@ void alarm_attach_device() {
     zigbee_pool_unlock();
     if (!snap.ieee_addr) ESP_LOGE(TAG, "device pool full: the Alarm device is not shown");
     if (save && !zap_store_save_device(&snap)) ESP_LOGW(TAG, "Alarm device not saved");
+    heap_caps_free(m);
 }
 
 void alarm_start() {
-    static Seed seeds[kAlarmMaxSensors];   // app_main's stack is tight
     // Subscribed first: a report that comes while the seeds are read is queued for the event pump, which app_main
     // starts after this returns, so it lands after the seeds instead of between the read and the subscription, lost.
     if (event_bus_subscribe(EventType::ZCL_ATTR, on_attr, attr_filter) == EVENT_SUB_INVALID)
         ESP_LOGE(TAG, "not subscribed: sensors and keypads are not watched");
-    uint8_t n;
-    {
-        Lock l;
-        n = s_cfg->n_sensors;
-        for (uint8_t i = 0; i < n; i++) seeds[i].ieee = s_cfg->sensors[i].ieee;
-    }
-    read_seeds(seeds, n);
-    {
-        Lock l;
-        apply_seeds(s_panel, *s_cfg, seeds, n);
+    // PSRAM, not app_main's tight stack: the seeds are copied from the shadow's table in RAM, never read from flash.
+    auto* seeds = static_cast<Seed*>(heap_caps_malloc(kAlarmMaxSensors * sizeof(Seed), MALLOC_CAP_SPIRAM));
+    if (seeds) {
+        uint8_t n;
+        {
+            Lock l;
+            n = s_cfg->n_sensors;
+            for (uint8_t i = 0; i < n; i++) seeds[i].ieee = s_cfg->sensors[i].ieee;
+        }
+        read_seeds(seeds, n);
+        {
+            Lock l;
+            apply_seeds(s_panel, *s_cfg, seeds, n);
+        }
+        heap_caps_free(seeds);
+    } else {
+        ESP_LOGE(TAG, "out of memory: the sensors start with no last values");
     }
     // Internal RAM (xTaskCreate): it writes NVS, so its stack cannot sit in PSRAM. Its first pass
     // publishes the Alarm device's attributes.
