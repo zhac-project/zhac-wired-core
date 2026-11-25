@@ -9,8 +9,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "sound_synth.h"
+
+// The hub's own Hub Sound device, a siren output for the alarm: "\x02ZHACSN", in the hub-local range.
+constexpr uint64_t kHubSoundIeee = 0x025A484143534E00ULL;
 
 // Boot, in this order (app_main): the stored volume and mute, the codec probe (a match claims the pins, so
 // before user_io_early_init) and the rule hooks (before simple_rules_init), with or without a codec ...
@@ -21,6 +25,9 @@ void sound_start();
 bool        sound_present();           // the codec's chip ID matched
 const char* sound_error();             // "" or why a present codec is off
 bool        sound_owns_pin(int gpio);  // the 8 audio pins, once the chip ID matched
+// The Hub Sound device in the pool (app_main, after the pool restore): added and kept current when the chip ID
+// matched, else a stored one (a board swap) is removed, silently. With CONFIG_ZHAC_AUDIO off: nothing.
+void        sound_attach_device();
 
 // Plays as USER; volume -1 = the default. ABSENT without a codec or when it did not start; the rest is the
 // player's admission (sound_synth.h). A sound asked for before sound_start() plays once the task runs.

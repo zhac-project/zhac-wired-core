@@ -293,6 +293,7 @@ extern "C" void app_main() {
     // the pool init and the shadow sink: they all live inside zigbee_mgr_init().
     user_io_attach_device();   // the Hub I/O device: after the pool restore, before its shadow
     alarm_attach_device();     // the Alarm device, likewise
+    sound_attach_device();     // the Hub Sound device (a speaker's codec answered), likewise
     zigbee_pool_lock();
     const uint16_t shadow_n =
         device_shadow_restore_from_pool(pool_all(), pool_count());

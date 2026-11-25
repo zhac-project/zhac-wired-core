@@ -2,31 +2,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // The hub speaker: the codec probe, the I2S stream, the amplifier pin, NVS, the rule hooks and the render
-// task around the pure player of sound_synth.h. Locking: s_mu guards s_player and s_save around every
-// player call, render included; callers get the player's answer at once. Only the task writes NVS (volume
-// and mute, between sounds, outside the lock): callers may run on a PSRAM stack, and one writer keeps the
-// saved values equal to the live ones.
+// task around the pure player of sound_synth.h, and the Hub Sound device (a PROTO_LOCAL pool entry whose
+// `warning` the alarm sends as a siren output). Locking: s_mu guards s_player and s_save around every player
+// call, render included; callers get the player's answer at once. Only the task writes NVS (volume and mute,
+// between sounds, outside the lock): callers may run on a PSRAM stack, and one writer keeps the saved values
+// equal to the live ones. The pool lock (recursive, and a device_cmd caller may hold it) is never taken with
+// s_mu held: the device's last_seen is touched before s_mu is taken or after it is released.
 #include "sound.h"
 
 #include "sdkconfig.h"
 
 #if CONFIG_ZHAC_AUDIO
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
+#include "device_shadow.h"
 #include "es8311.h"
+#include "local_dev.h"
 #include "simple_rules.h"
+#include "zap_common.h"
+#include "zap_store.h"
+#include "zigbee_pool.h"
 
 namespace {
 
@@ -36,6 +47,7 @@ constexpr size_t      kBlock          = 256;                   // samples per re
 constexpr uint32_t    kLingerBlocks   = kSoundRate / kBlock;   // ~1 s of silence before the amplifier goes off
 constexpr uint32_t    kWriteTimeoutMs = 100;
 constexpr uint32_t    kIdleWakeMs     = 60000;                 // the idle task still wakes this often
+constexpr int64_t     kSeenEveryUs    = 55LL * 1000000;        // under kIdleWakeMs: an idle wake always passes it
 constexpr gpio_num_t  kPa             = static_cast<gpio_num_t>(CONFIG_ZHAC_AUDIO_PA_GPIO);
 static_assert(kSoundRate == 16000, "es8311.cpp holds the clock row for 16 kHz only");
 
@@ -95,6 +107,21 @@ void save_settings() {
     if (e != ESP_OK) ESP_LOGW(TAG, "volume and mute not saved: %s", esp_err_to_name(e));
 }
 
+// ── The Hub Sound device's last_seen ──
+
+uint32_t wall_s() {
+    const time_t t = time(nullptr);
+    return t > 1577836800 ? static_cast<uint32_t>(t) : 0;
+}
+
+void touch_last_seen() {   // the speaker is always there; never called with s_mu held
+    const uint32_t t = wall_s();
+    if (!t) return;
+    zigbee_pool_lock();
+    if (ZapDevice* d = pool_find_by_ieee(kHubSoundIeee)) d->last_seen = t;
+    zigbee_pool_unlock();
+}
+
 // ── Boot ──
 
 // The I2C bus and the chip-ID check. No codec: the bus goes and SDA/SCL are reset, as before.
@@ -123,13 +150,19 @@ bool probe() {
 // Plays the player block by block. The amplifier goes on once a sound's first block is queued, and off after
 // ~1 s of silence; a sound in that second keeps it on. Idle with it off, the task saves a changed volume or
 // mute, then sleeps until a caller's notify, a minute at most. The I2S channel runs throughout and sends
-// zeros whenever no block is queued.
+// zeros whenever no block is queued. Every pass, whatever plays, also keeps the Hub Sound device's last_seen
+// current (kSeenEveryUs): a loop can keep the idle wait away for 10 min.
 void sound_task(void*) {
     bool     amp = false;
     uint32_t quiet = 0;          // silent blocks written since the last sound
     unsigned stack_free = ~0u;   // the least free stack logged so far
     bool     warned = false;
+    int64_t  next_seen_us = 0;
     for (;;) {
+        if (const int64_t now = esp_timer_get_time(); now >= next_seen_us) {
+            next_seen_us = now + kSeenEveryUs;
+            touch_last_seen();   // before the lock below; the PA, the linger and the I2S writes are not involved
+        }
         size_t n;
         {
             Lock l;
@@ -260,6 +293,35 @@ SoundResult admit(F&& f) {
     return r;
 }
 
+// ── The Hub Sound device ──
+
+// One input, `warning` (write-only): a Bool or an integer is a siren for 10 s or n s (false and 0 stop it), a
+// string the IAS WD text of sound_warning_text. It plays as DEVICE, so a stop ends only the device's own sound.
+DevCmdResult local_cmd(uint64_t ieee, const char* key, const DevCmdValue* v) {
+    if (ieee != kHubSoundIeee) return DEVCMD_NOT_FOUND;
+    if (!*s_err.load()) touch_last_seen();   // a speaker that failed to start is not "there"
+    if (std::strcmp(key, "warning") != 0) return DEVCMD_NO_CONVERTER;
+    SoundWarning w;
+    switch (v->kind) {
+    case DEVCMD_BOOL: w = sound_warning_secs(v->b ? 10 : 0); break;
+    case DEVCMD_INT:
+        if (v->i < 0) return DEVCMD_BAD_VALUE;
+        w = sound_warning_secs(static_cast<uint32_t>(std::min<int64_t>(v->i, UINT32_MAX)));   // held to 600 there
+        break;
+    case DEVCMD_STR:
+        if (!v->s || !sound_warning_text(v->s, &w)) return DEVCMD_BAD_VALUE;
+        break;
+    default: return DEVCMD_BAD_VALUE;
+    }
+    return admit([&] { return sound_player_warn(&s_player, w); }) == SoundResult::OK ? DEVCMD_OK : DEVCMD_BAD_VALUE;
+}
+
+size_t local_exposes(uint64_t ieee, char* buf, size_t cap) {
+    if (ieee != kHubSoundIeee || cap < sizeof(kHubSoundExposes)) return 0;
+    std::memcpy(buf, kHubSoundExposes, sizeof(kHubSoundExposes));
+    return sizeof(kHubSoundExposes) - 1;
+}
+
 }  // namespace
 
 void sound_early_init() {
@@ -269,6 +331,7 @@ void sound_early_init() {
     sound_player_set_volume(&s_player, load_u8("vol", static_cast<uint8_t>(s_player.volume)));
     sound_player_set_muted(&s_player, load_u8("muted", 0) != 0);
     s_present = probe();
+    if (s_present) local_dev_register(kHubSoundIeee, local_cmd, local_exposes);   // before any command can come
     simple_rules_set_sound_hooks(rules_check, rules_run);   // with or without a codec: the check says which
 }
 
@@ -299,6 +362,66 @@ bool sound_owns_pin(int gpio) {
     if (!s_present) return false;
     for (int p : kPins) if (p == gpio) return true;
     return false;
+}
+
+// Mirrors alarm_attach_device. No event at boot; a board without the speaker drops a stored entry, with none either.
+void sound_attach_device() {
+    if (!s_present) {
+        bool removed = false;
+        zigbee_pool_lock();
+        if (const ZapDevice* d = pool_find_by_ieee(kHubSoundIeee)) {
+            pool_remove(static_cast<uint16_t>(d - pool_all()));
+            removed = true;
+        }
+        zigbee_pool_unlock();
+        if (removed) {
+            zap_store_delete_device(kHubSoundIeee);
+            device_shadow_remove(kHubSoundIeee);
+            ESP_LOGI(TAG, "no speaker on this board: the stored Hub Sound device is removed");
+        }
+        return;
+    }
+    // PSRAM, not app_main's tight stack: copies of the pool's entry, and zap_store writes from its own copy.
+    auto* m = static_cast<ZapDevice*>(heap_caps_malloc(2 * sizeof(ZapDevice), MALLOC_CAP_SPIRAM));
+    if (!m) {
+        ESP_LOGE(TAG, "out of memory: the Hub Sound device is not shown");
+        return;
+    }
+    ZapDevice& snap   = m[0];
+    ZapDevice& before = m[1];
+    std::memset(&snap, 0, sizeof(snap));
+    bool save = false;
+    zigbee_pool_lock();
+    ZapDevice* d = pool_find_by_ieee(kHubSoundIeee);
+    bool added = false;
+    if (!d && (d = pool_add()) != nullptr) {
+        d->ieee_addr = kHubSoundIeee;
+        std::snprintf(d->friendly_name, sizeof(d->friendly_name), "Hub Sound");
+        added = true;
+    }
+    if (d) {
+        before = *d;
+        d->protocol        = PROTO_LOCAL;
+        d->nwk_addr        = 0xFFFE;   // "no network address"
+        d->device_type     = 1;        // mains powered, always there
+        d->power_source    = 1;
+        d->flags          &= static_cast<uint8_t>(~(ZAP_DEV_REMOVED | ZAP_DEV_FIX_BINDS | ZAP_DEV_FIX_CIE));
+        d->interview_state = static_cast<uint8_t>(InterviewState::IDENTITY_READY);
+        d->support_state   = static_cast<uint8_t>(SupportState::MATCHED);
+        d->configure_state = static_cast<uint8_t>(ConfigureState::DONE);
+        std::snprintf(d->model_id, sizeof(d->model_id), "ZHAC-SOUND");
+        std::snprintf(d->manufacturer_name, sizeof(d->manufacturer_name), "ZHAC");
+        if (const uint32_t t = wall_s()) d->last_seen = t;
+        save = added || std::memcmp(before.model_id, d->model_id, sizeof(d->model_id)) != 0 ||
+               before.protocol != d->protocol || before.flags != d->flags ||
+               before.support_state != d->support_state || before.interview_state != d->interview_state ||
+               before.configure_state != d->configure_state;
+        snap = *d;
+    }
+    zigbee_pool_unlock();
+    if (!snap.ieee_addr) ESP_LOGE(TAG, "device pool full: the Hub Sound device is not shown");
+    if (save && !zap_store_save_device(&snap)) ESP_LOGW(TAG, "Hub Sound device not saved");
+    heap_caps_free(m);
 }
 
 SoundResult sound_play(const char* name, int volume, bool loop) {
@@ -367,6 +490,7 @@ void        sound_start() {}
 bool        sound_present() { return false; }
 const char* sound_error() { return ""; }
 bool        sound_owns_pin(int) { return false; }
+void        sound_attach_device() {}
 SoundResult sound_play(const char*, int, bool) { return SoundResult::ABSENT; }
 SoundResult sound_tone(int, int, int) { return SoundResult::ABSENT; }
 SoundResult sound_melody(const SoundNote*, size_t, int) { return SoundResult::ABSENT; }

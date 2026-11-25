@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The hub's own (PROTO_LOCAL) devices -- Hub I/O and Alarm. device_cmd and
+// The hub's own (PROTO_LOCAL) devices -- Hub I/O, Alarm and Hub Sound. device_cmd and
 // zhc_adapter take one hook each; this routes them by ieee.
 #pragma once
 

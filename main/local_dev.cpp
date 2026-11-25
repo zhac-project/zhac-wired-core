@@ -9,7 +9,7 @@ struct LocalDev {
     device_cmd_local_fn   cmd;
     zhac_local_exposes_fn exposes;
 };
-LocalDev s_devs[2];   // Hub I/O, Alarm
+LocalDev s_devs[3];   // Hub I/O, Alarm, Hub Sound
 uint8_t  s_n = 0;
 
 const LocalDev* find(uint64_t ieee) {
