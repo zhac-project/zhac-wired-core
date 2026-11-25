@@ -550,6 +550,11 @@ int main_flow() {
           why == "profiles[0].sensors[0]: 0x0000000000000099 is not a device on this hub", why.c_str());
     CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[{"ieee":"0x1","entry":false},{"ieee":"0x10","entry":false}],"outputs":[]}]})", &why) &&
           why == "profiles[0].sensors[1]: Siren has no contact, occupancy, presence, vibration, water_leak, smoke, gas or carbon_monoxide", why.c_str());
+    // M43: the row is the place the page listed the sensor at in its first profile, not its place among that profile's slots:
+    // the Siren is b's first sensor (row 0), though the 0x1 that profile a has comes first by slot
+    CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[{"ieee":"0x1","entry":false}],"outputs":[]},
+          {"id":"b","name":"B","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[{"ieee":"0x10","entry":false},{"ieee":"0x1","entry":false}],"outputs":[]}]})", &why) &&
+          why == "profiles[1].sensors[0]: Siren has no contact, occupancy, presence, vibration, water_leak, smoke, gas or carbon_monoxide", why.c_str());
     CHECK(!h::save(R"({"profiles":[{"id":"a","name":"A","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[],"outputs":[]},
           {"id":"b","name":"B","class":"other","arm_delay":0,"trigger_delay":0,"siren_time":10,"notify_arm":false,"sensors":[],"outputs":[{"ieee":"0x12","kind":"state","value":"on","keep":false},{"ieee":"0x11","kind":"warning","mode":"fire","level":"high","strobe":false}]}]})", &why) &&
           why.rfind("profiles[1].outputs[1]: Valve has no warning", 0) == 0, why.c_str());

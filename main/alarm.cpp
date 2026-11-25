@@ -985,12 +985,10 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
         return n < kAlarmStoredMax ? n : 0;
     };
     for (uint8_t k = 0; ok && k < next->n_sensors; k++) {
-        // Where the page has it: its first profile, and its place among that profile's sensors.
+        // Where the page has it: its first profile, and the row it listed it at there.
         const uint8_t in = next->sensors[k].profiles;
         const unsigned i = in ? static_cast<unsigned>(__builtin_ctz(in)) : 0;
-        unsigned j = 0;
-        for (uint8_t s = 0; s < k; s++) j += next->sensors[s].profiles >> i & 1;
-        std::snprintf(where, sizeof(where), "profiles[%u].sensors[%u]", i, j);
+        std::snprintf(where, sizeof(where), "profiles[%u].sensors[%u]", i, static_cast<unsigned>(next->sensors[k].row));
         ok = known(next->sensors[k].ieee);
         if (ok && !has_sensor_key(buf, exposes())) {
             std::snprintf(err, cap, "%s: %s has no contact, occupancy, presence, vibration, water_leak, smoke, gas or carbon_monoxide",

@@ -45,6 +45,9 @@ struct AlarmSensor {
     uint64_t ieee;
     uint8_t  profiles;   // bit i: in profile i
     uint8_t  entry;      // bit i: delayed in profile i (starts pending instead of the alarm)
+    // Where the API form listed it in its first profile (the page's row, which an error names). Set by
+    // alarm_cfg_from_json only: the stored form and the stage 1 form do not keep it, and nothing but a message reads it.
+    uint8_t  row = 0;
 };
 
 struct AlarmOutput {

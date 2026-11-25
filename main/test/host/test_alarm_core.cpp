@@ -414,6 +414,16 @@ static void config_errors() {
           std::strstr(err, "sirens[0]: kind must be warning, alarm or state"), "stage 1: a siren kind keeps its message");
 }
 // The API form must list its profiles: a body without them is not a stage 1 config to convert (review F6, W19).
+// M43: the place a sensor has in the list of its first profile, as submitted: the page's row, which an error names.
+static void sensor_rows() {
+    static AlarmConfig c; char err[160];
+    // Slots follow first sight: S1 0, S2 1, S3 2. Profile b lists S2 first, then the S1 that a has, then S3.
+    CHECK(parse(R"({"profiles":[{"id":"a","name":"A","class":"fire","sensors":[{"ieee":"0x1"}]},
+                  {"id":"b","name":"B","class":"fire","sensors":[{"ieee":"0x2"},{"ieee":"0x1"},{"ieee":"0x3"}]}]})", &c, err, sizeof(err)) &&
+          c.n_sensors == 3 && c.sensors[0].ieee == 1 && c.sensors[1].ieee == 2 && c.sensors[2].ieee == 3, "three sensors in the slots of first sight");
+    CHECK(c.sensors[0].row == 0 && c.sensors[1].row == 0 && c.sensors[2].row == 2,
+          "row: the place in the first profile's list as submitted (S2 is b's first, not its second slot; S1's is a's)");
+}
 static void config_needs_profiles() {
     static AlarmConfig c, before; char err[160];
     CHECK(parse(R"({"profiles":[{"id":"flood","name":"Flood","class":"water","sensors":[{"ieee":"0x3"}]}],"codes":["1234"]})",
@@ -843,6 +853,7 @@ int main() {
     config_json();
     config_errors();
     config_needs_profiles();
+    sensor_rows();
     stage1_config();
     stored_config();
     stored_config_shape();

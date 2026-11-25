@@ -217,7 +217,8 @@ bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char*
     unsigned j = 0;
     for (JsonVariantConst item : arr) {
         char where[40];
-        std::snprintf(where, sizeof(where), "%ssensors[%u]", prefix, j++);
+        const unsigned row = j++;
+        std::snprintf(where, sizeof(where), "%ssensors[%u]", prefix, row);
         JsonObjectConst o = item.as<JsonObjectConst>();
         uint64_t ieee;
         if (!parse_ieee(o["ieee"], &ieee)) return fail(err, cap, "%s: ieee must be 0x and up to 16 hex digits", where);
@@ -230,6 +231,7 @@ bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char*
                 return fail(err, cap, "%s: more than %u different sensors", where, static_cast<unsigned>(kAlarmMaxSensors));
             slot = c->n_sensors++;
             c->sensors[slot].ieee = ieee;
+            c->sensors[slot].row = static_cast<uint8_t>(row);   // this is its first profile
         }
         c->sensors[slot].profiles |= static_cast<uint8_t>(1u << pi);
         if (entry) c->sensors[slot].entry |= static_cast<uint8_t>(1u << pi);
