@@ -76,7 +76,6 @@ struct Orphan { uint64_t ieee; AlarmOutKind kind; bool value, keep; };
 Orphan       s_orphans[kAlarmMaxOutputs];
 uint8_t      s_n_orphans = 0;
 uint32_t     s_kept_alarms[kAlarmMaxProfiles];   // by profile: the alarms whose outputs left as set are set or queued
-uint8_t      s_boot_sounding = 0;     // bit i: profile i was triggered when the hub restarted
 bool         s_resync = false;        // a save swapped the config: the task takes a pass over it
 bool         s_ids_changed = false;   // ... and the Alarm device has another list of attributes
 
@@ -92,6 +91,10 @@ TaskHandle_t  s_task = nullptr;
 
 // The task's own; set at boot before it starts.
 bool     s_boot_alert = false;              // restarted during pending or triggered
+// The boot stop: the outputs of what sounded at the restart, by the config of then (a save since changes nothing),
+// each device once. PSRAM, and only while one is due.
+Orphan*  s_boot_stop = nullptr;
+uint8_t  s_n_boot_stop = 0;
 char     s_st2_saved[kStatesMax];           // the "st2" record flash holds
 size_t   s_st2_len = 0;
 uint8_t  s_st_saved[2] = {0, 0};            // the stage 1 "st" record flash holds, when s_st_have
@@ -374,7 +377,7 @@ struct Pass {
     uint64_t     summary_cause;              // the device behind the summary's pending or triggered, else 0
     char         events[kEventsMax][kAlarmEventMax];
     uint8_t      st[2];                      // the stage 1 state record as of this look
-    Orphan       orphans[kAlarmMaxOutputs];
+    Orphan       orphans[2 * kAlarmMaxOutputs];   // a save's, then the boot stop's
     Act          acts[kAlarmMaxOutputs];
 };
 
@@ -386,6 +389,19 @@ void add_act(Pass& p, bool on, uint8_t k, uint16_t secs) {
     uint8_t at = p.n_act++;
     for (; at > 0 && p.acts[at - 1].index > k; at--) p.acts[at] = p.acts[at - 1];
     p.acts[at] = {on, k, secs, s_cfg->outputs[k]};
+}
+
+// The boot stop into the pass: each output of it that the plan of now does not sound (the plan drives the others),
+// once. The caller holds s_mu.
+void boot_stop_to(Pass& p, const AlarmDrive* plan, uint8_t n) {
+    for (uint8_t b = 0; b < s_n_boot_stop; b++) {
+        bool sounds = false;
+        for (uint8_t e = 0; e < n; e++) sounds = sounds || (plan[e].ieee == s_boot_stop[b].ieee && plan[e].output >= 0);
+        if (!sounds) p.orphans[p.n_orphans++] = s_boot_stop[b];
+    }
+    heap_caps_free(s_boot_stop);
+    s_boot_stop = nullptr;
+    s_n_boot_stop = 0;
 }
 
 // `boot_stop`: a minute after a restart during an alarm, what sounded before it and does not sound now is stopped.
@@ -429,20 +445,20 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     for (uint8_t i = 0; i < p.n_ch; i++) if (p.ch[i].alarm) alarmed |= static_cast<uint8_t>(1u << p.ch[i].profile);
     const uint8_t n = alarm_drive_plan(*s_cfg, *s_panel, now, plan);
     for (uint8_t e = 0; e < n; e++) {
-        int8_t was = s_follows[e];
-        for (uint8_t k = 0; boot_stop && was < 0 && plan[e].output < 0 && k < s_cfg->n_outputs; k++)
-            if (s_cfg->outputs[k].ieee == plan[e].ieee && (s_boot_sounding >> s_cfg->outputs[k].profile & 1)) was = static_cast<int8_t>(k);
+        const int8_t was = s_follows[e];
         AlarmOutAct a = alarm_output_step(*s_cfg, was, plan[e].output);
         if (plan[e].output >= 0 && (alarmed >> s_cfg->outputs[plan[e].output].profile & 1)) a = AlarmOutAct::START;
         s_follows[e] = plan[e].output;
         if (a != AlarmOutAct::NONE) add_act(p, a == AlarmOutAct::START, static_cast<uint8_t>(a == AlarmOutAct::START ? plan[e].output : was), plan[e].secs);
     }
+    // The boot stop also sets again what the restart's alarm left as set: the states are saved before the outputs are
+    // set, so the restart may have come in between.
+    if (boot_stop) boot_stop_to(p, plan, n);
     // The outputs left as set are set for every alarm, also one that is over before the task looks (silenced inside one
     // busy pass: a valve closes for every leak alarm, however short), as the config it went off under has them: a save
-    // queues them for an alarm before it (alarm_config_set). Again by the boot stop for what sounded at the restart: the
-    // states are saved before the outputs are set, so the restart may have come in between. It is the same command each
-    // time. The other outputs follow the state of now.
-    uint8_t kept = boot_stop ? s_boot_sounding : 0;   // the profiles whose kept outputs are set
+    // queues them for an alarm before it (alarm_config_set). It is the same command each time. The other outputs follow
+    // the state of now.
+    uint8_t kept = 0;   // the profiles whose kept outputs are set
     for (uint8_t i = 0; i < p.n_prof; i++) {
         if (s_panel->at(i).alarms != s_kept_alarms[i]) kept |= static_cast<uint8_t>(1u << i);
         s_kept_alarms[i] = s_panel->at(i).alarms;
@@ -455,7 +471,6 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
         for (uint8_t a = 0; a < p.n_orphans; a++) set = set || (p.orphans[a].keep && p.orphans[a].ieee == o.ieee);
         if (!set) add_act(p, true, k, 0);
     }
-    if (boot_stop) s_boot_sounding = 0;
 }
 
 // One state record that differs from flash, unless the same bytes failed less than kSaveRetryS ago. The first failure
@@ -844,10 +859,10 @@ void alarm_early_init() {
 
     // The states: "st2"; the intrusion profiles from the stage 1 "st" when that firmware wrote it since; "st" alone
     // when there is no "st2" (alarm_states_restore). Both are kept as read: the task writes one only when it differs.
-    uint8_t in_alarm = 0;
+    uint8_t in_alarm = 0, sounding = 0;
     s_st2_len = nvs_get("st2", s_st2_saved, sizeof(s_st2_saved));
     s_st_have = nvs_get("st", s_st_saved, sizeof(s_st_saved)) == sizeof(s_st_saved);
-    switch (alarm_states_restore(s_st2_saved, s_st2_len, s_st_have ? s_st_saved : nullptr, *s_cfg, s_panel, &in_alarm, &s_boot_sounding)) {
+    switch (alarm_states_restore(s_st2_saved, s_st2_len, s_st_have ? s_st_saved : nullptr, *s_cfg, s_panel, &in_alarm, &sounding)) {
     case AlarmRestored::NEW:
         break;
     case AlarmRestored::MIXED:
@@ -861,6 +876,14 @@ void alarm_early_init() {
         break;
     }
     s_boot_alert = in_alarm != 0;
+    if (sounding) s_boot_stop = static_cast<Orphan*>(heap_caps_malloc(kAlarmMaxOutputs * sizeof(Orphan), MALLOC_CAP_SPIRAM));
+    if (sounding && !s_boot_stop) ESP_LOGE(TAG, "out of memory: what sounded is not stopped a minute after the restart");
+    for (uint8_t k = 0; s_boot_stop && k < s_cfg->n_outputs; k++) {
+        const AlarmOutput& o = s_cfg->outputs[k];
+        bool listed = !(sounding >> o.profile & 1);
+        for (uint8_t i = 0; !listed && i < s_n_boot_stop; i++) listed = s_boot_stop[i].ieee == o.ieee;
+        if (!listed) s_boot_stop[s_n_boot_stop++] = {o.ieee, o.kind, o.value, o.keep};
+    }
     alarm_seen(*s_panel, s_seen);   // the restored states are where the task starts from, not changes
     alarm_summary_name(*s_cfg, *s_panel, s_summary, sizeof(s_summary));
 
@@ -1047,7 +1070,6 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             panel->adopt(*s_panel, *s_cfg);
             AlarmSeen seen[kAlarmMaxProfiles] = {};
             uint32_t since[kAlarmMaxProfiles] = {}, kept_alarms[kAlarmMaxProfiles] = {};
-            uint8_t sounding = 0;
             bool ids = next->n_profiles != s_cfg->n_profiles;
             for (uint8_t i = 0; i < next->n_profiles; i++) {
                 const int j = alarm_cfg_profile(*s_cfg, next->profiles[i].id);
@@ -1061,7 +1083,6 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
                 seen[i]  = s_seen[j];
                 since[i] = s_since[j];
                 kept_alarms[i] = s_panel->at(j).alarms;   // its alarms of before are queued below
-                if (s_boot_sounding >> j & 1) sounding |= static_cast<uint8_t>(1u << i);
             }
             // An output that still follows an alarm (a disarm the task has not acted on yet, or an alarm that began
             // while the devices were checked) is stopped by its old entry; the new plan then starts what still sounds.
@@ -1084,7 +1105,6 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
                 s_kept_alarms[i] = kept_alarms[i];
             }
             std::memset(s_pad, 0, sizeof(s_pad));
-            s_boot_sounding = sounding;
             s_resync        = true;
             s_ids_changed   = s_ids_changed || ids;
             std::swap(s_cfg, next);   // `next` and `panel` now hold the old ones, freed below

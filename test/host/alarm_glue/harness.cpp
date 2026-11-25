@@ -834,11 +834,42 @@ int fallback_flow() {
     return 0;
 }
 
+std::string packed(const char* json) {   // a config as "cfg2" holds it
+    static AlarmConfig c;
+    static char buf[kAlarmStoredMax];
+    char err[96];
+    if (!alarm_cfg_from_json(json, std::strlen(json), nullptr, &c, err, sizeof(err))) { std::printf("FAIL: %s\n", err); std::abort(); }
+    return std::string(buf, alarm_cfg_pack(c, buf, sizeof(buf)));
+}
+
 // Power cuts and restarts: chains of boots on one flash (h::boot_run). This process never boots itself.
 int restart_flow() {
     using h::boot_run;
     static uint64_t open[kAlarmMaxSensors];
     static uint8_t n_open = 0;
+    // A flood profile whose alarm switches a relay on; restarted while it sounds.
+    const char* relay = R"({"profiles":[{"id":"flood","name":"Flood","class":"water","arm_delay":0,"trigger_delay":0,"siren_time":20,
+      "notify_arm":false,"sensors":[{"ieee":"0x3","entry":false}],"outputs":[{"ieee":"0x12","kind":"state","value":"on","keep":false}]}]})";
+    const std::map<std::string, std::string> sounding = {
+        {"cfg2", packed(relay)}, {"st2", R"({"v":1,"l":[0,0],"p":[["flood",4,1]]})"}, {"st", std::string("\0\0", 2)}};
+
+    // ── A save inside the minute after that restart, which swaps the alarm's output for a siren: the boot stop stops what
+    //    sounded at the restart, not what the save lists (W9, M29) ──
+    std::string siren = relay;
+    const std::string out12 = R"({"ieee":"0x12","kind":"state","value":"on","keep":false})";
+    siren.replace(siren.find(out12), out12.size(), R"({"ieee":"0x10","kind":"warning","mode":"emergency","level":"high","strobe":true})");
+    g_nvs = sounding;
+    boot_run([&] {
+        h::boot();
+        run_task(20);
+        std::string why;
+        CHECK(h::save(siren.c_str(), &why), why.c_str());
+        run_task(38);
+        CHECK(cnt("cmd:") == 0, "nothing is stopped before the minute is over");
+        run_task(5);
+        CHECK(idx("The hub restarted during an alarm at ") >= 0 && cnt("cmd:12:state=0") == 1 && cnt("cmd:10:") == 0,
+              "a minute after the restart, the relay that was on is switched off, and the siren the save lists is left alone");
+    });
 
     // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
     std::string with_fire = kCfg;
