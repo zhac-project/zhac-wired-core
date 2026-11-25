@@ -7,8 +7,8 @@
 # The REAL alarm.cpp is copied from main/ and included whole by harness.cpp, with the real alarm_core.cpp; its task
 # loop runs in turns with the test, on a fake clock. Only the neighbours are fakes (stubs/, harness.cpp), and each of them
 # aborts when it is called under the alarm mutex.
-#   sh run.sh                  build and run the four modes (main, boot, legacy, fallback: one boot each);
-#                              exit code = the modes that failed
+#   sh run.sh                  build and run the five modes (main, boot, legacy, fallback: one boot each; restart:
+#                              chains of boots on one flash, for power cuts and restarts); exit code = the modes that failed
 #   MUTANT=<name> sh run.sh    same, after breaking ONE line in the work copy of alarm.cpp (never in the repo), to
 #                              show the harness can fail: cfg_overwritten | no_orphans | no_keep_follow | st_ignored
 # Needs the sibling zhac-components checkout next to this repo (ZHAC_COMPONENTS overrides) and g++.
@@ -45,7 +45,7 @@ g++ -std=gnu++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Wa
     -Wno-maybe-uninitialized -pthread $INC "$H/harness.cpp" "$R/main/alarm_core.cpp" -o "$W/harness"
 set +e
 fails=0
-for m in main boot legacy fallback; do
+for m in main boot legacy fallback restart; do
     # No leak check: the panel lives as long as the hub, and the task's thread is still waiting when a mode ends.
     ASAN_OPTIONS=detect_leaks=0 "$W/harness" $m || fails=$((fails + 1))
 done

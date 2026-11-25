@@ -6,8 +6,12 @@
 // Every fake of the shadow, the pool, device_cmd, NVS, the event bus, the cloud, Telegram and the page aborts when
 // it is called under the alarm mutex, and the mutex aborts when it is taken twice. Modes (alarm.cpp's statics live
 // as long as the process, so one boot is one run): main, a day of use; boot and legacy, a restart during an alarm
-// from the new records and from the stage 1 records; fallback, a boot after the stage 1 firmware armed the hub.
+// from the new records and from the stage 1 records; fallback, a boot after the stage 1 firmware armed the hub;
+// restart, chains of boots on one flash (boot_run: each boot in a child process), for power cuts and restarts.
 #include "alarm.cpp"
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <condition_variable>
 #include <cstdarg>
@@ -154,6 +158,58 @@ void boot() {
     alarm_start();
 }
 
+// One boot of a chain on one flash: `f` runs in a child process, from alarm.cpp's statics as they are at program start
+// (this process never boots). When `f` returns the power goes: the flash the child leaves is the next boot's, and its
+// checks count here.
+void boot_run(const std::function<void()>& f) {
+    int fd[2];
+    if (pipe(fd) != 0) std::abort();
+    std::fflush(stdout);
+    const pid_t pid = fork();
+    if (pid < 0) std::abort();
+    if (pid == 0) {
+        close(fd[0]);
+        f();
+        if (g_lock_depth) { std::printf("FAIL: the mutex is still held\n"); fails++; }
+        std::string out = std::to_string(checks) + " " + std::to_string(fails) + " " + std::to_string(g_nvs.size()) + "\n";
+        for (const auto& kv : g_nvs) out += std::to_string(kv.first.size()) + " " + std::to_string(kv.second.size()) + "\n" + kv.first + kv.second;
+        std::fflush(stdout);
+        for (size_t at = 0; at < out.size();) {
+            const ssize_t w = write(fd[1], out.data() + at, out.size() - at);
+            if (w <= 0) _exit(2);
+            at += static_cast<size_t>(w);
+        }
+        _exit(0);
+    }
+    close(fd[1]);
+    std::string in;
+    char buf[4096];
+    for (ssize_t r; (r = read(fd[0], buf, sizeof(buf))) > 0;) in.append(buf, static_cast<size_t>(r));
+    close(fd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || in.empty()) {
+        std::printf("FAIL: a boot of the chain died\n");
+        fails++;
+        return;
+    }
+    size_t at = 0;
+    auto num = [&] {   // digits, then one separator
+        int v = 0;
+        while (at < in.size() && in[at] >= '0' && in[at] <= '9') v = v * 10 + (in[at++] - '0');
+        at++;
+        return v;
+    };
+    checks = num();
+    fails = num();
+    g_nvs.clear();
+    for (int i = 0, n = num(); i < n; i++) {
+        const size_t kl = static_cast<size_t>(num()), vl = static_cast<size_t>(num());
+        g_nvs[in.substr(at, kl)] = in.substr(at + kl, vl);
+        at += kl + vl;
+    }
+}
+
 }  // namespace h
 
 // ── The fakes ──
@@ -282,6 +338,8 @@ int main_flow() {
     std::string why;
     CHECK(h::save(kCfg, &why), "the config saves");
     CHECK(cnt("nvs:cfg2") == 1 && cnt("nvs:cfg") == 1, "the save writes cfg2 and never cfg");
+    CHECK(cnt("nvs:st2") == 1 && idx("nvs:st2") > idx("nvs:cfg2") && g_nvs["st2"].find("[\"flood\",2,1]") != std::string::npos,
+          "and then the states, the new flood profile armed: a power cut before the task's pass keeps them (M28)");
     CHECK(h::persisted == std::vector<uint64_t>({0x1, 0x2, 0x3}),
           "each sensor the save adds is seeded, and its last values go to flash at the shadow's next sweep (M44)");
     run_task();
@@ -291,7 +349,8 @@ int main_flow() {
     CHECK(cnt("alert:") == 1 && idx("\"kind\":\"alarm_armed\"") >= 0 && idx("Armed (Flood) at ") >= 0 && idx("\"name\":\"flood\"") >= 0, "the new flood profile is armed and says so, keyed by its id");
     CHECK(idx("event:alarm_armed_flood") >= 0 && cnt("event:") == 1, "one event for it; the summary did not move");
     CHECK(cnt("attr:alarm_state") == 0, "alarm_state is not published again when the summary did not move");
-    CHECK(cnt("nvs:st2") == 1 && pos("nvs:st") < 0 && g_nvs["st"] == std::string("\0\0", 2), "st2 written; st is still the one the boot wrote");
+    CHECK(cnt("nvs:st2") == 2 && pos("nvs:st") < 0 && g_nvs["st"] == std::string("\0\0", 2),
+          "the task writes st2 once more (its copy is of before the save); st is still the one the boot wrote");
     CHECK(g_nvs["st2"].rfind("{\"v\":1,\"l\":[0,0],\"p\":[", 0) == 0, "st2 carries the st that flash holds (ruling 17)");
     CHECK(idx("nvs:st2") < idx("alert:") && idx("alert:") < idx("attr:flood") && idx("attr:flood") < idx("event:") && idx("event:") < idx("push:alarm.changed"),
           "pass order: states, notifications, attributes, events, (outputs), page");
@@ -775,9 +834,41 @@ int fallback_flow() {
     return 0;
 }
 
+// Power cuts and restarts: chains of boots on one flash (h::boot_run). This process never boots itself.
+int restart_flow() {
+    using h::boot_run;
+    static uint64_t open[kAlarmMaxSensors];
+    static uint8_t n_open = 0;
+
+    // ── A power cut right after a save: every profile comes back in its state at the save, a new one too (W6, M28) ──
+    std::string with_fire = kCfg;
+    with_fire.insert(with_fire.find("],\n \"keypads\""), R"(,
+ {"id":"fire","name":"Fire","class":"fire","arm_delay":0,"trigger_delay":0,"siren_time":15,"notify_arm":false,
+  "sensors":[{"ieee":"0x4","entry":false}],"outputs":[]})");
+    g_nvs.clear();
+    boot_run([&] {
+        h::boot();
+        run_task();
+        std::string why;
+        CHECK(h::save(kCfg, &why), why.c_str());
+        run_task();
+        CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "away armed");
+        run_task();
+        CHECK(h::save(with_fire.c_str(), &why), why.c_str());   // a fire profile more: it guards at once
+    });   // the power goes before the task's next pass
+    boot_run([] {
+        h::boot();
+        run_task();
+        CHECK(h::alarm_attrs["fire"] == "armed" && h::alarm_attrs["away"] == "armed" && h::alarm_attrs["flood"] == "armed" &&
+              h::alarm_attrs["night"] == "disarmed", "after the cut, every profile is in its state at the save, the new one too");
+    });
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "main";
-    const int rc = mode == "main" ? main_flow() : mode == "fallback" ? fallback_flow() : boot_flow(mode == "legacy");
+    const int rc = mode == "main" ? main_flow() : mode == "fallback" ? fallback_flow() : mode == "restart" ? restart_flow()
+                 : boot_flow(mode == "legacy");
     if (rc) { std::printf("FAIL: setup\n"); return 1; }
     if (g_lock_depth) { std::printf("FAIL: the mutex is still held\n"); return 1; }
     std::printf("%s: %s (%d checks, %d failed)\n", mode.c_str(), h::fails ? "FAILED" : "ALL PASSED", h::checks, h::fails);

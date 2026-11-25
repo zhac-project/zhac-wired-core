@@ -1033,6 +1033,11 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
         const uint8_t n_seeds = next->n_sensors;
         for (uint8_t i = 0; i < n_seeds; i++) seeds[i].ieee = next->sensors[i].ieee;
         read_seeds(seeds, n_seeds);
+        // The states go to flash with the config, beside the "st" that flash holds (ruling 17): a power cut before the
+        // task's next pass brings every profile back as the save left it, a new one too.
+        uint8_t st[2];
+        const bool have_st = nvs_get("st", st, sizeof(st)) == sizeof(st);
+        size_t states = 0;
         const uint32_t now = mono_s();
         {
             Lock l;
@@ -1084,7 +1089,9 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             s_ids_changed   = s_ids_changed || ids;
             std::swap(s_cfg, next);   // `next` and `panel` now hold the old ones, freed below
             std::swap(s_panel, panel);
+            states = alarm_states_pack(*s_cfg, *s_panel, buf, kStatesMax, have_st ? st : nullptr);
         }
+        if (states) nvs_put("st2", buf, states);   // if it fails, the task's next pass writes them
         // A sensor the save adds starts from its last values in the shadow: they go to flash at the shadow's next
         // sweep, as a sensor's change does (on_attr), or a power cut brings back older ones.
         for (uint8_t i = 0; i < n_seeds; i++)
