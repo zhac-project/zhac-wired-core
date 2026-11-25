@@ -176,6 +176,76 @@ menu "ZHAC wired-core board"
             Green blink while the join window is open, blue flash on Zigbee
             traffic, off otherwise. The S31 dev board has one on GPIO 60.
 
+    config ZHAC_AUDIO
+        bool "Hub speaker: generated sounds (ES8311 codec)"
+        depends on IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
+        default y
+        help
+            Plays generated sounds (no files) through the board's ES8311 codec
+            and its amplifier: from rules, Lua, the hub page and the Hub Sound
+            device. At boot the codec's chip ID is read over I2C; a board
+            without it keeps all of these pins and runs as before.
+
+    config ZHAC_AUDIO_MAX_VOLUME
+        int "Hub speaker: the loudest any sound may play (0-100)"
+        depends on ZHAC_AUDIO
+        range 0 100
+        default 70
+        help
+            Every volume, from every path, is held to this. 70 is set by ear on
+            the P4-NANO kit's 8 ohm 2 W speaker.
+
+    config ZHAC_AUDIO_I2C_SDA_GPIO
+        int "Hub speaker: codec I2C SDA"
+        depends on ZHAC_AUDIO
+        default 7 if IDF_TARGET_ESP32P4
+        default 51 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_I2C_SCL_GPIO
+        int "Hub speaker: codec I2C SCL"
+        depends on ZHAC_AUDIO
+        default 8 if IDF_TARGET_ESP32P4
+        default 50 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_MCLK_GPIO
+        int "Hub speaker: I2S MCLK"
+        depends on ZHAC_AUDIO
+        default 13 if IDF_TARGET_ESP32P4
+        default 52 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_BCLK_GPIO
+        int "Hub speaker: I2S BCLK"
+        depends on ZHAC_AUDIO
+        default 12 if IDF_TARGET_ESP32P4
+        default 53 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_LRCK_GPIO
+        int "Hub speaker: I2S LRCK (WS)"
+        depends on ZHAC_AUDIO
+        default 10 if IDF_TARGET_ESP32P4
+        default 55 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_DOUT_GPIO
+        int "Hub speaker: I2S data out (to the codec's DSDIN)"
+        depends on ZHAC_AUDIO
+        default 9 if IDF_TARGET_ESP32P4
+        default 56 if IDF_TARGET_ESP32S31
+
+    config ZHAC_AUDIO_ASDOUT_GPIO
+        int "Hub speaker: codec ASDOUT (reserved, never driven)"
+        depends on ZHAC_AUDIO
+        default 11 if IDF_TARGET_ESP32P4
+        default 54 if IDF_TARGET_ESP32S31
+        help
+            The codec's microphone data line. The microphone is not used; the
+            pin is only kept away from Settings > I/O, as the codec drives it.
+
+    config ZHAC_AUDIO_PA_GPIO
+        int "Hub speaker: amplifier enable (active high)"
+        depends on ZHAC_AUDIO
+        default 53 if IDF_TARGET_ESP32P4
+        default 57 if IDF_TARGET_ESP32S31
+
     config ZHAC_WIFI_HOSTED
         bool "Wi-Fi through an ESP-Hosted co-processor (test variant)"
         depends on IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
@@ -191,8 +261,8 @@ menu "ZHAC wired-core board"
 
     config ZHAC_IO_PINS
         string "GPIOs the owner may configure (Settings > I/O)"
-        default "21,22,23,26,27,45,46,47,48,53" if IDF_TARGET_ESP32P4 && ZHAC_WIFI_HOSTED
-        default "2,3,4,5,20,21,22,23,26,27,32,33,45,46,47,48,53" if IDF_TARGET_ESP32P4
+        default "21,22,23,26,27,45,46,47,48" if IDF_TARGET_ESP32P4 && ZHAC_WIFI_HOSTED
+        default "2,3,4,5,20,21,22,23,26,27,32,33,45,46,47,48" if IDF_TARGET_ESP32P4
         default "2,3,4,35,36,37,38,39,40,42,43,44,45,46,48,49" if IDF_TARGET_ESP32S31 && ZHAC_WIFI_HOSTED
         default "2,3,4,20,21,22,23,24,25,35,36,37,38,39,40,42,43,44,45,46,47,48,49" if IDF_TARGET_ESP32S31
         default ""
@@ -203,6 +273,8 @@ menu "ZHAC wired-core board"
             radio UART/reset, status LED, ESP-Hosted SPI, console) and pins IDF
             reserves (flash, PSRAM, USB) are dropped at boot whatever this says.
             Defaults leave out every pin not verified free on the board schematics.
+            53 is the speaker amplifier pin on P4 boards. The speaker's pins
+            (ZHAC_AUDIO_*) are dropped too when the codec answers at boot.
 
     config ZHAC_TEST_CRASH_CMD
         bool "Test builds only: the debug.crash command"

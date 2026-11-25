@@ -68,6 +68,8 @@ idf_component_register(
         "alarm_core.cpp"
         "alarm.cpp"
         "sound_synth.cpp"
+        "es8311.cpp"
+        "sound.cpp"
     INCLUDE_DIRS "."
     # Moves zhc_adapter's ~105 KB of lookup-table .bss to PSRAM. Without it the
     # esp32s31 build has too little internal DRAM left for EMAC DMA descriptors
@@ -105,6 +107,9 @@ idf_component_register(
         # user_io.cpp: the owner's pins (PWM, ADC; WS2812 through led_strip).
         esp_driver_ledc
         esp_adc
+        # sound.cpp: the speaker's ES8311 codec (I2C) and its sample stream (I2S).
+        esp_driver_i2c
+        esp_driver_i2s
         mdns
         # -- local components/ --------------------------------------------
         hap_master

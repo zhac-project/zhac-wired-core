@@ -50,6 +50,7 @@
 #include "api_rules.h"
 #include "api_io.h"
 #include "alarm.h"
+#include "sound.h"
 #include "user_io.h"
 #include "api_scripts.h"
 #include "api_status.h"
@@ -252,6 +253,8 @@ extern "C" void app_main() {
     zhac_adapter_init();
     heap_mark("adapter");
     zb_diag_init();   // unhandled-frame ring for GET /api/diagnostics/unhandled
+    // The speaker: a codec that answers claims its pins before user_io hands out the owner's.
+    sound_early_init();
     // The owner's pins: boot levels now, hooks before simple_rules/lua_engine load.
     user_io_early_init();
     alarm_early_init();   // the alarm panel: config + state from NVS, the Alarm device hooks
@@ -449,6 +452,7 @@ extern "C" void app_main() {
         ESP_LOGI(TAG, "lua_engine: scripts loaded");
     }
     user_io_start();   // pin values onto the Hub I/O device, then input/ADC polling
+    sound_start();     // I2S, the codec, the amplifier pin (low) and the render task
     alarm_start();     // watch sensors and keypads, publish the panel state, start its task
 
     // Start the pump LAST: every service its subscribers reach (ws_server,

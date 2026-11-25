@@ -31,6 +31,7 @@
 #include "event_bus.h"
 #include "local_dev.h"
 #include "simple_rules.h"
+#include "sound.h"
 #include "zap_common.h"
 #include "zap_store.h"
 #include "zcl_attribute.h"
@@ -152,7 +153,7 @@ bool firmware_pin(int p) {
         -1,
     };
     for (int q : kPins) if (q == p) return true;
-    return false;
+    return sound_owns_pin(p);   // the speaker's, once its codec answered (sound_early_init runs first)
 }
 
 void build_caps() {
