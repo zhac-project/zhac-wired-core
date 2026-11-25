@@ -263,6 +263,65 @@ static void names() {
     CHECK(!alarm_state_parse("armed_away", &s) && !alarm_state_parse(nullptr, &s), "stage 1 and unknown state names are refused");
 }
 
+// M1: a disarm of a profile that is already disarmed is not a disarm.
+static void disarm_of_disarmed() {
+    AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; AlarmSeen seen[kAlarmMaxProfiles]; AlarmChange ch[kAlarmMaxProfiles];
+    alarm_seen(p, seen);
+    p.disarm(kHome); p.disarm(kFlood); p.disarm(c.n_profiles); p.disarm(99);
+    bool none = true;
+    for (uint8_t i = 0; i < c.n_profiles; i++) none = none && p.at(i).disarms == 0;
+    CHECK(none && alarm_changes(p, seen, ch) == 0, "disarming profiles that are disarmed counts nothing and changes nothing");
+    p.disarm_all();
+    none = true;
+    for (uint8_t i = 0; i < c.n_profiles; i++) none = none && p.at(i).disarms == 0;
+    CHECK(none && alarm_changes(p, seen, ch) == 0, "disarm all on a panel that is disarmed: the same");
+    p.arm(kHome, false, 0, &open); p.disarm(kHome); p.disarm(kHome); p.disarm_all();
+    CHECK(p.at(kHome).disarms == 1 && ST(kHome) == AlarmState::DISARMED, "a disarm counts once however often it is repeated");
+}
+
+// M2: the check that runs when a profile reaches armed takes the sensor slots from the lowest, and skips a bypassed slot
+// for its hazard keys as for its contact.
+static void hazard_check_order() {
+    AlarmConfig c{}; uint64_t open = 0;
+    c.profiles[c.n_profiles++] = prof("fire", AlarmClass::FIRE, AlarmRole::NONE, 0, 0);
+    for (uint8_t i = 0; i < 3; i++) c.sensors[c.n_sensors++] = {ieee_of(i), 0x01, 0};
+    AlarmPanel p(&c);
+    p.seed(2, AlarmKey::SMOKE, true); p.seed(1, AlarmKey::CO, true);    // two active, none in slot 0
+    p.arm(0, false, 0, &open);
+    CHECK(p.at(0).state == AlarmState::TRIGGERED && p.at(0).cause == ieee_of(1) && p.at(0).alarms == 1,
+          "the check on reaching armed takes the lowest slot first: its cause is slot 1's");
+    AlarmPanel q(&c);   // slot 0 is open and smoking at once; slot 1 smokes; a forced arm bypasses slot 0
+    q.seed(0, AlarmKey::CONTACT, true); q.seed(0, AlarmKey::SMOKE, true); q.seed(1, AlarmKey::SMOKE, true);
+    CHECK(q.arm(0, false, 0, &open) == AlarmArmResult::OPEN && open == 1, "an open contact refuses it");
+    q.arm(0, true, 0, &open);
+    CHECK(q.at(0).bypass == 1 && q.at(0).state == AlarmState::TRIGGERED && q.at(0).cause == ieee_of(1),
+          "forced: slot 0 is bypassed and its smoke is ignored by the check; slot 1's alarm is the one");
+    AlarmPanel r(&c);   // the same slot 0 alone: nothing to trigger, and a new smoke report on it is ignored as well
+    r.seed(0, AlarmKey::CONTACT, true); r.seed(0, AlarmKey::SMOKE, true);
+    r.arm(0, true, 0, &open);
+    CHECK(r.at(0).state == AlarmState::ARMED && r.at(0).alarms == 0, "a bypassed slot's smoke does not raise the check's alarm");
+    r.sensor(0, AlarmKey::SMOKE, false, 5); r.sensor(0, AlarmKey::SMOKE, true, 6);
+    CHECK(r.at(0).state == AlarmState::ARMED && r.at(0).alarms == 0, "nor a new smoke report on it");
+    r.sensor(1, AlarmKey::SMOKE, true, 7);
+    CHECK(r.at(0).state == AlarmState::TRIGGERED && r.at(0).cause == ieee_of(1), "while a sensor that is not bypassed still does");
+}
+
+// M12 (ruling 11): what the task looks at is the state and the alarms, not the steps between two looks.
+static void changes_skip_steps() {
+    static AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; AlarmSeen seen[kAlarmMaxProfiles]; AlarmChange ch[kAlarmMaxProfiles];
+    p.arm(kNight, false, 0, &open); alarm_seen(p, seen);
+    p.disarm(kNight); p.arm(kNight, false, 10, &open);   // disarmed and armed again before the task looks
+    CHECK(alarm_changes(p, seen, ch) == 0 && p.at(kNight).disarms == 1 && ST(kNight) == AlarmState::ARMED,
+          "a disarm and a re-arm back to the state seen: no change (the count of disarms still shows it)");
+    p.disarm(kNight); p.arm(kNight, false, 20, &open);
+    p.sensor(sWindow, AlarmKey::CONTACT, true, 21); p.silence(kNight);   // an alarm in between, over again
+    const uint8_t n = alarm_changes(p, seen, ch);
+    CHECK(n == 1 && ch[0].profile == kNight && ch[0].from == AlarmState::ARMED && ch[0].to == AlarmState::ARMED && ch[0].alarm &&
+          !ch[0].by_command && ch[0].cause == ieee_of(sWindow), "with an alarm in between: one change, with the alarm and its cause");
+    alarm_seen(p, seen);
+    CHECK(alarm_changes(p, seen, ch) == 0, "and once acted on, nothing");
+}
+
 // An output must have something writable for its kind; a reading cannot sound.
 static void siren_fit() {
     auto fits = [](AlarmOutKind k, const char* ex) { return alarm_output_misfit(k, ex, std::strlen(ex)) == nullptr; };
@@ -928,6 +987,9 @@ int main() {
     keypad_codes();
     names();
     siren_fit();
+    disarm_of_disarmed();
+    hazard_check_order();
+    changes_skip_steps();
     config_json();
     class_words();
     config_errors();
