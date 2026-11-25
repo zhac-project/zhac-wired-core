@@ -478,7 +478,8 @@ int main_flow() {
 
     // ── A state that cannot be written still takes effect. A record that failed is tried again at the next change of
     //    state, else no sooner than 5 min after the failure, as the shadow waits: on a nearly full NVS each try can
-    //    cost a page copy and a sector erase (round 2). Each record logs a run of failures once, and once its end ──
+    //    cost a page copy and a sector erase (round 2). Each record logs a run of failures once, and once its end; flash
+    //    that comes to agree with the hub without a write ends a run too, so the next failure is logged again (M47) ──
     g_logs.clear();
     CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed");
     run_task();
@@ -490,7 +491,7 @@ int main_flow() {
     CHECK(h::logged("stage 1 state record not saved") == 1 && h::logged("states not saved") == 1, "each failure logged");
     run_task(9);   // nine passes with nothing new, 30 s apart
     CHECK(g_nvs_refused["st"] == 1 && g_nvs_refused["st2"] == 1, "no record is tried again within 5 min of its failure");
-    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed again, as flash still says");
+    CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "armed again, as flash still says: that run of failures is over");
     run_task();
     alarm_disarm("");   // the records that failed 4.5 min ago, but a change of state
     run_task();
@@ -499,7 +500,8 @@ int main_flow() {
     CHECK(g_nvs_refused["st"] == 2 && g_nvs_refused["st2"] == 2, "and then waits 5 min again");
     run_task(1);
     CHECK(g_nvs_refused["st"] == 3 && g_nvs_refused["st2"] == 3, "5 min after the failure, one more try of each, though nothing changed");
-    CHECK(h::logged("not saved") == 2, "a run of failures is logged once");
+    CHECK(h::logged("stage 1 state record not saved") == 2 && h::logged("states not saved") == 2,
+          "each record logs both runs of failures, each once: fail, agree, fail again (M47)");
     g_nvs_fail = false;
     g_trace.clear();
     run_task(9);
@@ -509,7 +511,7 @@ int main_flow() {
           "5 min after the failure, both records are written, whether or not the panel moved (F4)");
     CHECK(h::logged("stage 1 state record saved again") == 1 && h::logged("states saved again") == 1, "each record says once that it is saved again");
     run_task(20);
-    CHECK(cnt("nvs:") == 2 && h::logged("saved again") == 2 && h::logged("not saved") == 2, "nothing more to write, nothing more said");
+    CHECK(cnt("nvs:") == 2 && h::logged("saved again") == 2 && h::logged("not saved") == 4, "nothing more to write, nothing more said");
 
     // ── The wait after a failure is for the same bytes only: a change to others, which flash does not hold either, is
     //    tried at once (M46) ──

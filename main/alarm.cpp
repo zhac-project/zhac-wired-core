@@ -476,10 +476,11 @@ bool put_state(const char* key, const void* d, size_t n, SaveRetry<N>& r, const 
 // that finds another "st" beside it knows the stage 1 firmware wrote that one since (alarm_states_restore). Both
 // describe the one instant of the look: what happens while they are written is the next look's. A write that fails is
 // logged and the change still takes effect; a failed "st" leaves the two agreeing. A record that failed is tried again
-// at its next change, or kSaveRetryS later (put_state).
+// at its next change, or kSaveRetryS later (put_state). Flash that comes to agree without a write ends a run of failures.
 void save_states(const Pass& p) {
     if (s_st_have && std::memcmp(p.st, s_st_saved, sizeof(p.st)) == 0) {
         s_st_retry.len = 0;
+        s_st_retry.failing = false;
     } else if (put_state("st", p.st, sizeof(p.st), s_st_retry, "stage 1 state record", "a fall back to that firmware finds the one saved last")) {
         std::memcpy(s_st_saved, p.st, sizeof(p.st));
         s_st_have = true;
@@ -488,6 +489,7 @@ void save_states(const Pass& p) {
     const size_t len = alarm_states_pack(p.prof, p.state, p.rests, p.n_prof, st2, sizeof(st2), s_st_have ? s_st_saved : nullptr);
     if (len == s_st2_len && std::memcmp(st2, s_st2_saved, len) == 0) {
         s_st2_retry.len = 0;
+        s_st2_retry.failing = false;
         return;
     }
     if (len && put_state("st2", st2, len, s_st2_retry, "states", "a restart comes back to the ones saved last")) {
