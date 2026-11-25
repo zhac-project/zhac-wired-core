@@ -88,11 +88,14 @@ int  alarm_cfg_role(const AlarmConfig& c, AlarmRole r);         // the intrusion
 int  alarm_cfg_sensor(const AlarmConfig& c, uint64_t ieee);     // slot, -1
 const AlarmKeypad* alarm_cfg_keypad(const AlarmConfig& c, uint64_t ieee);
 
-// The API form (alarm.config.set, alarm.get). "profiles" must be a list: without one, the body is refused before
-// `out` is touched. "codes" left out keeps `keep`'s codes; "codes":[] clears them. False with the first problem in
-// `err`. `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack) and is partly filled
-// on any later failure. `pool`: where the parse takes its memory; null is the default allocator. The firmware gives
-// PSRAM: the largest config parses to tens of KB.
+// The API form (alarm.config.set, alarm.get). "profiles" must be a list. "codes" left out keeps `keep`'s codes (null: none);
+// "codes":[] clears them. `keep` is never `out`: `out` is reset before `keep` is read. False with the first problem in
+// `err`. `out` is built in place (an AlarmConfig is ~4.4 KB: never a local on a firmware stack). What a false leaves in it:
+//   - the body is not a JSON object, or "profiles" is not a list: `out` is as it was, untouched;
+//   - any other problem: `out` is reset and holds what was read before it, the sensors and outputs of the profile that failed
+//     among them (that profile is not in n_profiles). It is not a config: read nothing from it.
+// `pool`: where the parse takes its memory; null is the default allocator. The firmware gives PSRAM: the largest config
+// parses to tens of KB.
 bool alarm_cfg_from_json(const char* json, size_t len, const AlarmConfig* keep, AlarmConfig* out, char* err, size_t cap,
                          ArduinoJson::Allocator* pool = nullptr);
 // The stage 1 record ("cfg"), read at boot only: an object without "profiles" is the stage 1 form and is converted

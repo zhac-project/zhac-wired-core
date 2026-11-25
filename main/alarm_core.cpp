@@ -206,10 +206,9 @@ bool valid_name(JsonVariantConst v) {
     return true;
 }
 
-// The sensors of profile `pi`. A device is stored once, with a bit per profile.
-bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
-    char prefix[16];
-    std::snprintf(prefix, sizeof(prefix), "profiles[%u].", static_cast<unsigned>(pi));
+// The sensors of profile `pi`; `prefix` is its path in the messages ("profiles[2]."). A device is stored once, with a bit
+// per profile.
+bool parse_profile_sensors(JsonObjectConst po, const char* prefix, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
     JsonArrayConst arr;
     // No cap on the list itself: a profile's 49th item is a sensor listed twice or a 49th different one, and the loop
     // says so, as it does for 49 sensors over several profiles.
@@ -239,9 +238,7 @@ bool parse_profile_sensors(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char*
     return true;
 }
 
-bool parse_profile_outputs(JsonObjectConst po, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
-    char prefix[16];
-    std::snprintf(prefix, sizeof(prefix), "profiles[%u].", static_cast<unsigned>(pi));
+bool parse_profile_outputs(JsonObjectConst po, const char* prefix, uint8_t pi, AlarmConfig* c, char* err, size_t cap) {
     JsonArrayConst arr;
     if (!list_field(po, prefix, "outputs", kAlarmMaxProfileOutputs, &arr, err, cap)) return false;
     const uint8_t first = c->n_outputs;
@@ -260,6 +257,8 @@ bool parse_profiles(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap)
     for (JsonVariantConst item : arr) {
         const uint8_t pi = c->n_profiles;
         const unsigned i = pi;
+        char prefix[16];   // "profiles[7]."
+        std::snprintf(prefix, sizeof(prefix), "profiles[%u].", i);
         JsonObjectConst o = item.as<JsonObjectConst>();
         AlarmProfile& p = c->profiles[pi];
         p.siren_time = kSirenDefault;
@@ -294,7 +293,7 @@ bool parse_profiles(JsonObjectConst root, AlarmConfig* c, char* err, size_t cap)
         if (!num_field(o, "siren_time", kAlarmSirenMin, kAlarmSirenMax, &p.siren_time))
             return fail(err, cap, "profiles[%u]: siren_time must be %u-%u s", i, kAlarmSirenMin, kAlarmSirenMax);
         if (!bool_field(o, "notify_arm", &p.notify_arm)) return fail(err, cap, "profiles[%u]: notify_arm must be true or false", i);
-        if (!parse_profile_sensors(o, pi, c, err, cap) || !parse_profile_outputs(o, pi, c, err, cap)) return false;
+        if (!parse_profile_sensors(o, prefix, pi, c, err, cap) || !parse_profile_outputs(o, prefix, pi, c, err, cap)) return false;
         c->n_profiles++;
     }
     return true;
@@ -914,8 +913,8 @@ bool AlarmPanel::sensor(uint8_t slot, AlarmKey key, bool active, uint32_t now) {
 void AlarmPanel::go_off(uint8_t p, uint8_t slot, uint32_t now) {
     AlarmProfileStatus& s = st_[p];
     const AlarmSensor& sen = cfg_->sensors[slot];
-    if (!(sen.profiles >> p & 1) || (s.bypass >> slot & 1)) return;
-    const uint16_t delay = (sen.entry >> p & 1) ? cfg_->profiles[p].trigger_delay : 0;
+    if (!((sen.profiles >> p) & 1) || ((s.bypass >> slot) & 1)) return;
+    const uint16_t delay = ((sen.entry >> p) & 1) ? cfg_->profiles[p].trigger_delay : 0;
     if (s.state == AlarmState::ARMED && delay) {
         s.state = AlarmState::PENDING;
         s.cause = sen.ieee;
@@ -1094,7 +1093,7 @@ struct EventList {
         std::vsnprintf(name, sizeof(name), fmt, ap);
         va_end(ap);
         for (uint8_t i = 0; i < n; i++) if (std::strcmp(out[i], name) == 0) return;
-        if (n < cap) std::memcpy(out[n++], name, sizeof(name));
+        if (n < cap) std::memcpy(out[n++], name, std::strlen(name) + 1);   // the name and its NUL: not the stack bytes after it
     }
 };
 
@@ -1106,8 +1105,9 @@ bool alarm_key_parse(const char* key, AlarmKey* out) {
         {"vibration", AlarmKey::MOTION},     {"water_leak", AlarmKey::WATER_LEAK}, {"smoke", AlarmKey::SMOKE},
         {"gas", AlarmKey::GAS},              {"carbon_monoxide", AlarmKey::CO},
     };
+    if (!key) return false;
     for (const auto& k : kKeys) {
-        if (key && std::strcmp(key, k.name) == 0) { *out = k.key; return true; }
+        if (std::strcmp(key, k.name) == 0) { *out = k.key; return true; }
     }
     return false;
 }
@@ -1150,7 +1150,7 @@ uint8_t alarm_events(const AlarmConfig& c, const AlarmChange* ch, uint8_t n, con
         if (ch[i].to != ch[i].from) ev.add("alarm_%s_%s", alarm_state_name(ch[i].to), pr.id);   // the same name as above: once
     }
     if (intrusion_alarm) ev.add("alarm_triggered");
-    if (std::strcmp(summary_was, summary_now) != 0) ev.add("alarm_%s", summary_now);
+    if (summary_was && summary_now && std::strcmp(summary_was, summary_now) != 0) ev.add("alarm_%s", summary_now);
     return ev.n;
 }
 

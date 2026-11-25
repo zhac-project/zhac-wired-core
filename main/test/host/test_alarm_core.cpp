@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 static int g_fail = 0;
@@ -726,7 +727,7 @@ static void summary_and_keys() {
     p.tick(90); alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "triggered") == 0, "summary: triggered");
     CHECK(alarm_key_parse("contact", &k) && k == AlarmKey::CONTACT && alarm_key_parse("vibration", &k) && k == AlarmKey::MOTION &&
           alarm_key_parse("presence", &k) && k == AlarmKey::MOTION && alarm_key_parse("carbon_monoxide", &k) && k == AlarmKey::CO &&
-          alarm_key_parse("water_leak", &k) && k == AlarmKey::WATER_LEAK && !alarm_key_parse("tamper", &k) && !alarm_key_parse("alarm", &k), "sensor keys");
+          alarm_key_parse("water_leak", &k) && k == AlarmKey::WATER_LEAK && !alarm_key_parse("tamper", &k) && !alarm_key_parse("alarm", &k) && !alarm_key_parse(nullptr, &k) && !alarm_key_parse("", &k), "sensor keys");
 }
 static void changes_under_load() {
     static AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; AlarmSeen seen[kAlarmMaxProfiles]; AlarmChange ch[kAlarmMaxProfiles];
@@ -785,6 +786,46 @@ static void event_names() {
     CHECK(n == 2 && std::strcmp(ev[0], "alarm_disarmed_away") == 0 && std::strcmp(ev[1], "alarm_disarmed") == 0, "a disarm: its own and the stage 1 event");
     n = alarm_events(c, e, 2, "armed_home", "armed_night", ev, 1);
     CHECK(n == 1 && std::strcmp(ev[0], "alarm_disarmed_home") == 0, "a full list takes no more names");
+}
+// M15, M16: several changes in one pass come out in profile order, per change before the stage 1 names; a pass that has no
+// summary to compare (null) fires only the per-profile names; a name takes the bytes it has and no more.
+static void event_order() {
+    static AlarmConfig c = config(); char ev[20][kAlarmEventMax];
+    auto is = [&](uint8_t n, std::initializer_list<const char*> want) {
+        if (n != want.size()) return false;
+        uint8_t i = 0;
+        for (const char* w : want) if (std::strcmp(ev[i++], w) != 0) return false;
+        return true;
+    };
+    // home disarmed by command, night triggered, flood triggered and over again; the summary went armed_home -> triggered
+    const AlarmChange m[] = {{kHome, AlarmState::ARMED, AlarmState::DISARMED, 0, false, true},
+                             {kNight, AlarmState::DISARMED, AlarmState::TRIGGERED, 5, true, false},
+                             {kFlood, AlarmState::DISARMED, AlarmState::ARMED, 6, true, false}};
+    uint8_t n = alarm_events(c, m, 3, "armed_home", "triggered", ev, 20);
+    CHECK(is(n, {"alarm_disarmed_home", "alarm_triggered_night", "alarm_triggered_flood", "alarm_armed_flood", "alarm_triggered"}),
+          "three changes: profile order, each change's names, then the stage 1 alarm_triggered once (the summary's is the same name)");
+    n = alarm_events(c, m, 3, "armed_home", "triggered", ev, 4);
+    CHECK(is(n, {"alarm_disarmed_home", "alarm_triggered_night", "alarm_triggered_flood", "alarm_armed_flood"}), "a list of four stops after the fourth name");
+    n = alarm_events(c, m, 3, "armed_home", "triggered", ev, 0);
+    CHECK(n == 0, "a list of none takes none");
+    const AlarmChange a[] = {{kAway, AlarmState::DISARMED, AlarmState::ARMING, 0, false, false}};
+    n = alarm_events(c, a, 1, "disarmed", "arming", ev, 20);
+    CHECK(is(n, {"alarm_arming_away", "alarm_arming"}), "the summary's own name follows the change's, when it is another name");
+    n = alarm_events(c, m, 3, nullptr, nullptr, ev, 20);
+    CHECK(is(n, {"alarm_disarmed_home", "alarm_triggered_night", "alarm_triggered_flood", "alarm_armed_flood", "alarm_triggered"}),
+          "no summary names: the changes' names and the intrusion alarm come out, nothing is compared");
+    n = alarm_events(c, a, 1, "disarmed", nullptr, ev, 20);
+    CHECK(is(n, {"alarm_arming_away"}), "a summary now that is null: no stage 1 name");
+    n = alarm_events(c, a, 1, nullptr, "arming", ev, 20);
+    CHECK(is(n, {"alarm_arming_away"}), "a summary before that is null: no stage 1 name");
+    const AlarmChange gone[] = {{static_cast<uint8_t>(c.n_profiles), AlarmState::ARMED, AlarmState::DISARMED, 0, false, true},
+                                {kHome, AlarmState::ARMED, AlarmState::DISARMED, 0, false, true}};
+    n = alarm_events(c, gone, 2, "armed_home", "disarmed", ev, 20);
+    CHECK(is(n, {"alarm_disarmed_home", "alarm_disarmed"}), "a change of a profile the config does not have is skipped");
+    std::memset(ev, 'Z', sizeof(ev));
+    n = alarm_events(c, a, 1, "disarmed", "arming", ev, 20);
+    CHECK(n == 2 && ev[0][std::strlen("alarm_arming_away")] == '\0' && ev[0][std::strlen("alarm_arming_away") + 1] == 'Z' &&
+          ev[1][std::strlen("alarm_arming") + 1] == 'Z' && ev[2][0] == 'Z', "a name is copied with its NUL and not a byte more");
 }
 static void texts() {
     char t[64];
@@ -904,6 +945,7 @@ int main() {
     summary_and_keys();
     changes_under_load();
     event_names();
+    event_order();
     texts();
     outputs_plan();
     outputs_plan_classes();
