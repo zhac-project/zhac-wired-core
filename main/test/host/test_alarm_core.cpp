@@ -553,6 +553,112 @@ static void largest_config(AlarmConfig* c) {
     }
 }
 
+// A refusal, with its message exactly.
+static bool refused(const std::string& j, const char* msg) {
+    static AlarmConfig c; char err[160];
+    return !parse(j.c_str(), &c, err, sizeof(err)) && std::strcmp(err, msg) == 0;
+}
+// A profile object `n` of `count` profiles in a list: ids p0.., class other.
+static std::string profiles_of(unsigned count) {
+    std::string s = R"({"profiles":[)";
+    for (unsigned i = 0; i < count; i++) s += std::string(i ? "," : "") + R"({"id":"p)" + std::to_string(i) + R"(","name":"P","class":"other"})";
+    return s + "]}";
+}
+
+// M6: what the API form takes at its edges, and the refusal one step past each.
+static void config_boundaries() {
+    static AlarmConfig c; char err[160];
+    auto fits = [&](const std::string& j) { return parse(j.c_str(), &c, err, sizeof(err)); };
+    CHECK(fits(R"({"profiles":[{"id":"abcdefghijklm","name":"A","class":"fire"}]})") && std::strlen(c.profiles[0].id) == 13, "an id of 13 characters");
+    std::string n24;
+    for (int i = 0; i < 12; i++) n24 += "\xD0\x96";   // 12 two-byte letters: 24 bytes
+    CHECK(fits(R"({"profiles":[{"id":"a","name":")" + n24 + R"(","class":"fire"}]})") && std::strlen(c.profiles[0].name) == 24, "a name of 24 bytes");
+    CHECK(fits(R"({"profiles":[{"id":"a","name":"A","class":"fire","arm_delay":300,"trigger_delay":0,"siren_time":10},
+                              {"id":"b","name":"B","class":"fire","arm_delay":0,"trigger_delay":300,"siren_time":1800}]})") &&
+          c.profiles[0].arm_delay == 300 && c.profiles[0].trigger_delay == 0 && c.profiles[0].siren_time == 10 &&
+          c.profiles[1].arm_delay == 0 && c.profiles[1].trigger_delay == 300 && c.profiles[1].siren_time == 1800, "delays 0 and 300, siren time 10 and 1800");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A","class":"fire","arm_delay":-1}]})", "profiles[0]: arm_delay must be 0-300 s"), "an arm delay of -1");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A","class":"fire","trigger_delay":301}]})", "profiles[0]: trigger_delay must be 0-300 s"), "a trigger delay of 301");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A","class":"fire","siren_time":1801}]})", "profiles[0]: siren_time must be 10-1800 s"), "a siren time of 1801");
+    CHECK(fits(profiles_of(8)) && c.n_profiles == 8, "eight profiles");
+    CHECK(refused(profiles_of(9), "profiles: at most 8"), "nine profiles");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x5","kind":"warning"},{"ieee":"0x6","kind":"alarm"},{"ieee":"0x5","kind":"alarm"}]}]})",
+                  "profiles[0].outputs[2]: listed twice"), "an output device twice in one profile");
+    CHECK(fits(R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x5","kind":"warning"}]},
+                              {"id":"b","name":"B","class":"fire","outputs":[{"ieee":"0x5","kind":"warning"}]}]})") && c.n_outputs == 2,
+          "the same output device in two profiles is allowed");
+    const std::string st = R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x5","kind":"state","value":)";
+    CHECK(refused(st + R"("maybe"}]}]})", "profiles[0].outputs[0]: value must be on or off") &&
+          refused(st + R"(true}]}]})", "profiles[0].outputs[0]: value must be on or off"), "a state value that is not on or off");
+    CHECK(fits(st + R"("on"}]}]})") && c.outputs[0].value && fits(st + R"("off"}]}]})") && !c.outputs[0].value, "on and off");
+    const std::string rl = R"({"profiles":[{"id":"a","name":"A","class":")";
+    CHECK(fits(rl + R"(intrusion","role":""}]})") && c.profiles[0].role == AlarmRole::NONE && fits(rl + R"(fire","role":""}]})") &&
+          c.profiles[0].role == AlarmRole::NONE, "\"role\":\"\" is no role, for any class");
+    CHECK(refused(rl + R"(intrusion","role":"day"}]})", "profiles[0]: role is away, home or night, for an intrusion profile only") &&
+          refused(rl + R"(intrusion","role":7}]})", "profiles[0]: role is away, home or night, for an intrusion profile only"), "a role that is no mode");
+}
+
+// M6: the largest API form (every limit at once) written and read back.
+static void largest_api_form() {
+    static AlarmConfig c, k; char err[160]; std::string json;
+    largest_config(&c);
+    JsonDocument d; alarm_cfg_write(c, true, d.to<JsonObject>());
+    serializeJson(d, json);
+    CHECK(json.size() > 16000 && json.size() < 32000, "the largest API form is about 20 KB (`same` compares up to 32 KB)");
+    CHECK(parse(json.c_str(), &k, err, sizeof(err)) && k.n_profiles == 8 && k.n_sensors == 48 && k.n_outputs == 32 && k.n_keypads == 8 && k.n_codes == 8 &&
+          same(c, k), "it reads back whole");
+    bool fields = true;
+    for (uint8_t i = 0; i < 8; i++)
+        fields = fields && std::strcmp(k.profiles[i].id, c.profiles[i].id) == 0 && std::strcmp(k.profiles[i].name, c.profiles[i].name) == 0 &&
+                 k.profiles[i].cls == c.profiles[i].cls && k.profiles[i].role == c.profiles[i].role && k.profiles[i].arm_delay == 300 &&
+                 k.profiles[i].trigger_delay == 300 && k.profiles[i].siren_time == 1800 && k.profiles[i].notify_arm;
+    for (uint8_t i = 0; i < 48; i++) fields = fields && k.sensors[i].ieee == c.sensors[i].ieee && k.sensors[i].profiles == 0xFF && k.sensors[i].entry == 0xFF;
+    for (uint8_t i = 0; i < 32; i++)
+        fields = fields && k.outputs[i].profile == i / 8 && k.outputs[i].ieee == c.outputs[i].ieee && std::strcmp(k.outputs[i].melody, c.outputs[i].melody) == 0 &&
+                 std::strcmp(k.outputs[i].volume, c.outputs[i].volume) == 0;
+    for (uint8_t i = 0; i < 8; i++) fields = fields && k.keypads[i].ieee == c.keypads[i].ieee && k.keypads[i].trusted == c.keypads[i].trusted && std::strcmp(k.codes[i], c.codes[i]) == 0;
+    CHECK(fields, "field by field: ids, 24-byte names, delays, 48 sensors in 8 profiles, 32 outputs, keypads and codes");
+    static char buf[kAlarmStoredMax];
+    const size_t n = alarm_cfg_pack(k, buf, sizeof(buf));
+    CHECK(n && n <= kAlarmStoredMax, "and what was read from it is packed into the stored form");
+}
+
+// M10: text a profile or an output may not carry, and the limits of every list.
+static void config_text_and_limits() {
+    static AlarmConfig c; char err[160];
+    auto fits = [&](const std::string& j) { return parse(j.c_str(), &c, err, sizeof(err)); };
+    const std::string al = R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[{"ieee":"0x1","kind":"alarm",)";
+    CHECK(refused(al + R"("volume":"a\u0001b"}]}]})", "profiles[0].outputs[0]: volume must be plain text of up to 23 bytes"), "a control character in a volume");
+    CHECK(refused(al + R"("volume":"a\u007fb"}]}]})", "profiles[0].outputs[0]: volume must be plain text of up to 23 bytes"), "0x7F in a volume");
+    CHECK(refused(al + R"("melody":"a\u007fb"}]}]})", "profiles[0].outputs[0]: melody must be plain text of up to 23 bytes"), "0x7F in a melody");
+    CHECK(refused(al + R"("melody":"a\u001fb"}]}]})", "profiles[0].outputs[0]: melody must be plain text of up to 23 bytes"), "0x1F (the last control character) in a melody");
+    CHECK(fits(al + R"("melody":"a b","volume":"2 high"}]}]})") && std::strcmp(c.outputs[0].volume, "2 high") == 0, "0x20 (a space) is text");
+    CHECK(fits(al + R"("melody":"12345678901234567890123"}]}]})") && std::strlen(c.outputs[0].melody) == 23, "a melody of 23 bytes");
+    CHECK(refused(al + R"("volume":"123456789012345678901234"}]}]})", "profiles[0].outputs[0]: volume must be plain text of up to 23 bytes"), "a volume of 24 bytes");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A\u007fB","class":"fire"}]})", "profiles[0]: name must be 1-24 bytes of text"), "0x7F in a name");
+    CHECK(refused(R"({"profiles":[{"id":"a","name":"A\u001fB","class":"fire"}]})", "profiles[0]: name must be 1-24 bytes of text"), "0x1F in a name");
+    CHECK(fits(R"({"profiles":[{"id":"a","name":" A B ","class":"fire"}]})") && std::strcmp(c.profiles[0].name, " A B ") == 0, "spaces in a name");
+    // Over the limit of each list: the edge is taken, the next one refused.
+    std::string o8, o9, k8, k9, c8, c9;
+    for (unsigned i = 0; i < 9; i++) {
+        const std::string o = std::string(i ? "," : "") + R"({"ieee":"0x)" + std::to_string(i + 1) + R"(","kind":"warning"})";
+        const std::string kp = std::string(i ? "," : "") + R"({"ieee":"0x)" + std::to_string(i + 1) + R"("})";
+        const std::string cd = std::string(i ? "," : "") + R"("100)" + std::to_string(i) + R"(")";
+        o9 += o; k9 += kp; c9 += cd;
+        if (i < 8) { o8 += o; k8 += kp; c8 += cd; }
+    }
+    const std::string pr = R"({"profiles":[{"id":"a","name":"A","class":"fire","outputs":[)";
+    CHECK(fits(pr + o8 + "]}]}") && c.n_outputs == 8, "eight outputs in a profile");
+    CHECK(refused(pr + o9 + "]}]}", "profiles[0].outputs: at most 8"), "nine outputs in a profile");
+    CHECK(fits(R"({"profiles":[],"keypads":[)" + k8 + "]}") && c.n_keypads == 8, "eight keypads");
+    CHECK(refused(R"({"profiles":[],"keypads":[)" + k9 + "]}", "keypads: at most 8"), "nine keypads");
+    CHECK(fits(R"({"profiles":[],"codes":[)" + c8 + "]}") && c.n_codes == 8, "eight codes");
+    CHECK(refused(R"({"profiles":[],"codes":[)" + c9 + "]}", "codes: at most 8"), "nine codes");
+    CHECK(refused(profiles_of(9), "profiles: at most 8"), "nine profiles: the list limit, with the others");
+    CHECK(refused(R"({"profiles":[],"keypads":{}})", "keypads must be a list") && refused(R"({"profiles":[],"codes":"1234"})", "codes must be a list"),
+          "a keypads or codes that is no list");
+}
+
 static void stored_config() {
     static AlarmConfig c, k; char err[160]; static char buf[kAlarmStoredMax];
     parse(R"({"profiles":[{"id":"away","name":"Away","class":"intrusion","role":"away","arm_delay":30,"trigger_delay":30,
@@ -995,7 +1101,10 @@ int main() {
     config_errors();
     config_needs_profiles();
     sensor_rows();
+    config_boundaries();
+    config_text_and_limits();
     stage1_config();
+    largest_api_form();
     stored_config();
     stored_config_shape();
     stored_escapes();
