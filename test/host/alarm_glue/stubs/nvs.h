@@ -42,8 +42,9 @@ inline esp_err_t nvs_erase_key(nvs_handle_t, const char* k) {
 }
 inline esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
 inline void nvs_close(nvs_handle_t) {}
-inline esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* d, size_t* n) {
+inline esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* d, size_t* n) {   // no `d`: the length only, as in IDF
     auto it = g_nvs.find(k);
+    if (it != g_nvs.end() && !d) { *n = it->second.size(); return ESP_OK; }
     if (it == g_nvs.end() || it->second.size() > *n) return ESP_FAIL;
     std::memcpy(d, it->second.data(), it->second.size());
     *n = it->second.size();

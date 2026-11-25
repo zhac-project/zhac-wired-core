@@ -80,6 +80,7 @@ Orphan       s_orphans[kAlarmMaxOutputs];
 uint8_t      s_n_orphans = 0;
 uint32_t     s_kept_alarms[kAlarmMaxProfiles];   // by profile: the alarms whose outputs left as set are set or queued
 bool         s_boot_stop_now = false;   // a disarm: the boot stop's outputs are not left on until its minute is over
+bool         s_cfg_fallback = false;  // "cfg2" is there but this boot runs on another config: no state record till a save
 bool         s_resync = false;        // a save swapped the config: the task takes a pass over it
 bool         s_ids_changed = false;   // ... and the Alarm device has another list of attributes
 
@@ -382,7 +383,7 @@ struct Act {
 // writes into it, the records are only written from it.
 struct Pass {
     uint8_t      n_ch, n_prof, n_ev, n_orphans, n_act;
-    bool         running, resync, ids_changed;
+    bool         running, resync, ids_changed, cfg_fallback;
     AlarmChange  ch[kAlarmMaxProfiles];
     bool         panic[kAlarmMaxProfiles];   // by change: the alarm came from a keypad, not from a sensor
     AlarmProfile prof[kAlarmMaxProfiles];    // the profiles and their states as of this look
@@ -437,6 +438,7 @@ void look(uint32_t now, bool boot_stop, Pass& p) {
     p.running     = s_panel->running();
     p.resync      = s_resync;
     p.ids_changed = s_ids_changed;
+    p.cfg_fallback = s_cfg_fallback;
     s_resync = s_ids_changed = false;
     p.n_prof = s_cfg->n_profiles;
     for (uint8_t i = 0; i < p.n_prof; i++) {
@@ -525,8 +527,9 @@ bool put_state(const char* key, const void* d, size_t n, SaveRetry<N>& r, const 
 // logged and the change still takes effect; a failed "st" leaves the two agreeing. A record that failed is tried again
 // at its next change, or kSaveRetryS later (put_state). Flash that comes to agree without a write ends a run of failures.
 // After a save's own write of "st2" the copy of it is dropped: the look's states are written whatever it said (NVS
-// skips a blob it holds already).
+// skips a blob it holds already). Neither record on a fallback config: they keep the states of the stored one's profiles.
 void save_states(const Pass& p) {
+    if (p.cfg_fallback) return;
     if (s_st_have && std::memcmp(p.st, s_st_saved, sizeof(p.st)) == 0) {
         s_st_retry.len = 0;
         s_st_retry.failing = false;
@@ -883,6 +886,10 @@ void alarm_early_init() {
         have = alarm_cfg_unpack(buf, len, s_cfg, psram_json());
         if (!have) ESP_LOGE(TAG, "stored config unreadable: trying the stage 1 one");
     }
+    // "cfg2" is there but not read: this boot runs on another config (stage 1's too), and the state records hold the
+    // states of profiles it may lack. The task writes neither until a save. Asked by length only: no read target.
+    s_cfg_fallback = !have && nvs_get("cfg2", nullptr, 0);
+    if (s_cfg_fallback) ESP_LOGE(TAG, "the stored config is not in use: the states are not saved until a config is saved");
     if (!have) {
         if (const size_t len = buf ? nvs_get("cfg", buf, kAlarmStoredMax) : 0) {
             char err[96] = "";
@@ -1188,6 +1195,7 @@ bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
             std::memset(s_pad, 0, sizeof(s_pad));
             s_resync        = true;
             s_ids_changed   = s_ids_changed || ids;
+            s_cfg_fallback  = false;   // the config in force is the stored one again
             std::swap(s_cfg, next);   // `next` and `panel` now hold the old ones, freed below
             std::swap(s_panel, panel);
             states = alarm_states_pack(*s_cfg, *s_panel, buf, kStatesMax, have_st ? st : nullptr);

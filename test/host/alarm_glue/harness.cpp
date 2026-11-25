@@ -1094,6 +1094,54 @@ int restart_flow() {
             CHECK(h::alarm_attrs["flood"] == "armed", "after a power cut, flood comes back armed");
         });
     }
+
+    // ── A boot that does not run on the stored config (unreadable here, or no RAM to read it) writes no state record,
+    //    also when the stage 1 config is read instead: the records keep the states of the stored profiles, which the next
+    //    boot that reads it brings back. It says so once. A save ends that (final review, Minor 6) ──
+    static const std::string flood_armed = R"({"v":1,"l":[0,0],"p":[["away",0,0],["night",0,0],["flood",2,1]]})";
+    for (const bool stage1 : {false, true}) {
+        g_nvs = {{"cfg2", "not a config"}, {"st2", flood_armed}, {"st", std::string("\0\0", 2)}};
+        if (stage1) g_nvs["cfg"] = R"({"exit_delay":0,"entry_delay":20,"siren_time":120,"notify_arm":false,
+          "sensors":[{"ieee":"0x1","modes":["away"],"entry":true}],"sirens":[],"keypads":[],"codes":[]})";
+        boot_run([stage1] {
+            h::boot();
+            run_task();
+            CHECK(h::alarm_attrs.count("home") == 1 && h::logged("states are not saved") == 1,
+                  stage1 ? "the stage 1 config, and the log says the states are not saved" : "the defaults, and the log says the states are not saved");
+            CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "away armed");
+            run_task(1);
+            CHECK(cnt("nvs:") == 0 && g_nvs["st2"] == flood_armed && g_nvs["st"] == std::string("\0\0", 2),
+                  stage1 ? "on the stage 1 config, no state record is written" : "on the defaults, no state record is written");
+        });   // the power goes
+        g_nvs["cfg2"] = packed(kCfg);   // the next boot reads the stored config
+        boot_run([] {
+            h::boot();
+            run_task();
+            CHECK(h::alarm_attrs["flood"] == "armed" && h::alarm_attrs["away"] == "disarmed", "the next boot that reads it: flood armed, as stored");
+        });
+    }
+    g_nvs = {{"cfg2", "not a config"}, {"st2", flood_armed}, {"st", std::string("\0\0", 2)}};
+    boot_run([] {
+        h::boot();
+        run_task();
+        g_trace.clear();
+        std::string why;
+        CHECK(h::save(kCfg, &why), why.c_str());
+        CHECK(cnt("nvs:st2") == 1, "a save on the fallback writes the states");
+        CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "away armed");
+        run_task();
+        CHECK(g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos && g_nvs["st"] == std::string("\2\2", 2),
+              "and the task writes them again after it: the save ended the fallback");
+    });
+    g_nvs.clear();
+    boot_run([] {
+        h::boot();
+        run_task();
+        CHECK(cnt("nvs:st2") == 1 && h::logged("states are not saved") == 0, "a hub with no stored config writes its states, as before");
+        CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK, "away armed");
+        run_task(31);   // the defaults' 30 s arm delay
+        CHECK(g_nvs["st2"].find("[\"away\",2,1]") != std::string::npos, "and an arm");
+    });
     return 0;
 }
 
