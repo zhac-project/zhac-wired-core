@@ -661,6 +661,24 @@ static void adopt_states() {
     CHECK(s.at(0).state == AlarmState::TRIGGERED && s.at(0).cause == ieee_of(sSmoke) && s.at(0).alarms == 2,
           "the hazard check still owed is run at the next tick");
 }
+// M9: a bypass belongs to the profile the sensor is in. A save that takes the sensor out of an armed profile ends it there,
+// and a later save that puts it back does not bring it back.
+static void adopt_bypass_leaves_profile() {
+    AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0;
+    p.sensor(sWindow, AlarmKey::CONTACT, true, 1);
+    p.arm(kNight, true, 2, &open);                               // forced: the open window is bypassed in night
+    CHECK(p.at(kNight).bypass == (1ull << sWindow), "the window is bypassed in night");
+    AlarmConfig d = config(); d.sensors[sWindow].profiles = 0x01;   // a save: the window is in away only (still a sensor of the config)
+    AlarmPanel q(&d); q.adopt(p, c);
+    CHECK(q.at(kNight).state == AlarmState::ARMED && q.at(kNight).bypass == 0, "a save that takes the sensor out of night leaves no bypass there");
+    AlarmPanel r(&c); r.adopt(q, d);                             // a later save puts it back; night is still armed
+    CHECK(r.at(kNight).state == AlarmState::ARMED && r.at(kNight).bypass == 0, "put back: not bypassed");
+    r.sensor(sWindow, AlarmKey::CONTACT, false, 10); r.sensor(sWindow, AlarmKey::CONTACT, true, 11);
+    CHECK(r.at(kNight).state == AlarmState::TRIGGERED && r.at(kNight).cause == ieee_of(sWindow), "and it guards night again");
+    AlarmConfig e = config(); AlarmPanel s(&e);                  // a save that keeps it in the profile keeps the bypass
+    s.adopt(p, c);
+    CHECK(s.at(kNight).bypass == (1ull << sWindow), "a sensor that stays in the profile stays bypassed");
+}
 static void summary_and_keys() {
     static AlarmConfig c = config(); AlarmPanel p(&c); uint64_t open = 0; char s[24]; AlarmKey k;
     alarm_summary_name(c, p, s, sizeof(s)); CHECK(std::strcmp(s, "disarmed") == 0, "summary: disarmed");
@@ -819,6 +837,7 @@ int main() {
     stage1_state();
     states_of_two_firmwares();
     adopt_states();
+    adopt_bypass_leaves_profile();
     summary_and_keys();
     changes_under_load();
     event_names();
