@@ -46,6 +46,8 @@ constexpr const char* kNs             = "sound";
 constexpr size_t      kBlock          = 256;                   // samples per render and per DMA buffer: 16 ms
 constexpr uint32_t    kLingerBlocks   = kSoundRate / kBlock;   // ~1 s of silence before the amplifier goes off
 constexpr uint32_t    kWriteTimeoutMs = 100;
+constexpr int         kProbeTries     = 3;                     // chip-ID asks before the board counts as speakerless
+constexpr uint32_t    kProbeGapMs     = 20;
 constexpr uint32_t    kIdleWakeMs     = 60000;                 // the idle task still wakes this often
 constexpr int64_t     kSeenEveryUs    = 55LL * 1000000;        // under kIdleWakeMs: an idle wake always passes it
 constexpr gpio_num_t  kPa             = static_cast<gpio_num_t>(CONFIG_ZHAC_AUDIO_PA_GPIO);
@@ -124,7 +126,10 @@ void touch_last_seen() {   // the speaker is always there; never called with s_m
 
 // ── Boot ──
 
-// The I2C bus and the chip-ID check. No codec: the bus goes and SDA/SCL are reset, as before.
+// The I2C bus and the chip-ID check. One missed answer must not make the board speakerless (that removes the
+// stored Hub Sound device and its name and room), so the chip ID is asked up to kProbeTries times, kProbeGapMs
+// apart, on the one bus. es8311_probe leaves no device handle on the bus when it fails, so a retry adds none twice.
+// No codec: the bus goes and SDA/SCL are reset, as before.
 bool probe() {
     i2c_master_bus_config_t bc = {};
     bc.i2c_port          = -1;   // any free port
@@ -133,9 +138,14 @@ bool probe() {
     bc.clk_source        = I2C_CLK_SRC_DEFAULT;
     bc.glitch_ignore_cnt = 7;
     bc.flags.enable_internal_pullup = 1;
-    if (i2c_new_master_bus(&bc, &s_bus) == ESP_OK && es8311_probe(s_bus, &s_dev)) {
-        ESP_LOGI(TAG, "ES8311 found");
-        return true;
+    if (i2c_new_master_bus(&bc, &s_bus) == ESP_OK) {
+        for (int i = 0; i < kProbeTries; i++) {
+            if (i) vTaskDelay(pdMS_TO_TICKS(kProbeGapMs));
+            if (es8311_probe(s_bus, &s_dev)) {
+                ESP_LOGI(TAG, "ES8311 found");
+                return true;
+            }
+        }
     }
     if (s_bus) i2c_del_master_bus(s_bus);
     s_bus = nullptr;
