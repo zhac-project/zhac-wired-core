@@ -246,6 +246,18 @@ menu "ZHAC wired-core board"
         default 53 if IDF_TARGET_ESP32P4
         default 57 if IDF_TARGET_ESP32S31
 
+    config ZHAC_AUDIO_PA_LEAD_MS
+        int "Hub speaker: silence while the amplifier wakes, ms (0-500)"
+        depends on ZHAC_AUDIO
+        range 0 500
+        default 150
+        help
+            The amplifier is off after about a second of silence. A sound that
+            starts then switches it on and first plays this much silence: the
+            NS4150B mutes its output while it wakes. On the P4-NANO kit, by ear,
+            50 ms of lead still cut the start of a beep and 100 ms did not.
+            Every sound after a silence starts this much later.
+
     config ZHAC_WIFI_HOSTED
         bool "Wi-Fi through an ESP-Hosted co-processor (test variant)"
         depends on IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31

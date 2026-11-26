@@ -51,6 +51,9 @@ constexpr uint32_t    kProbeGapMs     = 20;
 constexpr uint32_t    kIdleWakeMs     = 60000;                 // the idle task still wakes this often
 constexpr int64_t     kSeenEveryUs    = 55LL * 1000000;        // under kIdleWakeMs: an idle wake always passes it
 constexpr gpio_num_t  kPa             = static_cast<gpio_num_t>(CONFIG_ZHAC_AUDIO_PA_GPIO);
+constexpr size_t      kLeadBlocks     =                        // silence while the amplifier wakes, whole blocks
+    (CONFIG_ZHAC_AUDIO_PA_LEAD_MS * kSoundRate / 1000 + kBlock - 1) / kBlock;
+constexpr int16_t     kSilence[kBlock] = {};
 static_assert(kSoundRate == 16000, "es8311.cpp holds the clock row for 16 kHz only");
 
 constexpr int kPins[] = {
@@ -167,11 +170,24 @@ bool probe() {
 
 // ── The render task ──
 
-// Plays the player block by block. The amplifier goes on once a sound's first block is queued, and off after
-// ~1 s of silence; a sound in that second keeps it on. Idle with it off, the task saves a changed volume or
-// mute, then sleeps until a caller's notify, a minute at most. The I2S channel runs throughout and sends
-// zeros whenever no block is queued. Every pass, whatever plays, also keeps the Hub Sound device's last_seen
-// current (kSeenEveryUs): a loop can keep the idle wait away for 10 min.
+// One block to the I2S queue. It waits while all four DMA buffers are full (16 ms each); the first failure
+// is logged.
+void write_block(const int16_t* b, bool* warned) {
+    size_t done = 0;
+    const esp_err_t e = i2s_channel_write(s_tx, b, kBlock * sizeof(b[0]), &done, kWriteTimeoutMs);
+    if (e != ESP_OK && !*warned) {
+        *warned = true;
+        ESP_LOGW(TAG, "I2S write: %s", esp_err_to_name(e));
+    }
+}
+
+// Plays the player block by block. A sound that starts while the amplifier is off switches it on and first
+// plays CONFIG_ZHAC_AUDIO_PA_LEAD_MS of silence: the amplifier mutes its output while it wakes, and the first
+// ~50-100 ms of a sound were lost (a whole `beep`, by ear on the P4-NANO kit). It goes off after ~1 s of
+// silence; a sound in that second keeps it on and starts at once. Idle with it off, the task saves a changed
+// volume or mute, then sleeps until a caller's notify, a minute at most. The I2S channel runs throughout and
+// sends zeros whenever no block is queued. Every pass, whatever plays, also keeps the Hub Sound device's
+// last_seen current (kSeenEveryUs): a loop can keep the idle wait away for 10 min.
 void sound_task(void*) {
     bool     amp = false;
     uint32_t quiet = 0;          // silent blocks written since the last sound
@@ -203,17 +219,13 @@ void sound_task(void*) {
             amp = false;
             continue;
         }
-        std::memset(s_buf + n, 0, (kBlock - n) * sizeof(s_buf[0]));
-        size_t done = 0;
-        const esp_err_t e = i2s_channel_write(s_tx, s_buf, sizeof(s_buf), &done, kWriteTimeoutMs);
-        if (e != ESP_OK && !warned) {
-            warned = true;
-            ESP_LOGW(TAG, "I2S write: %s", esp_err_to_name(e));
-        }
-        if (n && !amp && e == ESP_OK) {
+        if (n && !amp) {   // the sound's first block waits in s_buf while the amplifier wakes
             gpio_set_level(kPa, 1);
             amp = true;
+            for (size_t i = 0; i < kLeadBlocks; i++) write_block(kSilence, &warned);
         }
+        std::memset(s_buf + n, 0, (kBlock - n) * sizeof(s_buf[0]));
+        write_block(s_buf, &warned);
     }
 }
 
