@@ -17,9 +17,10 @@
 constexpr uint64_t kHubSoundIeee = 0x025A484143534E00ULL;
 
 // Boot, in this order (app_main): the stored volume and mute, the codec probe (a match claims the pins, so
-// before user_io_early_init) and the rule hooks (before simple_rules_init), with or without a codec ...
+// before user_io_early_init; it also drives the amplifier pin low at once) and the rule hooks (before
+// simple_rules_init), with or without a codec ...
 void sound_early_init();
-// ... then I2S, the codec, the amplifier pin (low) and the render task. A failure sets sound_error().
+// ... then I2S, the codec, the amplifier pin (low again) and the render task. A failure sets sound_error().
 void sound_start();
 
 bool        sound_present();           // the codec's chip ID matched

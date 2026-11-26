@@ -126,6 +126,16 @@ void touch_last_seen() {   // the speaker is always there; never called with s_m
 
 // ── Boot ──
 
+// The amplifier's enable pin: low, then an output. A floating enable line can hiss or pop a board without a
+// pull-down, so sound_early_init does this as soon as the codec answers, and start() again before the stream.
+esp_err_t pa_low() {
+    gpio_config_t pa = {};
+    pa.pin_bit_mask = 1ULL << CONFIG_ZHAC_AUDIO_PA_GPIO;
+    pa.mode         = GPIO_MODE_OUTPUT;
+    if (const esp_err_t e = gpio_set_level(kPa, 0); e != ESP_OK) return e;
+    return gpio_config(&pa);
+}
+
 // The I2C bus and the chip-ID check. One missed answer must not make the board speakerless (that removes the
 // stored Hub Sound device and its name and room), so the chip ID is asked up to kProbeTries times, kProbeGapMs
 // apart, on the one bus. es8311_probe leaves no device handle on the bus when it fails, so a retry adds none twice.
@@ -210,10 +220,7 @@ void sound_task(void*) {
 // The amplifier pin (low), I2S, the codec, the task. nullptr when all of it runs, else the step that failed
 // (why in *e); a failure after the I2S start stops the stream again.
 const char* start(esp_err_t* e) {
-    gpio_config_t pa = {};
-    pa.pin_bit_mask = 1ULL << CONFIG_ZHAC_AUDIO_PA_GPIO;
-    pa.mode         = GPIO_MODE_OUTPUT;
-    if ((*e = gpio_set_level(kPa, 0)) != ESP_OK || (*e = gpio_config(&pa)) != ESP_OK) return "amplifier pin";
+    if ((*e = pa_low()) != ESP_OK) return "amplifier pin";
 
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     cc.dma_desc_num  = 4;
@@ -341,7 +348,10 @@ void sound_early_init() {
     sound_player_set_volume(&s_player, load_u8("vol", static_cast<uint8_t>(s_player.volume)));
     sound_player_set_muted(&s_player, load_u8("muted", 0) != 0);
     s_present = probe();
-    if (s_present) local_dev_register(kHubSoundIeee, local_cmd, local_exposes);   // before any command can come
+    if (s_present) {
+        pa_low();   // the codec answered, so the pin is ours; a failure shows again in start(), which reports it
+        local_dev_register(kHubSoundIeee, local_cmd, local_exposes);   // before any command can come
+    }
     simple_rules_set_sound_hooks(rules_check, rules_run);   // with or without a codec: the check says which
 }
 
