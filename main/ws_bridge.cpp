@@ -647,7 +647,7 @@ static void cmd_device_list(int fd, uint32_t id, JsonDocument& doc) {
         o["lqi"]          = d.link_quality;
         o["battery"]      = d.battery_pct;
         o["ep_count"]     = d.endpoint_count;
-        if (d.protocol == PROTO_LOCAL) o["local"] = true;   // Hub I/O: UIs hide the Zigbee buttons
+        if (d.protocol == PROTO_LOCAL) o["local"] = true;   // Hub I/O, Alarm, Hub Sound: UIs hide the Zigbee buttons
     }
     zigbee_pool_unlock();
 
@@ -1965,7 +1965,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         return;
     }
     if (std::strcmp(cmd, "auth")               == 0) { reply_ok_or_err(fd, id, true, nullptr); return; }
-    // The hub's own devices (Hub I/O, Alarm) have no radio: Zigbee-only commands refuse them (spec §2).
+    // The hub's own devices (Hub I/O, Alarm, Hub Sound) have no radio: Zigbee-only commands refuse them (spec §2).
     static constexpr const char* kZigbeeOnly[] = {"device.bind", "device.reinterview", "device.configure",
                                                   "device.groups.add", "device.groups.remove", "device.groups.refresh"};
     for (const char* z : kZigbeeOnly) {

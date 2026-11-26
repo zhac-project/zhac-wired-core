@@ -169,12 +169,13 @@ static void loop_gap() {
 static void tone() {
     SoundVoice v;
     CHECK(!sound_voice_tone(&v, 99, 100, 70), "tone: 99 Hz is refused");
-    CHECK(!sound_voice_tone(&v, 8001, 100, 70), "tone: 8001 Hz is refused");
+    CHECK(!sound_voice_tone(&v, 7901, 100, 70), "tone: 7901 Hz is refused");
+    CHECK(!sound_voice_tone(&v, 8000, 100, 70), "tone: 8000 Hz is refused (Nyquist at 16 kHz: silent)");
     CHECK(!sound_voice_tone(&v, 440, 0, 70), "tone: 0 ms is refused");
     CHECK(!sound_voice_tone(&v, 440, 10001, 70), "tone: 10001 ms is refused");
     CHECK(!sound_voice_tone(nullptr, 440, 100, 70), "tone: a null voice is refused");
     CHECK(sound_voice_tone(&v, 100, 1, 70) && render_all(v).size() == 16, "tone: 100 Hz, 1 ms is accepted (16 samples)");
-    CHECK(sound_voice_tone(&v, 8000, 10000, 70) && render_all(v).size() == 160000, "tone: 8000 Hz, 10000 ms is accepted");
+    CHECK(sound_voice_tone(&v, 7900, 10000, 70) && render_all(v).size() == 160000, "tone: 7900 Hz, 10000 ms is accepted");
     CHECK(sound_voice_tone(&v, 1000, 1000, 70), "tone: 1000 Hz, 1000 ms is accepted");
     const auto s = render_all(v);
     CHECK(s.size() == 16000, "tone: renders 16000 samples");
@@ -195,8 +196,10 @@ static void melody() {
     CHECK(!sound_voice_melody(&v, nullptr, 3, 70), "melody: a null list is refused");
     const SoundNote low[] = {{440, 100}, {50, 100}};
     CHECK(!sound_voice_melody(&v, low, 2, 70), "melody: a note of 50 Hz is refused");
-    const SoundNote high[] = {{8001, 100}};
-    CHECK(!sound_voice_melody(&v, high, 1, 70), "melody: a note of 8001 Hz is refused");
+    const SoundNote high[] = {{7901, 100}}, nyquist[] = {{8000, 100}}, top[] = {{7900, 100}};
+    CHECK(!sound_voice_melody(&v, high, 1, 70), "melody: a note of 7901 Hz is refused");
+    CHECK(!sound_voice_melody(&v, nyquist, 1, 70), "melody: a note of 8000 Hz is refused");
+    CHECK(sound_voice_melody(&v, top, 1, 70), "melody: a note of 7900 Hz is accepted");
     const SoundNote zero[] = {{440, 0}};
     CHECK(!sound_voice_melody(&v, zero, 1, 70), "melody: a note of 0 ms is refused");
     const SoundNote longer[] = {{440, 10001}};
@@ -274,7 +277,7 @@ static void result_texts() {
           !std::strcmp(sound_result_text(SoundResult::BUSY), "an urgent sound is playing") &&
           !std::strcmp(sound_result_text(SoundResult::UNKNOWN), "unknown sound") &&
           !std::strcmp(sound_result_text(SoundResult::NO_LOOP), "this sound cannot loop") &&
-          !std::strcmp(sound_result_text(SoundResult::BAD_ARG), "bad value (volume 0-100, hz 100-8000, ms 1-10000, 1-32 notes)") &&
+          !std::strcmp(sound_result_text(SoundResult::BAD_ARG), "bad value (volume 0-100, hz 100-7900, ms 1-10000, 1-32 notes)") &&
           !std::strcmp(sound_result_text(SoundResult::ABSENT), "no speaker on this hub"),
           "texts: every result has its text");
 }
@@ -527,6 +530,50 @@ static void exposes() {
           "exposes: the Hub Sound's exposes fit an alarm warning output");
 }
 
+// A refusal's text: ABSENT says why when the codec answered but did not start (review L195).
+static void refusals() {
+    const char* off = "I2S setup failed: ESP_ERR_INVALID_STATE";
+    char b[96];
+    sound_refusal(SoundResult::ABSENT, "", b, sizeof(b));
+    CHECK(!std::strcmp(b, "no speaker on this hub"), "refusal: no codec is no speaker on this hub");
+    sound_refusal(SoundResult::ABSENT, nullptr, b, sizeof(b));
+    CHECK(!std::strcmp(b, "no speaker on this hub"), "refusal: no reason given is no speaker on this hub");
+    sound_refusal(SoundResult::ABSENT, off, b, sizeof(b));
+    CHECK(!std::strcmp(b, "speaker off: I2S setup failed: ESP_ERR_INVALID_STATE"), "refusal: a speaker that did not start says why");
+    sound_refusal(SoundResult::MUTED, off, b, sizeof(b));
+    CHECK(!std::strcmp(b, "muted"), "refusal: any other result keeps its text");
+    char s[8];
+    sound_refusal(SoundResult::ABSENT, off, s, sizeof(s));
+    CHECK(!std::strcmp(s, "speaker"), "refusal: a short buffer is cut and ended");
+}
+
+// simple_rules' parse-time check of sound.play / sound.stop (review L195, and M11's check texts).
+static void rule_check() {
+    const char* off = "I2S setup failed: ESP_ERR_INVALID_STATE";
+    char e[256];
+    CHECK(!sound_rule_check(false, "", "chime", false, e, sizeof(e)) && !std::strcmp(e, "no speaker on this hub"),
+          "rule check: no codec refuses");
+    CHECK(!sound_rule_check(true, off, "chime", false, e, sizeof(e)) &&
+              !std::strcmp(e, "speaker off: I2S setup failed: ESP_ERR_INVALID_STATE"),
+          "rule check: a speaker that did not start refuses and says why");
+    CHECK(!sound_rule_check(true, off, nullptr, false, e, sizeof(e)) && !std::strncmp(e, "speaker off: ", 13),
+          "rule check: ... a bare sound.stop too, as with no codec");
+    CHECK(sound_rule_check(true, "", "chime", false, e, sizeof(e)), "rule check: a known sound passes");
+    CHECK(sound_rule_check(true, "", "beep", true, e, sizeof(e)), "rule check: a loop of a loopable sound passes");
+    CHECK(sound_rule_check(true, "", nullptr, false, e, sizeof(e)) && sound_rule_check(true, "", "", false, e, sizeof(e)),
+          "rule check: a bare sound.stop passes");
+    CHECK(!sound_rule_check(true, "", "gong", false, e, sizeof(e)) &&
+              !std::strcmp(e, "unknown sound, use: beep,double_beep,triple_beep,chime,doorbell,westminster,notify,"
+                              "success,error,warning,armed,disarmed,alarm,siren,fire,co"),
+          "rule check: an unknown sound lists every name");
+    CHECK(!sound_rule_check(true, "", "chime", true, e, sizeof(e)) &&
+              !std::strcmp(e, "chime cannot loop, loopable: beep,double_beep,triple_beep,warning,alarm,siren,fire,co"),
+          "rule check: a loop of a sound that cannot loop lists the loopable ones");
+    char s[24];
+    CHECK(!sound_rule_check(true, "", "gong", false, s, sizeof(s)) && std::strlen(s) == sizeof(s) - 1,
+          "rule check: a short buffer is cut and ended");
+}
+
 int main() {
     table();
     lengths();
@@ -546,6 +593,8 @@ int main() {
     warning();
     warn_timing();
     exposes();
+    refusals();
+    rule_check();
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

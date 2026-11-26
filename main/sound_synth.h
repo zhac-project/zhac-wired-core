@@ -50,8 +50,8 @@ struct SoundVoice {
 // max_ms caps the sound whether it loops or not; 0 (or a value past it) = kSoundLoopCapMs. The cut fades
 // out over at most 10 ms and ends at the cap. loop on a sound that cannot loop is refused.
 bool   sound_voice_builtin(SoundVoice* v, int idx, int volume, bool loop, uint32_t max_ms);
-bool   sound_voice_tone(SoundVoice* v, int hz, int ms, int volume);                       // hz 100-8000, ms 1-10000
-bool   sound_voice_melody(SoundVoice* v, const SoundNote* n, size_t count, int volume);   // 1-32 notes, hz 0 or 100-8000, ms 1-10000
+bool   sound_voice_tone(SoundVoice* v, int hz, int ms, int volume);                       // hz 100-7900, ms 1-10000
+bool   sound_voice_melody(SoundVoice* v, const SoundNote* n, size_t count, int volume);   // 1-32 notes, hz 0 or 100-7900, ms 1-10000
 // Renders up to n samples; fewer than n means the voice ended with this call, and every later call returns 0.
 size_t sound_voice_render(SoundVoice* v, int16_t* out, size_t n);
 
@@ -60,6 +60,13 @@ size_t sound_voice_render(SoundVoice* v, int16_t* out, size_t n);
 enum class SoundOwner  : uint8_t { USER, DEVICE };   // DEVICE = the Hub Sound device
 enum class SoundResult : uint8_t { OK, MUTED, BUSY, UNKNOWN, NO_LOOP, BAD_ARG, ABSENT };
 const char* sound_result_text(SoundResult r);
+// A refusal's text into out (cut to cap, always ended): ABSENT with a reason `off` (sound_error(): the codec
+// answered but did not start) is "speaker off: <off>"; anything else is sound_result_text(r).
+void sound_refusal(SoundResult r, const char* off, char* out, size_t cap);
+// The rule check of a sound.play / sound.stop at save time: false, and why in err, when the hub cannot play
+// `name` (nullptr or "" = a bare sound.stop), or `loop` it. No codec (!present) or one that did not start
+// (`off` set) refuses every sound action; an unknown name or a loop it cannot do lists the names to use.
+bool sound_rule_check(bool present, const char* off, const char* name, bool loop, char* err, size_t cap);
 
 struct SoundPlayer {
     SoundVoice  voice;

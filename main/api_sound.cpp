@@ -38,7 +38,8 @@ esp_err_t reply_state(httpd_req_t* req) {
 }
 
 esp_err_t reply_error(httpd_req_t* req, const char* err) {
-    // Fixed firmware texts (api_sound_json.h's and sound_result_text's): no quotes or backslashes.
+    // Fixed firmware texts (api_sound_json.h's, sound_result_text's, and sound_error()'s step name and
+    // esp_err_to_name): no quotes or backslashes.
     char out[160];
     std::snprintf(out, sizeof(out), "{\"error\":\"%s\"}", err);
     httpd_resp_set_status(req, "400 Bad Request");
@@ -74,7 +75,10 @@ esp_err_t handle_play(httpd_req_t* req) {
     const char* err = n > 0 ? sound_play_parse(body, static_cast<size_t>(n), name, sizeof(name), &volume) : kSoundBadBody;
     if (err) return reply_error(req, err);
     const SoundResult r = sound_play(name, volume, false);
-    return r == SoundResult::OK ? reply_ok(req) : reply_error(req, sound_result_text(r));
+    if (r == SoundResult::OK) return reply_ok(req);
+    char why[96];   // "speaker off: " and sound_error()'s reason, or a result's text
+    sound_refusal(r, sound_error(), why, sizeof(why));
+    return reply_error(req, why);
 }
 
 esp_err_t handle_stop(httpd_req_t* req) {

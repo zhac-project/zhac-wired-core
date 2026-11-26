@@ -275,28 +275,8 @@ const char* start(esp_err_t* e) {
 
 // ── Rule hooks ──
 
-// The built-in names after the n bytes already in err, comma-joined; only the loopable ones if asked.
-void list_names(char* err, size_t cap, size_t n, bool loopable) {
-    const char* sep = "";
-    for (size_t i = 0; i < sound_count() && n < cap; i++) {
-        if (loopable && !sound_loopable(i)) continue;
-        n += static_cast<size_t>(std::snprintf(err + n, cap - n, "%s%s", sep, sound_name(i)));
-        sep = ",";
-    }
-}
-
 bool rules_check(const char* name, bool loop, char* err, size_t cap) {
-    if (!s_present) {
-        std::snprintf(err, cap, "%s", sound_result_text(SoundResult::ABSENT));
-        return false;
-    }
-    if (!name || !*name) return true;   // a bare sound.stop
-    const int i = sound_find(name);
-    if (i >= 0 && (!loop || sound_loopable(static_cast<size_t>(i)))) return true;
-    const int n = i < 0 ? std::snprintf(err, cap, "unknown sound, use: ")
-                        : std::snprintf(err, cap, "%s cannot loop, loopable: ", name);
-    list_names(err, cap, static_cast<size_t>(n), i >= 0);
-    return false;
+    return sound_rule_check(s_present, s_err.load(), name, loop, err, cap);
 }
 
 bool rules_run(bool play, const char* name, int volume, bool loop) {
@@ -306,7 +286,9 @@ bool rules_run(bool play, const char* name, int volume, bool loop) {
     }
     const SoundResult r = sound_play(name, volume, loop);
     if (r == SoundResult::OK || r == SoundResult::MUTED) return true;
-    ESP_LOGW(TAG, "rule: sound.play %s: %s", name, sound_result_text(r));
+    char why[sizeof(s_err_buf) + 16];   // "speaker off: " and the start's reason
+    sound_refusal(r, s_err.load(), why, sizeof(why));
+    ESP_LOGW(TAG, "rule: sound.play %s: %s", name, why);
     return false;
 }
 

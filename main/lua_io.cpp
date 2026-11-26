@@ -99,17 +99,25 @@ int l_ws_write(lua_State* L) {
     return 1;
 }
 
-// A volume argument: absent or nil = -1 (the default); any other integer goes to the player, which refuses
-// what is not -1..100 (BAD_ARG), so a huge one is only held to an int.
-int volume_arg(lua_State* L, int idx) {
-    if (lua_isnoneornil(L, idx)) return -1;
-    const lua_Integer v = luaL_checkinteger(L, idx);
-    return v < -1000 ? -1000 : (v > 1000 ? 1000 : static_cast<int>(v));
+// A whole number as Lua gives it (40, 40.0, "40"), held to an int far outside every range the player takes;
+// anything else (40.5, "loud", nil) is kNotWhole, which the player refuses (BAD_ARG). Either way the script
+// gets nil, err and goes on: luaL_checkinteger would end it.
+constexpr int kNotWhole = -1000;
+int int_arg(lua_State* L, int idx) {
+    int ok = 0;
+    const lua_Integer v = lua_tointegerx(L, idx, &ok);
+    if (!ok) return kNotWhole;
+    return v < kNotWhole ? kNotWhole : (v > 100000 ? 100000 : static_cast<int>(v));
 }
+
+// A volume argument: absent or nil = -1 (the default); else int_arg, and the player refuses what is not -1..100.
+int volume_arg(lua_State* L, int idx) { return lua_isnoneornil(L, idx) ? -1 : int_arg(L, idx); }
 
 int sound_result(lua_State* L, SoundResult r) {
     if (r == SoundResult::OK) { lua_pushboolean(L, 1); return 1; }
-    return fail(L, sound_result_text(r));
+    char why[96];   // "speaker off: " and sound_error()'s reason, or a result's text
+    sound_refusal(r, sound_error(), why, sizeof(why));
+    return fail(L, why);
 }
 
 int l_sound_play(lua_State* L) {
@@ -118,9 +126,7 @@ int l_sound_play(lua_State* L) {
 }
 
 int l_sound_tone(lua_State* L) {
-    const lua_Integer hz = luaL_checkinteger(L, 1), ms = luaL_checkinteger(L, 2);
-    auto cl = [](lua_Integer v) { return static_cast<int>(v < -1 ? -1 : (v > 100000 ? 100000 : v)); };   // the player's range is far inside
-    return sound_result(L, sound_tone(cl(hz), cl(ms), volume_arg(L, 3)));
+    return sound_result(L, sound_tone(int_arg(L, 1), int_arg(L, 2), volume_arg(L, 3)));
 }
 
 // notes: {{hz, ms}, ...}, at most kSoundMaxNotes; a malformed list is BAD_ARG, like a value out of range.

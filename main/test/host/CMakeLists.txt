@@ -75,3 +75,28 @@ target_include_directories(api_sound_json_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
     "${ZHAC_COMPONENTS}/components/arduinojson/src")
 add_test(NAME api_sound_json COMMAND api_sound_json_tests)
+
+# zhac.sound_* (lua_io.cpp) under the vendored Lua 5.5, the player behind fake sound.h calls (hub-sounds
+# review M4, L195). Lua is managed_components/georgik__lua, there after an IDF configure of this repo.
+set(LUA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../managed_components/georgik__lua" CACHE PATH "georgik__lua")
+if(EXISTS "${LUA_DIR}/lua/lapi.c")
+    enable_language(C)
+    file(GLOB LUA_SRCS "${LUA_DIR}/lua/*.c")
+    list(FILTER LUA_SRCS EXCLUDE REGEX "/(lua|luac|onelua|ltests)\\.c$")
+    add_library(host_lua STATIC ${LUA_SRCS})
+    target_include_directories(host_lua PUBLIC "${LUA_DIR}/include" "${LUA_DIR}/lua")
+    # CONFIG_LUA_MAXSTACK: luaconf.h reads it (the firmware's Kconfig default).
+    target_compile_definitions(host_lua PUBLIC CONFIG_LUA_MAXSTACK=1000000 PRIVATE LUA_USE_POSIX)
+    target_compile_options(host_lua PRIVATE -w)   # vendored code, as upstream ships it
+    add_executable(lua_io_tests test_lua_io.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../lua_io.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../sound_synth.cpp)
+    target_include_directories(lua_io_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/lua_io_stubs   # sdkconfig.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        "${ZHAC_COMPONENTS}/components/lua_engine/include")
+    target_link_libraries(lua_io_tests PRIVATE host_lua m)
+    add_test(NAME lua_io COMMAND lua_io_tests)
+else()
+    message(WARNING "Lua 5.5 not found at ${LUA_DIR}: lua_io_tests not built "
+                    "(configure the firmware with IDF once, or pass -DLUA_DIR=<georgik__lua>)")
+endif()

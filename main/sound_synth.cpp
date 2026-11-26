@@ -5,6 +5,7 @@
 #include "sound_synth.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 
@@ -145,7 +146,7 @@ bool sound_voice_builtin(SoundVoice* v, int idx, int volume, bool loop, uint32_t
 }
 
 bool sound_voice_tone(SoundVoice* v, int hz, int ms, int volume) {
-    if (!v || hz < 100 || hz > 8000 || ms < 1 || ms > 10000) return false;
+    if (!v || hz < 100 || hz > 7900 || ms < 1 || ms > 10000) return false;   // 8000 Hz = Nyquist at 16 kHz: silent
     voice_init(v, volume, false);
     v->steps[0] = note((uint16_t)hz, (uint16_t)ms);
     v->n_steps = 1;
@@ -155,7 +156,7 @@ bool sound_voice_tone(SoundVoice* v, int hz, int ms, int volume) {
 bool sound_voice_melody(SoundVoice* v, const SoundNote* n, size_t count, int volume) {
     if (!v || !n || count < 1 || count > kSoundMaxNotes) return false;
     for (size_t k = 0; k < count; k++)
-        if ((n[k].hz && (n[k].hz < 100 || n[k].hz > 8000)) || n[k].ms < 1 || n[k].ms > 10000) return false;
+        if ((n[k].hz && (n[k].hz < 100 || n[k].hz > 7900)) || n[k].ms < 1 || n[k].ms > 10000) return false;
     voice_init(v, volume, false);
     for (size_t k = 0; k < count; k++) v->steps[k] = n[k].hz ? note(n[k].hz, n[k].ms) : rest(n[k].ms);
     v->n_steps = (uint8_t)count;
@@ -229,10 +230,44 @@ const char* sound_result_text(SoundResult r) {
     case SoundResult::BUSY:    return "an urgent sound is playing";
     case SoundResult::UNKNOWN: return "unknown sound";
     case SoundResult::NO_LOOP: return "this sound cannot loop";
-    case SoundResult::BAD_ARG: return "bad value (volume 0-100, hz 100-8000, ms 1-10000, 1-32 notes)";
+    case SoundResult::BAD_ARG: return "bad value (volume 0-100, hz 100-7900, ms 1-10000, 1-32 notes)";
     case SoundResult::ABSENT:  return "no speaker on this hub";
     }
     return "";
+}
+
+void sound_refusal(SoundResult r, const char* off, char* out, size_t cap) {
+    if (!out || !cap) return;
+    if (r == SoundResult::ABSENT && off && *off) std::snprintf(out, cap, "speaker off: %s", off);
+    else std::snprintf(out, cap, "%s", sound_result_text(r));
+}
+
+namespace {
+
+// The built-in names after the n bytes already in err, comma-joined; only the loopable ones if asked.
+void list_names(char* err, size_t cap, size_t n, bool loopable) {
+    const char* sep = "";
+    for (size_t i = 0; i < sound_count() && n < cap; i++) {
+        if (loopable && !sound_loopable(i)) continue;
+        n += (size_t)std::snprintf(err + n, cap - n, "%s%s", sep, sound_name(i));
+        sep = ",";
+    }
+}
+
+}  // namespace
+
+bool sound_rule_check(bool present, const char* off, const char* name, bool loop, char* err, size_t cap) {
+    if (!present || (off && *off)) {
+        sound_refusal(SoundResult::ABSENT, off, err, cap);
+        return false;
+    }
+    if (!name || !*name) return true;   // a bare sound.stop
+    const int i = sound_find(name);
+    if (i >= 0 && (!loop || sound_loopable((size_t)i))) return true;
+    const int n = i < 0 ? std::snprintf(err, cap, "unknown sound, use: ")
+                        : std::snprintf(err, cap, "%s cannot loop, loopable: ", name);
+    list_names(err, cap, (size_t)n, i >= 0);
+    return false;
 }
 
 void sound_player_init(SoundPlayer* p, int max_volume) {
