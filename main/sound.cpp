@@ -199,10 +199,20 @@ void sound_task(void*) {
             next_seen_us = now + kSeenEveryUs;
             touch_last_seen();   // before the lock below; the PA, the linger and the I2S writes are not involved
         }
-        size_t n;
+        size_t n = 0;
+        bool   wake;
         {
             Lock l;
-            n = sound_player_render(&s_player, s_buf, kBlock);   // below kBlock: the sound ended, idle after
+            // With the amplifier off, a sound waits unrendered while it wakes, so a stop, a mute or a
+            // replace during the lead still counts.
+            wake = !amp && sound_player_playing(&s_player) != nullptr;
+            if (!wake) n = sound_player_render(&s_player, s_buf, kBlock);   // below kBlock: the sound ended, idle after
+        }
+        if (wake) {
+            gpio_set_level(kPa, 1);
+            amp = true;
+            for (size_t i = 0; i < kLeadBlocks; i++) write_block(kSilence, &warned);
+            continue;
         }
         if (n) {
             quiet = 0;
@@ -218,11 +228,6 @@ void sound_task(void*) {
             gpio_set_level(kPa, 0);
             amp = false;
             continue;
-        }
-        if (n && !amp) {   // the sound's first block waits in s_buf while the amplifier wakes
-            gpio_set_level(kPa, 1);
-            amp = true;
-            for (size_t i = 0; i < kLeadBlocks; i++) write_block(kSilence, &warned);
         }
         std::memset(s_buf + n, 0, (kBlock - n) * sizeof(s_buf[0]));
         write_block(s_buf, &warned);
