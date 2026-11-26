@@ -27,8 +27,8 @@ inline const char* sound_body_volume(JsonObjectConst o, int* volume) {
     return nullptr;
 }
 
-// PUT /api/sound: {"volume"?:int,"muted"?:bool}. -1 = not in the body. A refusal sets neither.
-struct SoundPut { int volume; int muted; };
+// PUT /api/sound: {"volume"?:int,"muted"?:bool}. -1 = not in the body (also what a fresh struct holds). A refusal sets neither.
+struct SoundPut { int volume = -1; int muted = -1; };
 inline const char* sound_put_parse(const char* body, size_t len, SoundPut* out) {
     JsonDocument doc;
     if (deserializeJson(doc, body, len) || !doc.is<JsonObject>()) return kSoundBadBody;
