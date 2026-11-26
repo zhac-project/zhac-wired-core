@@ -70,7 +70,7 @@ contents become the release-tag annotation at `just release`.
 - **The heap log line adds `main-largest`** (research A8): the largest block of the main internal heap, which the overall largest block (LP RAM, TCM) can hide.
 - **The hub asks DHCP for its last address after a restart** (`LWIP_DHCP_RESTORE_LAST_IP`, research 2026-11-18 A9), so its IP no longer wanders between reboots. The cloud hello carries `lan_ip` (the Wi-Fi address on a hub without a cable).
 - **TLS buffers in PSRAM on the P4 too** (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, as the S31 since 2026-09-21). The cloud link held about 25 KB of internal RAM, and every extra HTTPS session (OTA, Telegram) needed a free 16 KB internal block beside it; the P4 had about 60 KB internal free after boot. `tools/check_resolved_config.sh` now fails a build whose sdkconfig still allocates TLS internally. Espressif prefers internal RAM for TLS keys; without flash encryption the flash holding the Zigbee key and tokens is just as readable.
-- **P4: GPIO53 is the speaker amplifier pin.** It left the default user pins (`CONFIG_ZHAC_IO_PINS`). A hub with a user pin on 53 shows that row's error after the update; move the pin in Settings › I/O. The S31's lists had none of its audio pins.
+- **P4: GPIO53 is the speaker amplifier pin.** It left the default user pins (`CONFIG_ZHAC_IO_PINS`). A hub with a stored user pin on 53 drops that row at boot (the boot log says why) and Settings › I/O no longer lists it; add the pin again on another GPIO. The S31's lists had none of its audio pins.
 - **`rule.check` errors can be up to 191 characters** (was 95): a sound or strip refusal from the firmware is kept whole.
 
 ### Fixed
