@@ -3,8 +3,8 @@
 //
 // The hub speaker: the codec probe, the I2S stream, the amplifier pin, NVS, the rule hooks and the render
 // task around the pure player of sound_synth.h, and the Hub Sound device (a PROTO_LOCAL pool entry whose
-// `warning` the alarm sends as a siren output). Locking: s_mu guards s_player and s_save around every player
-// call, render included; callers get the player's answer at once. Only the task writes NVS (volume and mute,
+// `warning` the alarm sends as a siren output). Locking: s_mu guards s_player, s_save and s_task around every
+// player call, render included; callers get the player's answer at once. Only the task writes NVS (volume and mute,
 // between sounds, outside the lock): callers may run on a PSRAM stack, and one writer keeps the saved values
 // equal to the live ones. The pool lock (recursive, and a device_cmd caller may hold it) is never taken with
 // s_mu held: the device's last_seen is touched before s_mu is taken or after it is released.
@@ -70,8 +70,8 @@ char                     s_err_buf[64];
 i2c_master_bus_handle_t  s_bus  = nullptr;
 i2c_master_dev_handle_t  s_dev  = nullptr;
 i2s_chan_handle_t        s_tx   = nullptr;
-TaskHandle_t             s_task = nullptr;
-bool                     s_save = false;      // under s_mu: volume or mute changed since the task saved them
+TaskHandle_t             s_task = nullptr;   // under s_mu: HTTP and Lua call in while sound_start() runs
+bool                     s_save = false;     // under s_mu: volume or mute changed since the task saved them
 int16_t                  s_buf[kBlock];       // the task's block: static, off its stack
 
 struct Lock {
@@ -262,12 +262,21 @@ const char* start(esp_err_t* e) {
 
     // The task's stack: 6 KB like the other tasks that commit NVS (the commit path uses ~3 KB). Internal RAM
     // (xTaskCreate): it writes flash, so its stack cannot sit in PSRAM.
-    const char* step = nullptr;
+    const char*  step = nullptr;
+    TaskHandle_t t    = nullptr;
     if (!es8311_dac_start(s_dev, e)) {
         step = "codec setup";
-    } else if (xTaskCreate(sound_task, "sound", 6144, nullptr, 5, &s_task) != pdPASS) {
+    } else if (xTaskCreate(sound_task, "sound", 6144, nullptr, 5, &t) != pdPASS) {
         *e   = ESP_ERR_NO_MEM;
         step = "render task";
+    } else {
+        // Published under the lock, then one wake: a play or a setter between the task's first look at the
+        // player and this line found no task to wake.
+        {
+            Lock l;
+            s_task = t;
+        }
+        xTaskNotifyGive(t);
     }
     if (step) i2s_channel_disable(s_tx);
     return step;
@@ -299,13 +308,15 @@ bool rules_run(bool play, const char* name, int volume, bool loop) {
 template <typename F>
 SoundResult admit(F&& f) {
     if (!s_present) return SoundResult::ABSENT;
-    SoundResult r;
+    SoundResult  r;
+    TaskHandle_t t;
     {
         Lock l;
         if (*s_err.load()) return SoundResult::ABSENT;
         r = f();
+        t = s_task;
     }
-    if (r == SoundResult::OK && s_task) xTaskNotifyGive(s_task);
+    if (r == SoundResult::OK && t) xTaskNotifyGive(t);
     return r;
 }
 

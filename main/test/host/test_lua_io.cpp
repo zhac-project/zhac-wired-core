@@ -57,7 +57,8 @@ bool user_io_strip(const char*, const uint32_t*, size_t, char* err, size_t cap) 
 // ---- the runner ------------------------------------------------------------------------------
 static lua_State* L = nullptr;
 
-// A chunk's results as text joined by ",", or "error: <message>" when it raised one.
+// A chunk's results as text joined by ",", strings in double quotes (the string "nil" is not nil), or
+// "error: <message>" when it raised one.
 static std::string run(const char* chunk) {
     const int   top = lua_gettop(L);
     std::string out;
@@ -65,8 +66,11 @@ static std::string run(const char* chunk) {
         out = std::string("error: ") + lua_tostring(L, -1);
     } else {
         for (int i = top + 1; i <= lua_gettop(L); i++) {
+            const char* q = lua_type(L, i) == LUA_TSTRING ? "\"" : "";
             if (i > top + 1) out += ",";
+            out += q;
             out += luaL_tolstring(L, i, nullptr);
+            out += q;
             lua_pop(L, 1);
         }
     }
@@ -75,7 +79,7 @@ static std::string run(const char* chunk) {
 }
 
 static void numbers() {
-    const std::string bad = std::string("nil,") + sound_result_text(SoundResult::BAD_ARG);
+    const std::string bad = std::string("nil,\"") + sound_result_text(SoundResult::BAD_ARG) + "\"";
     CHECK(run("return zhac.sound_tone(440, 100)") == "true", "tone: whole numbers play");
     CHECK(run("return zhac.sound_tone(440.5, 100)") == bad, "tone: a fractional hz is nil, bad value");
     CHECK(run("return zhac.sound_tone(440, 'long')") == bad, "tone: a word for ms is nil, bad value");
@@ -87,19 +91,19 @@ static void numbers() {
     CHECK(run("return zhac.sound_play('chime', '40')") == "true", "play: a numeric string counts, as Lua converts it");
     CHECK(run("return zhac.sound_play('chime', 1e9)") == bad, "play: a huge volume is nil, bad value");
     CHECK(run("return zhac.sound_melody({{440, 100}}, 2.5)") == bad, "melody: a fractional volume is nil, bad value");
-    CHECK(run("local ok, err = zhac.sound_tone(0.5, 1) return 'went on', ok, err") == "went on," + bad,
+    CHECK(run("local ok, err = zhac.sound_tone(0.5, 1) return 'went on', ok, err") == "\"went on\"," + bad,
           "tone: the script goes on after a bad number");
 }
 
 static void speaker_off() {
     g_off = "I2S setup failed: ESP_ERR_INVALID_STATE";
-    const std::string why = "nil,speaker off: I2S setup failed: ESP_ERR_INVALID_STATE";
+    const std::string why = "nil,\"speaker off: I2S setup failed: ESP_ERR_INVALID_STATE\"";
     CHECK(run("return zhac.sound_play('chime')") == why, "play: a speaker that did not start says why");
     CHECK(run("return zhac.sound_tone(440, 100)") == why, "tone: ... the same");
     CHECK(run("return zhac.sound_melody({{440, 100}})") == why, "melody: ... the same");
     g_off   = "";
     g_codec = false;
-    CHECK(run("return zhac.sound_play('chime')") == "nil,no speaker on this hub", "play: no codec is no speaker on this hub");
+    CHECK(run("return zhac.sound_play('chime')") == "nil,\"no speaker on this hub\"", "play: no codec is no speaker on this hub");
     g_codec = true;
 }
 

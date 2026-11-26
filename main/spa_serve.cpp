@@ -133,11 +133,11 @@ bool spa_register(httpd_handle_t hd) {
     u.uri     = "/*";
     u.method  = HTTP_GET;
     u.handler = handle_spa_catchall;
-    // It registers last, so a full handler table costs only the web UI: REST and WS are already in.
+    // It registers last, so a full handler table shows here.
     const esp_err_t e = httpd_register_uri_handler(hd, &u);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "SPA catchall GET /* NOT registered (%s): the web UI answers 404, REST and WS work; "
-                      "raise WS_SERVER_MAX_URI_HANDLERS", esp_err_to_name(e));
+        ESP_LOGE(TAG, "SPA catchall GET /* NOT registered (%s): the web UI answers 404%s", esp_err_to_name(e),
+                 e == ESP_ERR_HTTPD_HANDLERS_FULL ? "; raise WS_SERVER_MAX_URI_HANDLERS (ws_server.h)" : "");
         return false;
     }
     ESP_LOGI(TAG, "SPA catchall GET /* registered");
