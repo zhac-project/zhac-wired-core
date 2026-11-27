@@ -192,6 +192,9 @@ void api_status_fill(JsonObject doc) {
     doc["remote_scripts"] = sys_remote_scripts();
     // ... and its "Log to cloud" switch only when this is (spec 2026-10-06 §4.1).
     doc["log_to_cloud"] = logcloud::level_name(logcloud::level_from_u8(sys_log_cloud()));
+    // ... and "Cloud control" and "Allow the cloud to disarm the alarm" (review 2026-11-26 HL-03, HL-02).
+    doc["remote_level"] = sys_remote_level_name(sys_remote_level());
+    doc["remote_alarm"] = sys_remote_alarm();
 #endif
     // lua_engine's boot-loop guard held the scripts (two crashes in a row while they started): the Scripts
     // page says so. The script that was loading at the last crash, "" when unknown. Only while it holds.

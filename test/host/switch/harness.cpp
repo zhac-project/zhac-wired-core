@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// What "Allow script changes from the cloud" does when NVS cannot be written (spec 2026-10-05 §3.1).
+// What "Allow script changes from the cloud" does when NVS cannot be written (spec 2026-10-05 §3.1), and the
+// cloud-control level and "Allow the cloud to disarm the alarm" (review 2026-11-26 HL-03, HL-02).
 // Runs the REAL main/sys_state.cpp and the REAL system_apply_settings (main/api_system.cpp) against a fake NVS
 // that can fail at open, set and commit. A cold boot is sys_state_init() again over the same fake flash.
 // Exit code = number of mismatches. See run.sh.
 #include "stubs.h"
 #include "sys_state.h"
 #include "log_cloud.h"
+#include "remote_allow.h"   // the real zhac-components one: the keys the relay keeps local
 
 #include <map>
 #include <string>
@@ -47,7 +49,9 @@ void ws_push_hub_caps() { g_pushes.push_back(sys_remote_scripts()); }
 // ---- fake NVS --------------------------------------------------------------------------------------------
 struct Fail { esp_err_t open, set, commit; };   // injected result per stage, ESP_OK = works
 static Fail g_fail{ESP_OK, ESP_OK, ESP_OK};
+static esp_err_t g_fail_ro = ESP_OK;             // read-only opens (NVS not usable at boot)
 static std::map<std::string, uint8_t> g_flash;   // durable "namespace/key" -> u8
+static std::map<std::string, std::string> g_flash_str;   // durable strings, set by the cases (nvs_set_str stores none)
 static int g_opens_rw = 0;                       // read-write opens (a settings write starts with one)
 static int g_flash_writes = 0;                   // commits that changed a durable value
 struct Handle { std::string ns; std::map<std::string, uint8_t> pending; };
@@ -59,6 +63,8 @@ esp_err_t nvs_open(const char* ns, nvs_open_mode_t mode, nvs_handle_t* h) {
     if (mode == NVS_READWRITE) {
         g_opens_rw++;
         if (g_fail.open != ESP_OK) return g_fail.open;
+    } else if (g_fail_ro != ESP_OK) {
+        return g_fail_ro;
     }
     *h = g_next++;
     g_open[*h] = Handle{ns, {}};
@@ -90,7 +96,16 @@ esp_err_t nvs_get_u8(nvs_handle_t h, const char* key, uint8_t* out) {
     *out = it->second;
     return ESP_OK;
 }
-esp_err_t nvs_get_str(nvs_handle_t, const char*, char*, size_t*) { return ESP_ERR_NVS_NOT_FOUND; }
+esp_err_t nvs_get_str(nvs_handle_t h, const char* key, char* out, size_t* len) {
+    auto it = g_flash_str.find(g_open.at(h).ns + "/" + key);
+    if (it == g_flash_str.end()) return ESP_ERR_NVS_NOT_FOUND;
+    const size_t need = it->second.size() + 1;
+    if (!out) { *len = need; return ESP_OK; }   // as NVS: a null buffer asks for the length
+    if (*len < need) return ESP_FAIL;
+    memcpy(out, it->second.c_str(), need);
+    *len = need;
+    return ESP_OK;
+}
 esp_err_t nvs_set_str(nvs_handle_t, const char*, const char*) { return ESP_OK; }
 }
 
@@ -124,13 +139,16 @@ static std::string pushes_s(const std::vector<bool>& p) {
     return s + "]";
 }
 
-// A hub that has just booted over this NVS content (-1 = key missing).
+// A hub that has just booted over this NVS content (-1 = key missing). The counters count what comes after the
+// boot (which writes the cloud-control level once on a flash without it).
 static void world(int nvs) {
     g_flash.clear();
+    g_flash_str.clear();
     if (nvs >= 0) g_flash[kKey] = static_cast<uint8_t>(nvs);
     g_fail = Fail{ESP_OK, ESP_OK, ESP_OK};
-    g_opens_rw = g_flash_writes = 0;
+    g_fail_ro = ESP_OK;
     sys_state_init();
+    g_opens_rw = g_flash_writes = 0;
     g_pushes.clear();
     g_log.clear();
 }
@@ -341,6 +359,195 @@ int main() {
         r = apply("{\"log_to_cloud\":\"errors\"}");
         lc_row("save FAILS, on: refused, stays off", !r && sys_log_cloud() == 0 && lc_nv() == -1 && g_lc_setting == 0);
         g_fail = none;
+    }
+
+    // "Cloud control" (review 2026-11-26 HL-03, ruling R18) and "Allow the cloud to disarm the alarm" (HL-02, R19):
+    // same fake NVS, keys sys_cfg/remote_level and sys_cfg/remote_alarm; remote_client keeps its token in
+    // zhac_remote/token. The relay's own hooks (remote_level_now, remote_alarm_allowed) are the real lines of
+    // ws_bridge.cpp and the real remote_allow.cpp.
+    {
+        const char* kLv = "sys_cfg/remote_level";
+        const char* kAl = "sys_cfg/remote_alarm";
+        const char* kTok = "zhac_remote/token";
+        const char* tok = "0123456789abcdef0123456789abcdef";
+        auto ck = [&](const char* name, bool ok) {
+            printf("%-44s | %s\n", name, ok ? "ok" : "MISMATCH");
+            if (!ok) {
+                g_mismatches++;
+                show_errors(g_log);
+            }
+        };
+        auto nv = [&](const char* k) { auto it = g_flash.find(k); return it == g_flash.end() ? -1 : (int)it->second; };
+        auto fresh = [&](const char* token) {   // a flash with nothing in it but the cloud token, when given
+            g_flash.clear();
+            g_flash_str.clear();
+            if (token) g_flash_str[kTok] = token;
+        };
+        auto boot = [&](Fail f, esp_err_t ro) {   // a cold boot over the flash as it is; the counters count the boot
+            g_fail = f;
+            g_fail_ro = ro;
+            g_opens_rw = g_flash_writes = 0;
+            g_log.clear();
+            sys_state_init();
+            g_fail = none;
+            g_fail_ro = ESP_OK;
+        };
+        auto at = [&](int level, int alarm) {   // a hub booted at this level and alarm switch (-1 = key missing)
+            fresh(nullptr);
+            if (level >= 0) g_flash[kLv] = static_cast<uint8_t>(level);
+            if (alarm >= 0) g_flash[kAl] = static_cast<uint8_t>(alarm);
+            boot(none, ESP_OK);
+            g_opens_rw = g_flash_writes = 0;
+            g_pushes.clear();
+            g_log.clear();
+        };
+        printf("\nremote_level, remote_alarm\n");
+
+        // The pure parts.
+        ck("default: full with a cloud token, else view", sys_remote_level_default(true) == 2 && sys_remote_level_default(false) == 0);
+        ck("names; above 2 counts as view",
+           !strcmp(sys_remote_level_name(0), "view") && !strcmp(sys_remote_level_name(1), "devices") &&
+           !strcmp(sys_remote_level_name(2), "full") && !strcmp(sys_remote_level_name(3), "view") &&
+           !strcmp(sys_remote_level_name(255), "view"));
+        bool parse_ok = sys_remote_level_parse("view") == 0 && sys_remote_level_parse("devices") == 1 &&
+                        sys_remote_level_parse("full") == 2 && sys_remote_level_parse(nullptr) == -1;
+        for (const char* bad : {"Full", "FULL", "", " full", "full ", "ful", "fully", "2", "admin"})
+            parse_ok = parse_ok && sys_remote_level_parse(bad) == -1;
+        ck("parse: the three names exactly, else -1", parse_ok);
+        ck("save rule: a raise once saved, a lowering at once",
+           sys_remote_level_after_save(0, 2, true) == 2 && sys_remote_level_after_save(0, 2, false) == 0 &&
+           sys_remote_level_after_save(0, 1, false) == 0 && sys_remote_level_after_save(1, 2, false) == 1 &&
+           sys_remote_level_after_save(2, 0, false) == 0 && sys_remote_level_after_save(2, 1, false) == 1 &&
+           sys_remote_level_after_save(1, 0, true) == 0 && sys_remote_level_after_save(2, 2, false) == 2);
+        ck("the relay keeps both keys local", remote_is_local_only_key("remote_level") && remote_is_local_only_key("remote_alarm"));
+
+        // The first boot of this firmware: full once for a hub that is linked, view for every other one.
+        fresh(tok);
+        boot(none, ESP_OK);
+        ck("upgrade with a cloud token: full, written once", sys_remote_level() == 2 && nv(kLv) == 2 && g_flash_writes == 1);
+        boot(none, ESP_OK);
+        ck("...next boot: full, nothing written", sys_remote_level() == 2 && g_opens_rw == 0);
+        bool r = apply("{\"remote_level\":\"view\"}");
+        boot(none, ESP_OK);
+        ck("...owner sets view, reboot: view (no 2nd run)", r && sys_remote_level() == 0 && nv(kLv) == 0 && g_opens_rw == 0);
+        fresh(nullptr);
+        boot(none, ESP_OK);
+        ck("fresh hub: view, written once", sys_remote_level() == 0 && nv(kLv) == 0 && g_flash_writes == 1);
+        g_flash_str[kTok] = tok;
+        boot(none, ESP_OK);
+        ck("...linked later, reboot: view", sys_remote_level() == 0 && g_opens_rw == 0);
+        fresh("");
+        boot(none, ESP_OK);
+        ck("an empty token is none: view", sys_remote_level() == 0 && nv(kLv) == 0);
+        fresh(tok);
+        boot(none, ESP_OK);
+        fresh(nullptr);   // system.storage_reset erases the partition, the token with it
+        boot(none, ESP_OK);
+        ck("storage reset: view", sys_remote_level() == 0 && nv(kLv) == 0);
+        for (const Fail& f : {f_open, f_set, f_commit}) {
+            fresh(tok);
+            boot(f, ESP_OK);
+            const bool first = sys_remote_level() == 0 && nv(kLv) == -1 && logged("remote_level=2 not saved");
+            boot(none, ESP_OK);
+            ck("upgrade, write FAILS: view; next boot full", first && sys_remote_level() == 2 && nv(kLv) == 2);
+        }
+        fresh(tok);
+        boot(f_open, ESP_ERR_NVS_NOT_INITIALIZED);
+        ck("NVS not usable at boot: view, no write", sys_remote_level() == 0 && g_opens_rw == 0 && !sys_remote_alarm());
+        fresh(tok);
+        g_flash[kLv] = 7;
+        boot(none, ESP_OK);
+        ck("a stored 7 is view, left for the next save", sys_remote_level() == 0 && nv(kLv) == 7 && g_opens_rw == 0);
+
+        // The page sets the level.
+        at(0, -1);
+        r = apply("{\"remote_level\":\"full\"}");
+        ck("view -> full, saved: full, hub.caps", r && sys_remote_level() == 2 && nv(kLv) == 2 && g_pushes.size() == 1);
+        r = apply("{\"remote_level\":\"devices\"}");
+        ck("full -> devices, saved: devices, hub.caps", r && sys_remote_level() == 1 && nv(kLv) == 1 && g_pushes.size() == 2);
+        for (const Fail& f : {f_open, f_set, f_commit}) {
+            at(0, -1);
+            g_fail = f;
+            r = apply("{\"remote_level\":\"full\"}");
+            g_fail = none;
+            ck("view -> full, save FAILS: refused, stays view",
+               !r && sys_remote_level() == 0 && nv(kLv) == 0 && g_pushes.empty() && logged("it stays view"));
+            at(2, -1);
+            g_fail = f;
+            r = apply("{\"remote_level\":\"view\"}");
+            g_fail = none;
+            const bool now = !r && sys_remote_level() == 0 && nv(kLv) == 2 && g_pushes.size() == 1 &&
+                             logged("may be full again after a reboot");
+            boot(none, ESP_OK);
+            ck("full -> view, save FAILS: refused, view now", now && sys_remote_level() == 2);   // why the page is told
+        }
+        at(2, -1);
+        g_fail = f_set;
+        apply("{\"remote_level\":\"view\"}");
+        g_fail = none;
+        g_pushes.clear();
+        r = apply("{\"remote_level\":\"view\"}");
+        const bool repaired = r && sys_remote_level() == 0 && nv(kLv) == 0 && g_pushes.empty();
+        boot(none, ESP_OK);
+        ck("...then view again, NVS healthy: repaired", repaired && sys_remote_level() == 0);
+        at(1, -1);
+        r = apply("{\"remote_level\":\"devices\"}");
+        ck("same level again: saved (repair), no hub.caps",
+           r && sys_remote_level() == 1 && g_opens_rw == 1 && g_flash_writes == 0 && g_pushes.empty());
+        for (const char* bad : {"{\"remote_level\":\"Full\"}", "{\"remote_level\":\"\"}", "{\"remote_level\":2}",
+                                "{\"remote_level\":true}", "{\"remote_level\":\"admin\"}", "{\"remote_level\":{}}"}) {
+            at(1, -1);
+            r = apply(bad);
+            ck(bad, !r && sys_remote_level() == 1 && nv(kLv) == 1 && g_opens_rw == 0 && g_pushes.empty());
+        }
+        at(1, -1);
+        r = apply("{\"remote_level\":null}");
+        ck("level null counts as absent", r && sys_remote_level() == 1 && g_opens_rw == 0 && g_pushes.empty());
+
+        // The relay reads the level for every command: a lowering refuses the very next one.
+        at(1, -1);
+        const bool before = remote_cmd_allowed("device.attr.set") && !remote_cmd_allowed("rule.create");
+        apply("{\"remote_level\":\"view\"}");
+        ck("devices -> view: the next device write refused",
+           before && !remote_cmd_allowed("device.attr.set") && remote_cmd_allowed("status.get"));
+        g_fail = f_set;
+        apply("{\"remote_level\":\"full\"}");
+        g_fail = none;
+        ck("a raise not saved: the relay still refuses", !remote_cmd_allowed("device.attr.set") && !remote_cmd_allowed("rule.create"));
+        apply("{\"remote_level\":\"full\"}");
+        ck("the raise saved: the relay passes rules", remote_cmd_allowed("rule.create") && remote_cmd_allowed("device.attr.set"));
+
+        // The alarm switch: as remote_scripts.
+        at(-1, -1);
+        ck("alarm switch: missing = off", !sys_remote_alarm() && !remote_alarm_allowed());
+        r = apply("{\"remote_alarm\":true}");
+        ck("alarm on, saved: on, hub.caps, the relay sees it",
+           r && sys_remote_alarm() && nv(kAl) == 1 && g_pushes.size() == 1 && remote_alarm_allowed());
+        for (const Fail& f : {f_open, f_set, f_commit}) {
+            at(-1, 0);
+            g_fail = f;
+            r = apply("{\"remote_alarm\":true}");
+            g_fail = none;
+            ck("alarm on, save FAILS: refused, stays off",
+               !r && !sys_remote_alarm() && nv(kAl) == 0 && g_pushes.empty() && logged("it stays off"));
+            at(-1, 1);
+            g_fail = f;
+            r = apply("{\"remote_alarm\":false}");
+            g_fail = none;
+            const bool now = !r && !sys_remote_alarm() && !remote_alarm_allowed() && nv(kAl) == 1 && g_pushes.size() == 1 &&
+                             logged("may be on again after a reboot");
+            boot(none, ESP_OK);
+            ck("alarm off, save FAILS: refused, off now", now && sys_remote_alarm());
+        }
+        at(-1, 1);
+        r = apply("{\"remote_alarm\":\"true\"}");
+        ck("alarm \"true\" (string) while on: off", r && !sys_remote_alarm() && nv(kAl) == 0);
+        at(-1, 1);
+        r = apply("{\"remote_alarm\":null}");
+        ck("alarm null while on: untouched", r && sys_remote_alarm() && g_opens_rw == 0 && g_pushes.empty());
+        at(-1, 1);
+        r = apply("{\"remote_alarm\":true}");
+        ck("alarm on while on: no NVS call, no push", r && sys_remote_alarm() && g_opens_rw == 0 && g_pushes.empty());
     }
 
     printf("\n%s (%d mismatch%s)\n", g_mismatches ? "FAILED" : "ALL OK", g_mismatches, g_mismatches == 1 ? "" : "es");

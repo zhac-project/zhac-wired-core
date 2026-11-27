@@ -37,6 +37,10 @@ AlarmReply alarm_arm(const char* id, bool force, uint64_t* open, uint8_t* n_open
 AlarmReply alarm_disarm(const char* id);
 // Pending or triggered of that profile ends now; it goes where it would when the alarm time ends.
 AlarmReply alarm_silence(const char* id);
+// A cloud write to the Alarm device that the hub took (review 2026-11-26 HL-02): `key` the attribute (or the
+// command's name), `value` its text or nullptr. The owner's alert "Alarm <value> from the cloud" (kind
+// alarm_changed_by_cloud) and Telegram, as for the alarm's own notifications. Takes no lock.
+void alarm_cloud_changed(const char* key, const char* value);
 // Replace the config ("codes" left out keeps the stored ones). False with the first
 // problem in `err` when nothing was changed; refused while an alarm is running.
 bool alarm_config_set(const char* json, size_t len, char* err, size_t cap);

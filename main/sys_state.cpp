@@ -23,6 +23,8 @@ static bool s_metrics_mqtt    = false;
 static int  s_metrics_mqtt_s  = 60;
 static std::atomic<bool> s_remote_scripts{false};   // read on task_remote, written on the httpd task
 static std::atomic<uint8_t> s_log_cloud{0};      // read by the log hook on every task, written on the httpd task
+static std::atomic<uint8_t> s_remote_level{0};   // as s_remote_scripts; view until sys_state_init reads it
+static std::atomic<bool> s_remote_alarm{false};
 
 static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-5) == 1 &&
               sys_clamp_metrics_interval(1) == 1 && sys_clamp_metrics_interval(30) == 30 &&
@@ -33,6 +35,12 @@ static_assert(sys_clamp_metrics_interval(0) == 1 && sys_clamp_metrics_interval(-
 static_assert(sys_remote_scripts_after_save(true, true) && !sys_remote_scripts_after_save(false, true) &&
               !sys_remote_scripts_after_save(true, false) && !sys_remote_scripts_after_save(false, false),
               "remote_scripts: RAM is on only when on was asked for and saved; off always applies");
+
+static_assert(sys_remote_level_default(true) == 2 && sys_remote_level_default(false) == 0,
+              "remote_level: a linked hub keeps full, every other one starts at view (R18)");
+static_assert(sys_remote_level_after_save(0, 2, true) == 2 && sys_remote_level_after_save(0, 2, false) == 0 &&
+              sys_remote_level_after_save(2, 0, false) == 0 && sys_remote_level_after_save(2, 1, false) == 1,
+              "remote_level: a raise only once saved, a lowering at once");
 
 // A POSIX TZ string is printable ASCII without spaces or quotes
 // ("<+0530>-5:30"), as zap_ntp_host_ok has it for the time server. Anything
@@ -55,7 +63,7 @@ static uint8_t nvs_get_u8(const char* ns, const char* key, uint8_t def) {
 }
 
 // ESP_OK once the value is committed, else the first NVS error. The flags below keep ignoring it, as they
-// always did; sys_set_remote_scripts must not.
+// always did; the cloud settings (remote_scripts, remote_alarm, remote_level, log_cloud) must not.
 static esp_err_t nvs_set_u8_commit(const char* ns, const char* key, uint8_t v) {
     nvs_handle_t h;
     esp_err_t e = nvs_open(ns, NVS_READWRITE, &h);
@@ -66,6 +74,39 @@ static esp_err_t nvs_set_u8_commit(const char* ns, const char* key, uint8_t v) {
     return e;
 }
 
+// remote_client's token (zhac_remote/token, remote_nvs.cpp): the hub has been linked to the cloud.
+static bool cloud_token_stored() {
+    nvs_handle_t h;
+    if (nvs_open("zhac_remote", NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = 0;
+    const bool stored = nvs_get_str(h, "token", nullptr, &len) == ESP_OK && len > 1;   // len counts the NUL
+    nvs_close(h);
+    return stored;
+}
+
+// The cloud-control level (HL-03, R18). No key yet (ESP_ERR_NVS_NOT_FOUND, also for no sys_cfg at all): the first
+// boot of this firmware, which writes the default once, so the owner's later choice is never overwritten and a hub
+// linked later stays at view. The default is a raise from view like any other: it applies once saved, and a failed
+// write leaves view and is tried again at the next boot. Any other read error (NVS not usable) leaves view.
+static uint8_t load_remote_level() {
+    uint8_t v = 0;
+    nvs_handle_t h;
+    esp_err_t e = nvs_open("sys_cfg", NVS_READONLY, &h);
+    if (e == ESP_OK) {
+        e = nvs_get_u8(h, "remote_level", &v);
+        nvs_close(h);
+    }
+    if (e == ESP_OK) return v <= 2 ? v : 0;   // a value no firmware writes counts as view
+    if (e != ESP_ERR_NVS_NOT_FOUND) return 0;
+    const bool linked = cloud_token_stored();
+    const uint8_t def = sys_remote_level_default(linked);
+    const esp_err_t w = nvs_set_u8_commit("sys_cfg", "remote_level", def);
+    if (w != ESP_OK) ESP_LOGE(TAG, "remote_level=%u not saved: %s", (unsigned)def, esp_err_to_name(w));
+    const uint8_t level = sys_remote_level_after_save(0, def, w == ESP_OK);
+    ESP_LOGW(TAG, "cloud control: %s on this firmware's first start (%s)", sys_remote_level_name(level),
+             linked ? "linked to the cloud" : "not linked");
+    return level;
+}
 
 void sys_state_init() {
     s_metrics_enabled = nvs_get_u8("sys_cfg", "metrics_en", 0) != 0;
@@ -73,6 +114,8 @@ void sys_state_init() {
     s_metrics_mqtt    = nvs_get_u8("sys_cfg", "metrics_mqtt", 0) != 0;
     s_metrics_mqtt_s  = sys_clamp_metrics_interval(nvs_get_u8("sys_cfg", "metrics_mqtt_s", 60));
     s_remote_scripts.store(nvs_get_u8("sys_cfg", "remote_scripts", 0) != 0);
+    s_remote_alarm.store(nvs_get_u8("sys_cfg", "remote_alarm", 0) != 0);
+    s_remote_level.store(load_remote_level());
     {
         const uint8_t lc = nvs_get_u8("sys_cfg", "log_cloud", 0);
         s_log_cloud.store(lc <= 3 ? lc : 0);
@@ -91,9 +134,11 @@ void sys_state_init() {
         nvs_close(h);
     }
 
-    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds remote_scripts=%d log_cloud=%u",
+    ESP_LOGI(TAG, "init: metrics=%d ap_disabled=%d tz=%s metrics_mqtt=%d/%ds remote_scripts=%d log_cloud=%u "
+             "remote_level=%s remote_alarm=%d",
              s_metrics_enabled, s_ap_disabled, s_tz[0] ? s_tz : "UTC", s_metrics_mqtt, s_metrics_mqtt_s,
-             (int)s_remote_scripts.load(), (unsigned)s_log_cloud.load());
+             (int)s_remote_scripts.load(), (unsigned)s_log_cloud.load(), sys_remote_level_name(s_remote_level.load()),
+             (int)s_remote_alarm.load());
 }
 
 bool sys_metrics_enabled() { return s_metrics_enabled; }
@@ -153,10 +198,37 @@ bool sys_rotate_api_token(char* out, size_t cap) { return auth_rotate_token(out,
 
 bool sys_remote_scripts() { return s_remote_scripts.load(); }
 
-bool sys_set_remote_scripts(bool on) {
-    const esp_err_t e = nvs_set_u8_commit("sys_cfg", "remote_scripts", on ? 1 : 0);
-    if (e != ESP_OK) ESP_LOGE(TAG, "remote_scripts=%d not saved: %s", (int)on, esp_err_to_name(e));
-    s_remote_scripts.store(sys_remote_scripts_after_save(on, e == ESP_OK));
+// The cloud switches (remote_scripts, remote_alarm): saved first, on only once saved.
+static bool set_cloud_switch(std::atomic<bool>& s, const char* key, bool on) {
+    const esp_err_t e = nvs_set_u8_commit("sys_cfg", key, on ? 1 : 0);
+    if (e != ESP_OK) ESP_LOGE(TAG, "%s=%d not saved: %s", key, (int)on, esp_err_to_name(e));
+    s.store(sys_remote_scripts_after_save(on, e == ESP_OK));
+    return e == ESP_OK;
+}
+
+bool sys_set_remote_scripts(bool on) { return set_cloud_switch(s_remote_scripts, "remote_scripts", on); }
+
+bool sys_remote_alarm() { return s_remote_alarm.load(); }
+
+bool sys_set_remote_alarm(bool on) { return set_cloud_switch(s_remote_alarm, "remote_alarm", on); }
+
+static constexpr const char* kRemoteLevelNames[] = {"view", "devices", "full"};
+
+const char* sys_remote_level_name(uint8_t level) { return kRemoteLevelNames[level <= 2 ? level : 0]; }
+
+int sys_remote_level_parse(const char* name) {
+    for (int i = 0; name && i < 3; i++)
+        if (strcmp(name, kRemoteLevelNames[i]) == 0) return i;
+    return -1;
+}
+
+uint8_t sys_remote_level() { return s_remote_level.load(); }
+
+bool sys_set_remote_level(uint8_t level) {
+    if (level > 2) return false;
+    const esp_err_t e = nvs_set_u8_commit("sys_cfg", "remote_level", level);
+    if (e != ESP_OK) ESP_LOGE(TAG, "remote_level=%u not saved: %s", (unsigned)level, esp_err_to_name(e));
+    s_remote_level.store(sys_remote_level_after_save(s_remote_level.load(), level, e == ESP_OK));
     return e == ESP_OK;
 }
 

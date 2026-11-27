@@ -782,6 +782,25 @@ int main_flow() {
         CHECK(n > 0 && n < 2048, "the exposes of eight profiles fit the callers' 2048-byte buffers");
         CHECK(h::alarm_attrs.size() == 8 + 3, "eight profile attributes, alarm_state, alarm_sensor (and the shadow's own)");
     }
+    // ── A cloud write the hub took (review 2026-11-26 HL-02): the owner hears of each one, as an alert and on Telegram ──
+    g_trace.clear();
+    alarm_cloud_changed("alarm_state", "disarmed");
+    CHECK(cnt("alert:") == 1 && idx("\"kind\":\"alarm_changed_by_cloud\"") >= 0 && idx("\"message\":\"Alarm disarmed from the cloud") >= 0 &&
+          idx("\"name\":\"alarm_state=disarmed\"") >= 0 && idx("tg:Alarm: Alarm disarmed from the cloud") >= 0,
+          "a cloud disarm: \"Alarm disarmed from the cloud\", an alert and Telegram");
+    g_trace.clear();
+    alarm_cloud_changed("alarm_state", "armed_away");
+    alarm_cloud_changed("night", "disarmed");
+    alarm_cloud_changed("device.rename", nullptr);
+    CHECK(cnt("alert:") == 3 && idx("\"message\":\"Alarm armed_away from the cloud") >= 0 &&
+          idx("\"message\":\"Alarm disarmed from the cloud (night)") >= 0 && idx("\"name\":\"night=disarmed\"") >= 0 &&
+          idx("\"message\":\"Alarm changed from the cloud (device.rename)") >= 0 && idx("\"name\":\"device.rename\"") >= 0,
+          "an arm, a profile's key (named) and a write with no value (changed): each its own alert, each its own name, so "
+          "the cloud's repeat filter keeps them apart");
+    g_trace.clear();
+    alarm_cloud_changed(nullptr, nullptr);
+    CHECK(cnt("alert:") == 1 && idx("\"message\":\"Alarm changed from the cloud at") >= 0 && idx("\"name\"") < 0,
+          "no key: still an alert, with no name");
     return 0;
 }
 

@@ -1070,6 +1070,19 @@ AlarmReply alarm_silence(const char* id) {
     return r;
 }
 
+// The cloud's repeat filter drops an alert whose kind and name it saw within its window, so the name carries the
+// key and the value: an arm and the disarm right after it are two alerts there (HL-02: the owner hears of each).
+void alarm_cloud_changed(const char* key, const char* value) {
+    char msg[128], what[64] = "";
+    const int n = std::snprintf(msg, sizeof(msg), "Alarm %.40s from the cloud", value && *value ? value : "changed");
+    if (key && *key && std::strcmp(key, "alarm_state") != 0 && n > 0 && static_cast<size_t>(n) < sizeof(msg))
+        std::snprintf(msg + n, sizeof(msg) - n, " (%.40s)", key);   // a profile's key, or the command
+    if (key && *key && value) std::snprintf(what, sizeof(what), "%.31s=%.31s", key, value);
+    else if (key && *key) std::snprintf(what, sizeof(what), "%.31s", key);
+    ESP_LOGW(TAG, "%s", msg);
+    notify("alarm_changed_by_cloud", 0, what[0] ? what : nullptr, msg);
+}
+
 bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
     auto* next  = new (std::nothrow) AlarmConfig();
     auto* panel = next ? new (std::nothrow) AlarmPanel(next) : nullptr;

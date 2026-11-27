@@ -11,6 +11,10 @@ contents become the release-tag annotation at `just release`.
 
 ## [Unreleased]
 
+### Security
+
+- **"Cloud control" and "Allow the cloud to disarm the alarm"** (review 2026-11-26 HL-03, HL-02). The hub page sets how far the cloud reaches, `view`, `devices` or `full` (NVS `sys_cfg/remote_level`), and whether the cloud may do more to the Alarm device than arm it (`sys_cfg/remote_alarm`, off on every hub). The first start of this firmware writes the level once: `full` for a hub that already stores a cloud token, `view` for every other one, also after a storage reset or when linked later. `POST /api/settings` and WS `settings.set` take `remote_level` (`"view"|"devices"|"full"`) and `remote_alarm` (bool); the cloud relay may not change either. A lowering applies at once and a raise only once saved, and a failed save answers an error. `/api/status`, `status.get` and `hub.caps` carry `remote_level` and `remote_alarm`. Every cloud write to the Alarm device the hub takes raises an alert, `Alarm <value> from the cloud` (kind `alarm_changed_by_cloud`, also on Telegram).
+
 ### Added
 
 - **Safety profiles** (spec `extra/docs/superpowers/specs/2026-11-24-safety-profiles-design.md`). The alarm panel now runs up to 8 profiles, each with its own sensors, outputs, delays and state, in place of the three fixed modes. The hub page that shows and edits them is now named **Safety** (`#/security` still opens it); the device stays **Alarm** and the commands stay `alarm.*`.

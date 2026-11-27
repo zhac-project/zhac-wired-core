@@ -7,7 +7,8 @@
 // settings + status + token handlers can share them.
 //
 // NVS: namespace "sys_cfg"  keys: metrics_en (u8), ap_disabled (u8), timezone (str),
-//                                 metrics_mqtt (u8), metrics_mqtt_s (u8), remote_scripts (u8)
+//                                 metrics_mqtt (u8), metrics_mqtt_s (u8), remote_scripts (u8),
+//                                 log_cloud (u8), remote_level (u8), remote_alarm (u8)
 //      namespace "zhac_auth" keys: enabled (u8), token (str, 33 incl NUL)
 #pragma once
 #include <cstddef>
@@ -55,6 +56,30 @@ bool sys_remote_scripts();
 // NVS may still say on and a reboot would bring it back, so the caller must tell the user.
 bool sys_set_remote_scripts(bool on);
 constexpr bool sys_remote_scripts_after_save(bool on, bool saved) { return on && saved; }
+
+// "Cloud control" (review 2026-11-26 HL-03, ruling R18): how far the cloud reaches, 0 view, 1 devices, 2 full
+// (remote_level_t). NVS sys_cfg/remote_level. The first boot of a firmware with it writes
+// sys_remote_level_default(a cloud token is stored) once: a hub already linked keeps what it had, every other one
+// (new, storage reset, or linked later) starts at view. Changed only from this hub's own page (the relay answers
+// local_only); read by the relay's gate on task_remote for every command, so a change applies to the next one.
+constexpr uint8_t sys_remote_level_default(bool cloud_token_stored) { return cloud_token_stored ? 2 : 0; }
+const char* sys_remote_level_name(uint8_t level);   // "view", "devices", "full"; above 2 counts as "view"
+int sys_remote_level_parse(const char* name);       // the level a name gives (case matters), -1 if none or null
+uint8_t sys_remote_level();
+// Saves to NVS first; RAM takes the level by the rule below: a lowering applies at once even when the save fails,
+// a raise only once saved, so RAM never lets the cloud do more than NVS does. false = the save failed (or the level
+// is not 0..2). After a failed lowering NVS may still hold the higher level, which a reboot brings back, so the
+// caller must tell the user.
+bool sys_set_remote_level(uint8_t level);
+constexpr uint8_t sys_remote_level_after_save(uint8_t was, uint8_t want, bool saved) {
+    return (saved || want < was) ? want : was;
+}
+
+// "Allow the cloud to disarm the alarm" (HL-02, R19): sys_cfg/remote_alarm (u8 0/1), missing = off on every hub,
+// so a storage reset turns it off. Off, the cloud may only arm the Alarm device. Same rules as remote_scripts:
+// changed only from this hub's own page, on only once saved (sys_remote_scripts_after_save), false = not saved.
+bool sys_remote_alarm();
+bool sys_set_remote_alarm(bool on);
 
 // "Log to cloud" (spec 2026-10-06 cloud logs §4.1): 0 off, 1 errors, 2 warnings, 3 everything (logcloud::Level).
 // NVS sys_cfg/log_cloud, missing = off, so a storage reset turns it off.

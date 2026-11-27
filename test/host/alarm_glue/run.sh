@@ -10,7 +10,8 @@
 #   sh run.sh                  build and run the five modes (main, boot, legacy, fallback: one boot each; restart:
 #                              chains of boots on one flash, for power cuts and restarts); exit code = the modes that failed
 #   MUTANT=<name> sh run.sh    same, after breaking ONE line in the work copy of alarm.cpp (never in the repo), to
-#                              show the harness can fail: cfg_overwritten | no_orphans | no_keep_follow | st_ignored
+#                              show the harness can fail: cfg_overwritten | no_orphans | no_keep_follow | st_ignored |
+#                              cloud_one_name
 # Needs the sibling zhac-components checkout next to this repo (ZHAC_COMPONENTS overrides) and g++.
 set -e
 H=$(cd "$(dirname "$0")" && pwd)
@@ -33,6 +34,7 @@ case "${MUTANT:-}" in
     no_orphans)      mutate 's/if (k >= 0 && !s_cfg->outputs\[k\].keep && s_n_orphans < kAlarmMaxOutputs)/if (false)/' ;;   # a save forgets what still sounds
     no_keep_follow)  mutate 's/for (uint8_t k = 0; kept && k < s_cfg->n_outputs; k++) {/for (uint8_t k = 0; false \&\& k < s_cfg->n_outputs; k++) {/' ;;   # a collapsed alarm closes no valve
     st_ignored)      mutate 's/s_st_have ? s_st_saved : nullptr, \*s_cfg, s_panel/nullptr, *s_cfg, s_panel/' ;;   # a newer stage 1 state is not read at boot
+    cloud_one_name)  mutate 's/notify("alarm_changed_by_cloud", 0, what\[0\] ? what : nullptr, msg);/notify("alarm_changed_by_cloud", 0, nullptr, msg);/' ;;   # the cloud's repeat filter would merge a disarm into the arm before it
     *) echo "unknown MUTANT" >&2; exit 98 ;;
 esac
 

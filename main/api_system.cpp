@@ -57,30 +57,62 @@ bool system_apply_settings(const char* json, size_t len) {
     if (doc["auth_enabled"].is<bool>())
         sys_set_auth_enabled(doc["auth_enabled"].as<bool>());
 
-    // "Allow script changes from the cloud" (spec 2026-10-05 §3.1). Only this hub's own page gets here with
-    // the key: the cloud relay answers settings.set carrying it with local_only. Only JSON true turns it
-    // on; any other value (false, 0, "true", {}) turns it off, so a malformed request can never leave it
-    // on. null counts as absent, as it does for the relay's local_only check. A change pushes hub.caps,
-    // so the cloud knows at once.
+    // The cloud switches: "Allow script changes from the cloud" (spec 2026-10-05 §3.1) and "Allow the cloud to
+    // disarm the alarm" (review 2026-11-26 HL-02, R19). Only this hub's own page gets here with these keys: the
+    // cloud relay answers settings.set carrying one with local_only. Only JSON true turns one on; any other value
+    // (false, 0, "true", {}) turns it off, so a malformed request can never leave it on. null counts as absent,
+    // as it does for the relay's local_only check. A change pushes hub.caps, so the cloud knows at once.
     // A failed NVS save answers false (the page gets "bad settings", REST 400), never OK: off still applies
     // at once, but NVS may keep saying on, and a reboot would bring it back.
-    if (!doc["remote_scripts"].isNull()) {
-        const bool on = doc["remote_scripts"].is<bool>() && doc["remote_scripts"].as<bool>();
-        const bool was = sys_remote_scripts();
+    auto cloud_switch = [&doc](const char* key, bool (*now)(), bool (*set)(bool), const char* what) {
+        if (doc[key].isNull()) return true;
+        const bool on = doc[key].is<bool>() && doc[key].as<bool>();
+        const bool was = now();
         // On in RAM means saved, so on again needs nothing. Off is saved even when RAM already says off: after
         // a failed save NVS may still say on, and sending off again must be able to repair that (NVS skips a
         // write of the same value, so a consistent hub writes nothing).
         if (!(on && was)) {
-            const bool saved = sys_set_remote_scripts(on);
-            if (sys_remote_scripts() != was) {   // off applies at once, on only once saved
-                ESP_LOGW(TAG, "script changes from the cloud: %s", on ? "allowed" : "off");
+            const bool saved = set(on);
+            if (now() != was) {   // off applies at once, on only once saved
+                ESP_LOGW(TAG, "%s: %s", what, on ? "allowed" : "off");
                 ws_push_hub_caps();
             }
             if (!saved) {
-                ESP_LOGE(TAG, "script changes from the cloud: %s not saved, %s", on ? "allowed" : "off",
+                ESP_LOGE(TAG, "%s: %s not saved, %s", what, on ? "allowed" : "off",
                          on ? "it stays off" : "it is off now but may be on again after a reboot");
                 return false;
             }
+        }
+        return true;
+    };
+    if (!cloud_switch("remote_scripts", sys_remote_scripts, sys_set_remote_scripts, "script changes from the cloud"))
+        return false;
+    if (!cloud_switch("remote_alarm", sys_remote_alarm, sys_set_remote_alarm, "the cloud disarming the alarm"))
+        return false;
+
+    // "Cloud control" (review 2026-11-26 HL-03, R18): "view", "devices" or "full". Only this hub's own page gets
+    // here with the key (the relay answers local_only). Any other non-null value is refused ("bad settings"); null
+    // counts as absent. Always saved, as log_to_cloud is, so sending a level again repairs a failed save. A lowering
+    // applies at once and a raise only once saved; a failed save answers false, so the page is told. A change
+    // pushes hub.caps.
+    if (!doc["remote_level"].isNull()) {
+        const int parsed = sys_remote_level_parse(doc["remote_level"].as<const char*>());
+        if (parsed < 0) return false;
+        const uint8_t want = static_cast<uint8_t>(parsed);
+        const uint8_t was = sys_remote_level();
+        const bool saved = sys_set_remote_level(want);
+        if (sys_remote_level() != was) {
+            ESP_LOGW(TAG, "cloud control: %s", sys_remote_level_name(sys_remote_level()));
+            ws_push_hub_caps();
+        }
+        if (!saved) {
+            if (want < was)
+                ESP_LOGE(TAG, "cloud control: %s not saved, it is %s now but may be %s again after a reboot",
+                         sys_remote_level_name(want), sys_remote_level_name(want), sys_remote_level_name(was));
+            else
+                ESP_LOGE(TAG, "cloud control: %s not saved, it stays %s", sys_remote_level_name(want),
+                         sys_remote_level_name(was));
+            return false;
         }
     }
 

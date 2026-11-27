@@ -1264,10 +1264,13 @@ static constexpr char kRemoteCapsJson[] = "[\"rules.v1\",\"rules.v2\",\"scripts.
 
 static const char* log_level_now() { return logcloud::level_name(logcloud::level_from_u8(sys_log_cloud())); }
 
-// Worst cases (longest level "everything", remote_scripts false), checked at build time (spec §8): the
-// hub.caps payload must fit ws_push_hub_caps' buffer, the remote.auth extra remote_client.cpp's extra[160].
+// Worst cases (longest log level "everything", remote_scripts false, longest cloud-control level "devices",
+// remote_alarm false), checked at build time (spec §8): the hub.caps payload must fit ws_push_hub_caps' buffer,
+// the remote.auth extra remote_client.cpp's extra[160]. remote.auth carries no level: the cloud reads it with
+// status.get (a view-level read) and from hub.caps (review 2026-11-26 HL-03).
 static_assert(sizeof("{\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
-                     "\"log_to_cloud\":\"everything\"}") <= 160, "hub.caps payload outgrew its 160 B buffer");
+                     "\"log_to_cloud\":\"everything\",\"remote_level\":\"devices\",\"remote_alarm\":false}") <= 160,
+              "hub.caps payload outgrew its 160 B buffer");
 static_assert(sizeof(",\"caps\":[\"rules.v1\",\"rules.v2\",\"scripts.v1\",\"logs.v1\"],\"remote_scripts\":false,"
                      "\"log_to_cloud\":\"everything\",\"lan_ip\":\"255.255.255.255\"") <= 160,
               "remote_hello_extra outgrew remote_client's extra[160]");
@@ -1278,9 +1281,12 @@ static_assert(sizeof(WifiStatus::ip) <= sizeof("255.255.255.255"), "lan_ip above
 
 void ws_push_hub_caps() {
     if (!push_listeners()) return;
-    char buf[160];   // 106 bytes at the longest level; 96 left no room (a payload that does not fit is not sent)
-    const int n = snprintf(buf, sizeof(buf), "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\"}",
-                           kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now());
+    char buf[160];   // 152 bytes at the longest levels (static_assert above); a payload that does not fit is not sent
+    const int n = snprintf(buf, sizeof(buf),
+                           "{\"caps\":%s,\"remote_scripts\":%s,\"log_to_cloud\":\"%s\",\"remote_level\":\"%s\","
+                           "\"remote_alarm\":%s}",
+                           kRemoteCapsJson, sys_remote_scripts() ? "true" : "false", log_level_now(),
+                           sys_remote_level_name(sys_remote_level()), sys_remote_alarm() ? "true" : "false");
     if (n > 0 && (size_t)n < sizeof(buf)) push_event("hub.caps", buf, (size_t)n);
 }
 
@@ -2078,6 +2084,35 @@ extern "C" void dispatch_envelope_for_remote(int fd, JsonDocument& doc) {
 // which remote_client.cpp calls, so the linker always pulls it in. A strong definition in an object
 // nothing references is never extracted from its archive, and the weak default silently wins.
 extern "C" bool remote_scripts_allowed(void) { return sys_remote_scripts(); }
+// "Cloud control" and "Allow the cloud to disarm the alarm" (review 2026-11-26 HL-03, HL-02), read for every cloud
+// command, so a change on the hub page applies to the next one. One line each: test/host/switch cuts them out.
+extern "C" remote_level_t remote_level_now(void) { return static_cast<remote_level_t>(sys_remote_level()); }
+extern "C" bool remote_alarm_allowed(void) { return sys_remote_alarm(); }
+// The Alarm device the gate guards, and its name now (a rule may name it instead of giving its IEEE).
+extern "C" uint64_t remote_alarm_ieee(void) { return kAlarmIeee; }
+extern "C" size_t remote_alarm_name(char* out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    struct Out { char* s; size_t cap; } o{out, cap};
+    zigbee_pool_with_device(kAlarmIeee, [](ZapDevice* d, void* p) {
+        auto* t = static_cast<Out*>(p);
+        snprintf(t->s, t->cap, "%.*s", static_cast<int>(sizeof(d->friendly_name)), d->friendly_name);
+    }, &o);
+    return std::strlen(out);
+}
+// group.cmd sets every member of the group (api_groups.cpp group_cmd, the same record): does group `id` hold `ieee`?
+extern "C" bool remote_group_has(uint16_t id, uint64_t ieee) {
+    GrpRecord g{};
+    if (!grp_find(id, g)) return false;
+    for (uint8_t i = 0; i < g.member_count && i < GRP_MAX_MEMBERS; i++)
+        if (g.members[i].ieee == ieee) return true;
+    return false;
+}
+// Each cloud write to the Alarm device the hub took raises the owner's alert (HL-02). `by` is the cloud's word only.
+extern "C" void remote_alarm_changed(const char* key, const char* value, const char* by) {
+    (void)by;
+    alarm_cloud_changed(key, value);
+}
 
 // remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default
 // (none), which dual-chip and mono keep, so the cloud treats those as read-only.
