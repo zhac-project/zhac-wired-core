@@ -775,6 +775,11 @@ void zb_interview_on_announce(uint64_t ieee, uint16_t nwk) {
     c.now = esp_zigbee_backend_wall_clock_s();
 
     if (zigbee_pool_with_device(ieee, rejoin_fn, &c)) {
+        // An announce is a frame from the device, which never reaches the
+        // decoder: it answers the availability ping and brings an offline
+        // device back at once (a light switched back on at the wall), as
+        // zigbee2mqtt counts it. The pool lock is released by now.
+        zhac_adapter_heard(ieee);
         // Known device. A full re-interview is only warranted when we never
         // got its identity -- routers announce on every power cycle, and
         // re-running four ZDO round-trips per device across a mains outage

@@ -198,8 +198,9 @@ void on_device_leave(const Event& e) {
     if (mqtt_gw_format_topic(topic, sizeof(topic), suffix) > 0) mqtt_gw_publish(topic, "", 0, 0, true);
 }
 
-// The availability ping's verdict, to Home Assistant (research 2026-11-18 B7): DEVICE_OFFLINE when a mains device let
-// its ping go unanswered, DEVICE_SEEN when it is heard again.
+// The adapter's availability verdict, to Home Assistant (research 2026-11-18 B7): DEVICE_OFFLINE when a device was
+// silent too long (an hour with its ping unanswered, 48 h when it is not pinged), DEVICE_SEEN when it is heard again.
+// The bridge keeps its own 48-hour clock for devices with a battery.
 void on_availability(const Event& e) {
     uint64_t ieee = 0;
     memcpy(&ieee, e.data, sizeof(ieee));

@@ -80,6 +80,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Fixed
 
+- **A battery device no longer shows offline after half an hour** (zhac-components `zhc_adapter`, owner 2026-11-27). A battery sensor whose power source the interview missed, parented by a router, was pinged as a mains device, could not answer and showed offline (a HOBEIAN ZG-102ZA, 26 minutes after its last report). Only routers not on battery and devices on single-phase mains are pinged now, as zigbee2mqtt does. A pinged device is offline on the hub page, in Home Assistant and for `Offline#<device>` once it has sent nothing for an hour with its ping unanswered (also after a command nothing reached, which no longer counts at once); a battery device once it has sent nothing for 48 hours (in Home Assistant: was 25 hours). `Offline#<device>` now fires for battery devices too. A device's announce (a light switched back on at the wall) brings it back at once (`esp_zb_interview.cpp` calls `zhac_adapter_heard()`).
 - **Hub sounds, small fixes from the review** (`main/sound_synth.cpp`, `sound.cpp`, `lua_io.cpp`, `api_sound.cpp`).
   - A tone or melody note above 7900 Hz is refused as a bad value. At the 16 kHz sample rate, 8000 Hz played as silence.
   - `zhac.sound_play`, `zhac.sound_tone` and `zhac.sound_melody` answer a volume, pitch or length that is not a whole number (`40.5`, `"loud"`) with `nil, err`. Before, the script ended with an error.

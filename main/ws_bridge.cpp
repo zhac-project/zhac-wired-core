@@ -2223,7 +2223,8 @@ static void on_device_leave(const Event& e) {
 // A device's availability, for the hub page and the cloud, as an attr.bulk entry with no attrs (both merge it as is).
 // DEVICE_SEEN: it ended a long silence, usually by answering an availability ping, which changes no state and so
 // sends no attr.changed -- its new last_seen (when there is a clock) the way zigbee2mqtt publishes last_seen, and
-// online again. DEVICE_OFFLINE: it let its ping go unanswered (research 2026-11-18 B7).
+// online again. DEVICE_OFFLINE: it was silent too long, an hour with its ping unanswered or 48 h when it is not
+// pinged (research 2026-11-18 B7; owner 2026-11-27).
 static void on_device_availability(const Event& e) {
     if (!push_listeners()) return;
     uint64_t ieee = 0;
