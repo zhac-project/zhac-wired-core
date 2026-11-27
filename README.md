@@ -404,7 +404,8 @@ build-breaking rather than conventions nobody reads.
 
 ## Licence
 
-AGPL-3.0-or-later, matching the other firmware cores. SPDX headers are enforced.
+AGPL-3.0-or-later. The license text is in `LICENSE`; the copyright, the CLA and the other notes
+are in `NOTICE`. Every source file carries an SPDX header.
 
 ## Status LED
 

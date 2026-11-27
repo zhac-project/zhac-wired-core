@@ -47,6 +47,7 @@ contents become the release-tag annotation at `just release`.
 
 ### Changed
 
+- **`LICENSE` is the plain AGPL-3.0 text**, so GitHub shows the license. The copyright, the contribution terms and the web UI note moved to the new `NOTICE`, and `CLA.md`, which those terms cite, is added (the same text as in the other ZHAC repos).
 - **A keypad PIN no longer reaches the cloud**: `attr.changed` for `action_code` and `pin_code` goes to the hub page only.
 - **Device support follows zigbee-herdsman-converters v26.133.0** (embedded-zhc cad6000, was v26.125.0;
   pinned in `release-manifest.json` with the P1–P8 siblings): devices that landed on the wrong definition get
