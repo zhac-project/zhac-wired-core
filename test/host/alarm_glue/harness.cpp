@@ -376,7 +376,13 @@ int main_flow() {
     g_trace.clear();
     uint64_t open[kAlarmMaxSensors];
     uint8_t n_open = 9;
+    // Final review 2026-11-27 Critical 1: with the cloud's alarm switch off, an arm passes only when it stops nothing.
+    CHECK(!alarm_arm_replaces("night") && !alarm_arm_replaces("away") && !alarm_arm_replaces("flood"),
+          "no intrusion profile armed (Flood, water, is): an arm stops nothing");
     CHECK(alarm_arm("away", false, open, &n_open) == AlarmReply::OK && n_open == 0, "away arms");
+    CHECK(alarm_arm_replaces("night"), "Away armed: arming Night would stop it");
+    CHECK(!alarm_arm_replaces("away") && !alarm_arm_replaces("flood") && !alarm_arm_replaces("nope") &&
+          !alarm_arm_replaces(nullptr), "the same profile, a water profile, an unknown id: they stop nothing");
     CHECK(alarm_arm("nope", false, open, &n_open) == AlarmReply::NO_PROFILE, "an unknown id is no profile");
     run_task();
     {
@@ -468,6 +474,7 @@ int main_flow() {
     emit(0x20, "action", 0, "arm_night_zones");
     run_task();
     CHECK(h::alarm_attrs["night"] == "arming", "the keypad's night button arms the night profile");
+    CHECK(alarm_arm_replaces("away") && !alarm_arm_replaces("night"), "Night arming: arming Away would stop it");
     CHECK(!h::save(kCfg, &why) && why == "an alarm is running: disarm or wait, then save", "a save during the arm delay is refused");
     emit(0x20, "action", 0, "arm_day_zones");   // no profile has the role home: ignored
     g_trace.clear();
@@ -783,24 +790,33 @@ int main_flow() {
         CHECK(h::alarm_attrs.size() == 8 + 3, "eight profile attributes, alarm_state, alarm_sensor (and the shadow's own)");
     }
     // ── A cloud write the hub took (review 2026-11-26 HL-02): the owner hears of each one, as an alert and on Telegram ──
+    // Final review 2026-11-27 Minor 3: who did it (the relay passes an account id only), and notify's "Alarm: " once.
+    static constexpr const char* kBy = "3f2a6b1c-0000-4000-8000-00000000abcd";
     g_trace.clear();
-    alarm_cloud_changed("alarm_state", "disarmed");
-    CHECK(cnt("alert:") == 1 && idx("\"kind\":\"alarm_changed_by_cloud\"") >= 0 && idx("\"message\":\"Alarm disarmed from the cloud") >= 0 &&
-          idx("\"name\":\"alarm_state=disarmed\"") >= 0 && idx("tg:Alarm: Alarm disarmed from the cloud") >= 0,
-          "a cloud disarm: \"Alarm disarmed from the cloud\", an alert and Telegram");
+    g_logs.clear();
+    alarm_cloud_changed("alarm_state", "disarmed", kBy);
+    CHECK(cnt("alert:") == 1 && idx("\"kind\":\"alarm_changed_by_cloud\"") >= 0 &&
+          idx("\"message\":\"Set to disarmed from the cloud by 3f2a6b1c-0000-4000-8000-00000000abcd at ") >= 0 &&
+          idx("\"name\":\"alarm_state=disarmed\"") >= 0 &&
+          idx("tg:Alarm: Set to disarmed from the cloud by 3f2a6b1c-0000-4000-8000-00000000abcd") >= 0 &&
+          h::logged("Set to disarmed from the cloud by 3f2a6b1c-0000-4000-8000-00000000abcd") == 1,
+          "a cloud disarm: an alert, Telegram and the log, each saying who");
     g_trace.clear();
-    alarm_cloud_changed("alarm_state", "armed_away");
-    alarm_cloud_changed("night", "disarmed");
-    alarm_cloud_changed("device.rename", nullptr);
-    CHECK(cnt("alert:") == 3 && idx("\"message\":\"Alarm armed_away from the cloud") >= 0 &&
-          idx("\"message\":\"Alarm disarmed from the cloud (night)") >= 0 && idx("\"name\":\"night=disarmed\"") >= 0 &&
-          idx("\"message\":\"Alarm changed from the cloud (device.rename)") >= 0 && idx("\"name\":\"device.rename\"") >= 0,
-          "an arm, a profile's key (named) and a write with no value (changed): each its own alert, each its own name, so "
-          "the cloud's repeat filter keeps them apart");
+    alarm_cloud_changed("alarm_state", "armed_away", "");
+    alarm_cloud_changed("night", "disarmed", nullptr);
+    alarm_cloud_changed("device.rename", nullptr, "");
+    alarm_cloud_changed("rule.create", nullptr, kBy);
+    CHECK(cnt("alert:") == 4 && idx("\"message\":\"Set to armed_away from the cloud at ") >= 0 &&
+          idx("\"message\":\"Set to disarmed from the cloud (night) at ") >= 0 && idx("\"name\":\"night=disarmed\"") >= 0 &&
+          idx("\"message\":\"Changed from the cloud (device.rename) at ") >= 0 && idx("\"name\":\"device.rename\"") >= 0 &&
+          idx("\"message\":\"Changed from the cloud (rule.create) by 3f2a6b1c-0000-4000-8000-00000000abcd at ") >= 0,
+          "an arm, a profile's key (named), a write with no value (changed), a rule save: each its own alert, each its "
+          "own name, so the cloud's repeat filter keeps them apart; no `by`, no \" by \"");
     g_trace.clear();
-    alarm_cloud_changed(nullptr, nullptr);
-    CHECK(cnt("alert:") == 1 && idx("\"message\":\"Alarm changed from the cloud at") >= 0 && idx("\"name\"") < 0,
+    alarm_cloud_changed(nullptr, nullptr, nullptr);
+    CHECK(cnt("alert:") == 1 && idx("\"message\":\"Changed from the cloud at") >= 0 && idx("\"name\"") < 0,
           "no key: still an alert, with no name");
+    CHECK(idx("Alarm: Alarm") < 0 && idx("tg:Alarm: Changed from the cloud at") >= 0, "Telegram: \"Alarm: \" once");
     return 0;
 }
 

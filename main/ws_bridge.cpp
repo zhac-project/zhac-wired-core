@@ -2108,10 +2108,23 @@ extern "C" bool remote_group_has(uint16_t id, uint64_t ieee) {
         if (g.members[i].ieee == ieee) return true;
     return false;
 }
-// Each cloud write to the Alarm device the hub took raises the owner's alert (HL-02). `by` is the cloud's word only.
+// Each cloud write to the Alarm device the hub took raises the owner's alert (HL-02), naming the account id the
+// relay checked (final review 2026-11-27 Minor 3).
 extern "C" void remote_alarm_changed(const char* key, const char* value, const char* by) {
-    (void)by;
-    alarm_cloud_changed(key, value);
+    alarm_cloud_changed(key, value, by);
+}
+// With the alarm switch off, the cloud's arm passes only when it stops no other profile (final review 2026-11-27
+// Critical 1).
+extern "C" bool remote_alarm_arm_replaces(const char* id) { return alarm_arm_replaces(id); }
+// rule.run from the cloud (final review 2026-11-27): the stored text remote_allow reads as a rule save's. The slot
+// lives on task_remote's stack only until the gate has read it, before the dispatch.
+extern "C" size_t remote_rule_text(uint16_t id, char* out, size_t cap) {
+    RuleSlot s;
+    if (cap) out[0] = '\0';
+    if (!id || !rule_store_load(id, &s) || !s.src_len) return 0;
+    const size_t n = s.src_len < sizeof(s.src) ? s.src_len : sizeof(s.src);
+    if (cap) snprintf(out, cap, "%.*s", static_cast<int>(n), reinterpret_cast<const char*>(s.src));
+    return n;
 }
 
 // remote.auth's extra fields (§3.6): the caps and the switch. Overrides remote_client's weak default

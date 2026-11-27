@@ -1072,15 +1072,32 @@ AlarmReply alarm_silence(const char* id) {
 
 // The cloud's repeat filter drops an alert whose kind and name it saw within its window, so the name carries the
 // key and the value: an arm and the disarm right after it are two alerts there (HL-02: the owner hears of each).
-void alarm_cloud_changed(const char* key, const char* value) {
+// notify puts "Alarm: " in front on Telegram, so the text does not (final review 2026-11-27 Minor 3), and it names
+// who did it: at most 7 + 24 + 15 + 27 + 44 = 117 bytes, under notify's 127.
+void alarm_cloud_changed(const char* key, const char* value, const char* by) {
     char msg[128], what[64] = "";
-    const int n = std::snprintf(msg, sizeof(msg), "Alarm %.40s from the cloud", value && *value ? value : "changed");
+    int n = value && *value ? std::snprintf(msg, sizeof(msg), "Set to %.24s from the cloud", value)
+                            : std::snprintf(msg, sizeof(msg), "Changed from the cloud");
     if (key && *key && std::strcmp(key, "alarm_state") != 0 && n > 0 && static_cast<size_t>(n) < sizeof(msg))
-        std::snprintf(msg + n, sizeof(msg) - n, " (%.40s)", key);   // a profile's key, or the command
+        n += std::snprintf(msg + n, sizeof(msg) - n, " (%.24s)", key);   // a profile's key, or the command
+    if (by && *by && n > 0 && static_cast<size_t>(n) < sizeof(msg))
+        std::snprintf(msg + n, sizeof(msg) - n, " by %.40s", by);
     if (key && *key && value) std::snprintf(what, sizeof(what), "%.31s=%.31s", key, value);
     else if (key && *key) std::snprintf(what, sizeof(what), "%.31s", key);
     ESP_LOGW(TAG, "%s", msg);
     notify("alarm_changed_by_cloud", 0, what[0] ? what : nullptr, msg);
+}
+
+// AlarmPanel::arm stops every other intrusion profile when it arms one, unless one of them alarms (then it arms
+// nothing). Any other intrusion profile not disarmed counts, so a pending or sounding one refuses too.
+bool alarm_arm_replaces(const char* id) {
+    Lock l;
+    const int p = id ? alarm_cfg_profile(*s_cfg, id) : -1;
+    if (p < 0 || s_cfg->profiles[p].cls != AlarmClass::INTRUSION) return false;
+    for (uint8_t i = 0; i < s_cfg->n_profiles; i++)
+        if (i != p && s_cfg->profiles[i].cls == AlarmClass::INTRUSION && s_panel->at(i).state != AlarmState::DISARMED)
+            return true;
+    return false;
 }
 
 bool alarm_config_set(const char* json, size_t len, char* err, size_t cap) {
